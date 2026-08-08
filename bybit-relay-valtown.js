@@ -74,8 +74,13 @@ async function bybit(method, path, params) {
     },
     body,
   });
+  // Keep the raw body: when Bybit (or a CDN in front of it) answers with HTML,
+  // the status + first slice of the body is the only thing that identifies the cause.
+  const raw = await res.text();
   let data;
-  try { data = await res.json(); } catch { data = { retCode: -1, retMsg: "non-JSON reply from Bybit" }; }
+  try { data = JSON.parse(raw); } catch {
+    data = { retCode: -1, retMsg: `non-JSON reply from Bybit — HTTP ${res.status} ${res.statusText}: ${raw.slice(0, 300).replace(/\s+/g, " ")}` };
+  }
   return { status: res.status, data };
 }
 
