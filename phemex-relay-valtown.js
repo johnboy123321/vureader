@@ -201,6 +201,8 @@ export default async function (request) {
     if (!(slNum > 0)) return json({ error: "refusing order: stop loss is not a valid price" }, 400);
     if (isLong && slNum >= refPx) return json({ error: `refusing order: LONG stop ${slNum} must be BELOW entry ${refPx}` }, 400);
     if (!isLong && slNum <= refPx) return json({ error: `refusing order: SHORT stop ${slNum} must be ABOVE entry ${refPx}` }, 400);
+    const slDist = Math.abs(refPx - slNum) / refPx;
+    if (slDist < 0.003) return json({ error: `refusing order: stop is ${(slDist * 100).toFixed(2)}% from entry — too tight (min 0.3%), it would mint an oversized position` }, 400);
     if (o.takeProfitRp != null) {
       const tp = Number(o.takeProfitRp);
       if (!(tp > 0) || (isLong && tp <= refPx) || (!isLong && tp >= refPx))

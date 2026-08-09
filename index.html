@@ -7764,6 +7764,11 @@ document.addEventListener('click', function(e){
     if(!Number.isFinite(sl)||sl<=0) return 'no stop loss — hard rule, never trade stopless';
     if(isLong && sl>=en) return 'LONG stop '+sl+' is not below entry '+en;
     if(!isLong && sl<=en) return 'SHORT stop '+sl+' is not above entry '+en;
+    // A hair-thin stop mints a monster position (£10 / $2.79 = 3.5 BTC) and gets rejected
+    // by the exchange for being too close to price. Demand real breathing room.
+    const dist=Math.abs(en-sl)/en;
+    if(dist<0.003) return 'stop is only '+(dist*100).toFixed(2)+'% from entry — too tight to be real (min 0.3%)';
+    if(dist>0.35) return 'stop is '+(dist*100).toFixed(0)+'% from entry — implausible plan';
     const tp=+t.tp1;
     if(Number.isFinite(tp)&&tp>0&&((isLong&&tp<=en)||(!isLong&&tp>=en))) return 'target '+tp+' is on the wrong side of entry '+en;
     return null;
