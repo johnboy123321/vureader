@@ -1354,7 +1354,8 @@ body.layout-edit #layout-bar { display:flex; flex-wrap:wrap; justify-content:cen
     <div style="font-size:12px;color:var(--dim);margin-bottom:12px;line-height:1.5;">
       Nothing here is random: the bot only acts when a signal you save (or an auto-scan entry) scores at or above the minimum, and it copies that card's exact entry, stop and first target. Below is every decision it has made — including trades it looked at and passed on — and any live positions on the exchange.
     </div>
-    <div id="bot-status" style="font-size:11px;color:var(--dim);margin-bottom:14px;font-family:ui-monospace,monospace;"></div>
+    <div id="bot-status" style="font-size:11px;color:var(--dim);margin-bottom:10px;font-family:ui-monospace,monospace;"></div>
+    <div id="bot-pnl" style="margin-bottom:14px;"></div>
     <div style="font-size:11px;font-weight:700;color:var(--muted);margin-bottom:6px;">OPEN POSITIONS (EXCHANGE)</div>
     <div id="bot-positions" style="margin-bottom:16px;"><div style="font-size:11px;color:var(--dim);">Loading…</div></div>
     <div style="font-size:11px;font-weight:700;color:var(--muted);margin-bottom:6px;">DECISIONS</div>
@@ -7767,6 +7768,11 @@ document.addEventListener('click', function(e){
       const plan={ entry:t.entry, sl:t.sl, tp1:t.tp1, thesis:t.thesis||'', source:t.source||'' };
       const vetOK=(t.source==='auto-scan'&&t.vetGrade==='positive');
       if(score<num(LS.min,8) && !vetOK){ pushLog(Object.assign({coin:t.coin,dir:t.dir,score,skipped:(t.score!=null?'score '+score+' below minimum '+num(LS.min,8):'no brain score and backtest vet not positive')},plan)); return; }
+      // Correlation guard — alt majors move together; 4 shorts in one sweep is one bet, not four.
+      const corrMax=num('mc_exec_corrmax',3);
+      try{ const snap=JSON.parse(get('mc_exec_possnap','{}'))||{}; const dir=(t.dir==='short')?'Short':'Long';
+        const sameDir=Object.keys(snap).filter(k=>k.endsWith('|'+dir)).length;
+        if(sameDir>=corrMax){ pushLog(Object.assign({coin:t.coin,dir:t.dir,score,skipped:'correlation guard — already holding '+sameDir+' '+dir.toLowerCase()+' positions (max '+corrMax+')'},plan)); return; } }catch{}
       // Daily cap — keeps a wide whitelist from firehosing the ledger (and later, the account).
       const cap=num('mc_exec_daycap',10);
       try{ const dayAgo=Date.now()-24*3600*1000; const fired24=JSON.parse(get(LS.log,'[]')).filter(e=>e.at&&new Date(e.at).getTime()>dayAgo&&(e.result==='PLACED'||e.result==='dry-run OK')).length;
@@ -7828,6 +7834,7 @@ document.addEventListener('click', function(e){
     if(e.error) return ['ERROR','#e88'];
     if(e.skipped) return ['PASSED','#999'];
     const r=String(e.result||'');
+    if(r==='STOP ATTACHED') return ['STOP SET','#9c9'];
     if(r.startsWith('ERR')) return ['REJECTED','#e88'];
     if(r==='PLACED') return ['PLACED','#8bd'];
     if(r==='FILLED') return ['FILLED','#9c9'];
@@ -7846,7 +7853,7 @@ document.addEventListener('click', function(e){
       const when=e.at?new Date(e.at).toLocaleString(undefined,{day:'2-digit',month:'short',hour:'2-digit',minute:'2-digit'}):'';
       const head='<div class="bot-row-top"><span class="bot-badge" style="color:'+col+';border-color:'+col+'55">'+label+'</span>'
         +(e.coin?'<b>'+esc(e.coin)+' '+esc((e.dir||'').toUpperCase())+'</b>':'')
-        +(Number.isFinite(+e.score)&&e.coin?'<span style="color:var(--dim);">score '+e.score+'/10</span>':'')
+        +(e.coin?(Number(e.score)>0?'<span style="color:var(--dim);">score '+e.score+'/10</span>':(e.source==='auto-scan'||/backtest/.test(e.thesis||''))?'<span style="color:var(--dim);">backtest-vetted</span>':''):'')
         +'<span style="margin-left:auto;color:var(--dim);font-size:10px;">'+when+'</span></div>';
       if(e.kill) return '<div class="bot-row">'+head+'<div class="bot-why">Kill switch — exec turned off, resting orders cancelled.</div></div>';
       if(e.error) return '<div class="bot-row">'+head+'<div class="bot-why">'+esc(e.error)+'</div></div>';
@@ -7874,6 +7881,27 @@ document.addEventListener('click', function(e){
         const pr=await (await fetch(url+'/positions',{headers:{Authorization:'Bearer '+get(LS.token,'')}})).json();
         const all=(pr.data&&pr.data.data&&pr.data.data.positions)||[];
         const open=all.filter(p=>Number(p.size)>0);
+        // ── P&L SUMMARY: everything in one place, no hunting through Phemex ──
+        try{
+          const pnlEl=document.getElementById('bot-pnl');
+          if(pnlEl){
+            const openPnl=open.reduce((s,p)=>s+(Number(p.unRealisedPnlRv||p.unrealisedPnlRv||0)||0),0);
+            const closed=log.filter(e=>e.result==='CLOSED');
+            let realised=0, wins=0, losses=0;
+            closed.forEach(e=>{ const m=String(e.thesis||'').match(/last seen ([+-]?[\d.]+) USDT/); if(m){ const v=parseFloat(m[1]); if(Number.isFinite(v)){ realised+=v; if(v>0) wins++; else if(v<0) losses++; } } });
+            const naked=open.filter(p=>!(Number(p.stopLossRp||p.stopLoss||0)>0)).length;
+            const col=v=>v>0?'#9c9':v<0?'#e88':'var(--muted)';
+            const money=v=>(v>0?'+':'')+v.toFixed(2)+' USDT';
+            pnlEl.innerHTML='<div class="bot-row" style="cursor:default"><div class="bot-nums" style="margin-top:0">'
+              +'<span>open <b>'+open.length+'</b></span>'
+              +'<span>unrealised <b style="color:'+col(openPnl)+'">'+money(openPnl)+'</b></span>'
+              +'<span>closed <b>'+closed.length+'</b></span>'
+              +'<span>realised <b style="color:'+col(realised)+'">'+money(realised)+'</b></span>'
+              +(wins+losses?'<span>record <b>'+wins+'W / '+losses+'L</b></span>':'')
+              +(naked?'<span class="bot-nostop">'+naked+' WITHOUT STOP</span>':'<span style="color:#9c9">all stopped ✓</span>')
+              +'</div></div>';
+          }
+        }catch(e){}
         if(!open.length){ posEl.innerHTML='<div style="font-size:11px;color:var(--dim);">None — flat.</div>'; return; }
         posEl.innerHTML=open.map(p=>{
           const entry=p.avgEntryPriceRp||p.avgEntryPrice, mark=p.markPriceRp||p.markPrice, pnl=p.unRealisedPnlRv||p.unrealisedPnlRv||p.unRealisedPnl;
@@ -7907,6 +7935,26 @@ document.addEventListener('click', function(e){
       Object.keys(now).forEach(k=>{ if(!prev[k]){ notify('FILLED: '+k.replace('|',' ')+' — size '+now[k].size); pushLog({coin:k.split('|')[0].replace(/USDT$/,''),dir:k.split('|')[1].toLowerCase(),result:'FILLED',thesis:'Position confirmed on exchange, size '+now[k].size}); } });
       Object.keys(prev).forEach(k=>{ if(!now[k]){ const pnl=prev[k]&&Number.isFinite(prev[k].pnl)?' (last seen '+(prev[k].pnl>0?'+':'')+prev[k].pnl.toFixed(1)+' USDT)':''; notify('CLOSED: '+k.replace('|',' ')+pnl); pushLog({coin:k.split('|')[0].replace(/USDT$/,''),dir:k.split('|')[1].toLowerCase(),result:'CLOSED',thesis:'Position gone from exchange — stopped, target hit, or closed manually.'+pnl}); } });
       set('mc_exec_possnap',JSON.stringify(now));
+      // ── NAKED-STOP GUARD: any open position without an exchange stop gets one attached ──
+      let armed={}; try{ armed=JSON.parse(get('mc_exec_slarmed','{}'))||{}; }catch{}
+      for(const p of open){
+        const key=p.symbol+'|'+(p.posSide||'');
+        const hasSL=Number(p.stopLossRp||p.stopLoss||0)>0;
+        if(hasSL){ if(armed[key]) { delete armed[key]; } continue; }
+        if(armed[key]) continue;                       // already tried this position
+        const root=String(p.symbol||'').replace(/USDT$/,'');
+        let log=[]; try{ log=JSON.parse(get(LS.log,'[]'))||[]; }catch{}
+        const src=log.find(x=>x.coin===root&&Number(x.sl)>0&&!x.skipped);
+        if(!src){ notify('⚠ '+p.symbol+' '+(p.posSide||'')+' has NO STOP and no saved plan to rebuild one — close it manually.'); armed[key]=1; continue; }
+        try{
+          const r=await callWorker('/stop',{symbol:p.symbol,posSide:p.posSide,stopPxRp:src.sl,orderQtyRq:p.size});
+          const ok=r.status===200&&!r.data.error;
+          armed[key]=1;
+          pushLog({coin:root,dir:(p.posSide||'').toLowerCase(),result:ok?'STOP ATTACHED':'ERR stop '+(r.data.error||r.status),sl:src.sl,thesis:ok?'Position had no exchange stop — protective stop placed at '+src.sl:'Could not attach a stop: '+(r.data.error||r.status)});
+          notify((ok?'Stop attached: ':'STOP FAILED: ')+p.symbol+' @ '+src.sl);
+        }catch(e){ armed[key]=1; }
+      }
+      set('mc_exec_slarmed',JSON.stringify(armed));
       const bp=document.getElementById('bot-panel'); if(bp&&bp.classList.contains('show')) renderBot();
     }catch(e){}
   }

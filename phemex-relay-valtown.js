@@ -113,6 +113,36 @@ export default async function (request) {
     return json({ cancelled: r, note: "Open orders cancelled. Close any live position manually to be certain." });
   }
 
+  // ── Attach a protective stop to an EXISTING position ──
+  // Belt and braces: entry orders carry stopLossRp, but if the exchange ever drops it the
+  // position is naked. This places a reduce-only conditional stop that closes the position.
+  if (request.method === "POST" && seg === "/stop") {
+    if (KILL) return json({ error: "KILL switch is ON — no orders placed." }, 423);
+    let b; try { b = await request.json(); } catch { return json({ error: "bad json" }, 400); }
+    const symbol = String(b.symbol || "").toUpperCase();
+    const posSide = b.posSide === "Short" ? "Short" : "Long";
+    const stopPx = Number(b.stopPxRp);
+    const qty = Number(b.orderQtyRq);
+    if (!symbol || !(stopPx > 0) || !(qty > 0)) return json({ error: "symbol, stopPxRp and orderQtyRq required" }, 400);
+    const stopOrder = {
+      clOrdID: ("cipherSL-" + Date.now()).slice(0, 40),
+      symbol,
+      side: posSide === "Long" ? "Sell" : "Buy",   // closing side
+      posSide,
+      ordType: "Stop",
+      stopPxRp: String(stopPx),
+      triggerType: "ByMarkPrice",
+      orderQtyRq: String(qty),
+      timeInForce: "ImmediateOrCancel",
+      closeOnTrigger: true,
+      reduceOnly: true,
+      text: "cipher-protective-stop",
+    };
+    if (DRY) return json({ dryRun: true, wouldSend: stopOrder });
+    const r = await phemex("POST", "/g-orders", "", stopOrder);
+    return json({ sent: stopOrder, phemex: r }, r.httpStatus === 200 ? 200 : 502);
+  }
+
   // ── Place order ──
   if (request.method === "POST" && seg === "/order") {
     if (KILL) return json({ error: "KILL switch is ON — no orders placed." }, 423);
