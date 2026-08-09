@@ -5889,8 +5889,17 @@ async function autoVet(h) {
 async function execAutoTake(h) {
   try {
     if (!window.CipherExec || !h || h.botTook) return;
-    const mode = localStorage.getItem('mc_exec_mode') || 'off'; if (mode === 'off') return;
+    const mode = localStorage.getItem('mc_exec_mode') || 'off';
     const coin = String(h.coin || '').toUpperCase();
+    // LEDGER MODE: with exec off, vetted signals are still logged as tracked trades and graded
+    // against real market prices. The evidence keeps building even when nothing is being traded.
+    if (mode === 'off') {
+      if (!h.vet || h.vet.grade !== 'positive' || !Number.isFinite(+h.sl) || !Number.isFinite(+h.px)) return;
+      const thesisL = ((h.ev || []).slice(0, 3).join('; ') || h.label || '') + (h.vet.line ? ' · backtest: ' + h.vet.line : '');
+      const okL = await openPaperTrade({ coin, dir: h.dir, market: 'crypto', entry: h.px, sl: h.sl, tp1: h.tp1, tp2: h.tp2, tp3: h.tp3, source: 'ledger', vetGrade: 'positive', thesis: thesisL });
+      if (okL) { h.botTook = true; try { CipherExec.logDecision({ coin, dir: h.dir, entry: h.px, sl: h.sl, tp1: h.tp1, tp2: h.tp2, result: 'LEDGER', thesis: thesisL, source: 'ledger' }); } catch {} }
+      return;
+    }
     if (!CipherExec.symbols().includes(coin)) return; // not tradeable by the bot — stays a normal alert
     const thesis = ((h.ev || []).slice(0, 3).join('; ') || h.label || '') + (h.vet && h.vet.line ? ' · backtest: ' + h.vet.line : '');
     if (!Number.isFinite(+h.sl) || !Number.isFinite(+h.px)) { CipherExec.logDecision({ coin, dir: h.dir, skipped: 'no complete plan (missing stop)', thesis }); return; }
@@ -7816,21 +7825,59 @@ document.addEventListener('click', function(e){
   }
   async function panic(){ set(LS.mode,'off'); renderPill(); const symbols=['BTCUSDT','ETHUSDT','SOLUSDT']; for(const s of symbols){ try{ await callWorker('/panic',{symbol:s}); }catch{} } notify('KILL: exec OFF and resting orders cancelled. Check Phemex for any open position.'); pushLog({kill:true}); }
   async function status(){ try{ const url=get(LS.url,'').replace(/\/+$/,''); const res=await fetch(url+'/status',{headers:{Authorization:'Bearer '+get(LS.token,'')}}); return res.json(); }catch(e){ return {error:String(e)}; } }
+  // ═══ SELF-TEST: prove the whole chain in ~30s — order accepted, filled, stop + target attached ═══
+  // Places ONE small, fully-valid BTC long (real stop 1.5% away, target 2R), then reads the
+  // exchange back and reports pass/fail per stage. No more shipping a fix and waiting on signals.
   async function testFire(){
-    let px=0; try{ if(typeof getQuote==='function'){ const q=await getQuote('BTC','crypto'); if(Number.isFinite(q)) px=q; } }catch{}
-    if(!(px>0)){ alert('Test: could not get a live BTC price. Open the BTC chart once, then retry.'); return; }
-    const demo={coin:'BTC',dir:'long',entry:px,sl:+(px*0.90).toFixed(1),tp1:undefined,score:9,id:'test-'+Date.now()};
-    const built=buildOrder(demo); if(built.err){ alert('Test failed: '+built.err); return; }
-    const o=built.order; o.ordType='Market'; delete o.priceRp; o.timeInForce='ImmediateOrCancel'; // force a plain market order
-    try{ const r=await callWorker('/order',o); pushLog({test:true,result:r.data});
-      if(r.data && r.data.dryRun){ alert('DRY-RUN on — nothing placed. Turn DRY_RUN off on the val to trade for real.'); return; }
-      if(r.data && r.data.error){ alert('val refused: '+r.data.error); return; }
-      const d=r.data.phemex && r.data.phemex.data; const od=d && d.data;
-      await new Promise(res=>setTimeout(res,1800));
-      let pos='?'; try{ const pr=await (await fetch(get(LS.url,'').replace(/\/+$/,'')+'/positions',{headers:{Authorization:'Bearer '+get(LS.token,'')}})).json(); const L=(pr.data?.data?.positions||[]).find(p=>p.symbol==='BTCUSDT'&&p.posSide==='Long'); pos=L?L.size:'0'; }catch(e){ pos='read err'; }
-      const filled=pos&&pos!=='0'&&pos!=='?'&&pos!=='read err';
-      alert('MARKET order sent\nPhemex code: '+(d?d.code:'?')+' '+(d?d.msg:'')+'\nordStatus: '+(od?od.ordStatus:'?')+'\n\nBTC position size now: '+pos+(filled?'\n\n✓✓ IT FILLED — you have a live testnet position!':'\n\n(still 0 — market did not fill; testnet book likely empty)'));
-    }catch(e){ alert('Test error: '+e.message); }
+    const url=get(LS.url,'').replace(/\/+$/,''), tok=get(LS.token,'');
+    if(!url){ alert('Exec URL not set.'); return; }
+    const H={Authorization:'Bearer '+tok};
+    const steps=[]; const say=(ok,txt)=>steps.push((ok===null?'…  ':ok?'PASS  ':'FAIL  ')+txt);
+    const readPos=async()=>{ const r=await (await fetch(url+'/positions',{headers:H})).json();
+      return ((r.data&&r.data.data&&r.data.data.positions)||[]).find(p=>p.symbol==='BTCUSDT'&&Number(p.size)>0); };
+    const readOrders=async()=>{ const r=await (await fetch(url+'/orders?symbol=BTCUSDT',{headers:H})).json(); return r.orders||[]; };
+    try{
+      let px=0; try{ if(typeof getQuote==='function'){ const q=await getQuote('BTC','crypto'); if(Number.isFinite(q)) px=q; } }catch{}
+      if(!(px>0)){ alert('Self-test: no live BTC price. Open the BTC chart once, then retry.'); return; }
+      const before=await readPos();
+      if(before){ if(!confirm('You already hold BTCUSDT '+before.size+'. The self-test adds a small long on top. Continue?')) return; }
+
+      // A deliberately sane plan: stop 1.5% below, target 3% above (2R).
+      const entry=+px.toFixed(1), sl=+(px*0.985).toFixed(1), tp1=+(px*1.03).toFixed(1);
+      const demo={coin:'BTC',dir:'long',entry,sl,tp1,score:9,id:'selftest-'+Date.now()};
+      const bad=planValid(demo); say(!bad,'plan is valid'+(bad?' — '+bad:' (stop 1.5% below, target 2R)'));
+      if(bad){ alert('SELF-TEST\n\n'+steps.join('\n')); return; }
+
+      const built=buildOrder(demo);
+      if(built.err){ say(false,'order builder: '+built.err); alert('SELF-TEST\n\n'+steps.join('\n')); return; }
+      const o=built.order; o.ordType='Market'; delete o.priceRp; o.timeInForce='ImmediateOrCancel';
+      say(true,'order built — size '+built.meta.qty+' ('+'£'+num(LS.risk,10)+' risk)');
+
+      const r=await callWorker('/order',o);
+      if(r.data&&r.data.dryRun){ alert('SELF-TEST\n\nval is in DRY_RUN — nothing was placed.\n\n'+steps.join('\n')); return; }
+      const accepted=r.status===200&&!r.data.error;
+      say(accepted,'exchange accepted the order'+(accepted?'':' — '+(r.data.error||r.status)));
+      pushLog({test:true,coin:'BTC',dir:'long',entry,sl,tp1,qty:built.meta.qty,result:accepted?'PLACED':'ERR '+(r.data.error||r.status),thesis:'Self-test trade'});
+      if(!accepted){ alert('SELF-TEST\n\n'+steps.join('\n')+'\n\nThe order was refused — nothing is at risk.'); return; }
+
+      // Poll for the fill, then for the protective orders (Phemex creates them a beat later).
+      let pos=null; for(let i=0;i<6&&!pos;i++){ await new Promise(s=>setTimeout(s,2000)); pos=await readPos(); }
+      say(!!pos,'position filled'+(pos?' — size '+pos.size+' @ '+(pos.avgEntryPriceRp||'?'):' — no fill after 12s (thin testnet book)'));
+
+      let orders=[],hasSL=false,hasTP=false;
+      for(let i=0;i<5&&!(hasSL&&hasTP);i++){ await new Promise(s=>setTimeout(s,2000)); orders=await readOrders();
+        hasSL=orders.some(x=>Number(x.stopPxRp)>0&&Number(x.stopPxRp)<entry);
+        hasTP=orders.some(x=>Number(x.stopPxRp)>0&&Number(x.stopPxRp)>entry); }
+      const slO=orders.find(x=>Number(x.stopPxRp)>0&&Number(x.stopPxRp)<entry);
+      const tpO=orders.find(x=>Number(x.stopPxRp)>0&&Number(x.stopPxRp)>entry);
+      say(hasSL,'STOP LOSS resting on the exchange'+(slO?' @ '+slO.stopPxRp:' — NOT SET, this is the hard-rule failure'));
+      say(hasTP,'TAKE PROFIT resting on the exchange'+(tpO?' @ '+tpO.stopPxRp:' — not set'));
+
+      const allGood=accepted&&pos&&hasSL;
+      alert('SELF-TEST — '+(allGood?'CHAIN WORKING':'PROBLEM FOUND')+'\n\n'+steps.join('\n')
+        +'\n\nplanned: entry '+entry+' · stop '+sl+' · target '+tp1
+        +(pos?'\n\nThis left a real testnet position open. Close it on Phemex when you\u2019re done.':''));
+    }catch(e){ alert('SELF-TEST crashed: '+(e&&e.message||e)+'\n\n'+steps.join('\n')); }
   }
   function renderPill(){
     let el=document.getElementById('cipherExecPill');
@@ -7885,6 +7932,7 @@ document.addEventListener('click', function(e){
     if(r==='STOP ATTACHED') return ['STOP SET','#9c9'];
     if(r.startsWith('ERR')) return ['REJECTED','#e88'];
     if(r==='PLACED') return ['PLACED','#8bd'];
+    if(r==='LEDGER') return ['LEDGER','#8bd'];
     if(r==='FILLED') return ['FILLED','#9c9'];
     if(r==='CLOSED') return ['CLOSED','#bbb'];
     return ['DRY RUN','#bbb'];
@@ -7893,7 +7941,10 @@ document.addEventListener('click', function(e){
     const logEl=document.getElementById('bot-log'), stEl=document.getElementById('bot-status'), posEl=document.getElementById('bot-positions');
     if(!logEl) return;
     const mode=get(LS.mode,'off');
-    if(stEl) stEl.textContent='mode: '+mode.toUpperCase()+' · fires at score ≥ '+num(LS.min,8)+' · risk £'+num(LS.risk,10)+'/trade · exchange: Phemex testnet';
+    if(stEl) stEl.textContent=(mode==='off'
+      ? 'mode: LEDGER ONLY — vetted signals tracked and graded on real prices, no orders placed'
+      : 'mode: '+mode.toUpperCase()+' · fires at score ≥ '+num(LS.min,8)+' · exchange: Phemex testnet')
+      +' · risk £'+num(LS.risk,10)+'/trade';
     const log=(()=>{ try{ return JSON.parse(get(LS.log,'[]'))||[]; }catch{ return []; } })();
     if(!log.length){ logEl.innerHTML='<div style="font-size:11px;color:var(--dim);">No decisions yet. When a signal scores ≥ '+num(LS.min,8)+' and gets saved, it shows up here — taken or passed.</div>'; }
     else logEl.innerHTML=log.map(e=>{
