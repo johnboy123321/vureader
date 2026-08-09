@@ -140,13 +140,20 @@ export default async function (request) {
     const stopPx = Number(b.stopPxRp);
     const qty = Number(b.orderQtyRq);
     if (!symbol || !(stopPx > 0) || !(qty > 0)) return json({ error: "symbol, stopPxRp and orderQtyRq required" }, 400);
+    // Same hard rule: a protective stop on the wrong side of the market is not protection.
+    const mkt = Number(b.markPrice || b.refPx || 0);
+    if (mkt > 0) {
+      if (posSide === "Long" && stopPx >= mkt) return json({ error: `refusing stop: LONG stop ${stopPx} must be BELOW market ${mkt}` }, 400);
+      if (posSide === "Short" && stopPx <= mkt) return json({ error: `refusing stop: SHORT stop ${stopPx} must be ABOVE market ${mkt}` }, 400);
+    }
+    const sdp = mkt > 0 ? ((String(mkt).split(".")[1] || "").length || 2) : 2;
     const stopOrder = {
       clOrdID: ("cipherSL-" + Date.now()).slice(0, 40),
       symbol,
       side: posSide === "Long" ? "Sell" : "Buy",   // closing side
       posSide,
       ordType: "Stop",
-      stopPxRp: String(stopPx),
+      stopPxRp: String(Number(stopPx.toFixed(sdp))),
       triggerType: "ByMarkPrice",
       orderQtyRq: String(qty),
       timeInForce: "ImmediateOrCancel",
@@ -186,23 +193,41 @@ export default async function (request) {
     if (!stopLossRp) return json({ error: "refusing order with no stop loss" }, 400);
     if (!(refPx > 0)) return json({ error: "refPx required to size-check the order" }, 400);
 
+    // ── HARD RULE: a stop must exist AND sit on the losing side of entry. ──
+    // A long's stop is below entry, a short's is above. A stop on the wrong side is not a
+    // stop — Phemex silently drops it and the position ends up naked. Refuse the whole order.
+    const isLong = side === "Buy";
+    const slNum = Number(stopLossRp);
+    if (!(slNum > 0)) return json({ error: "refusing order: stop loss is not a valid price" }, 400);
+    if (isLong && slNum >= refPx) return json({ error: `refusing order: LONG stop ${slNum} must be BELOW entry ${refPx}` }, 400);
+    if (!isLong && slNum <= refPx) return json({ error: `refusing order: SHORT stop ${slNum} must be ABOVE entry ${refPx}` }, 400);
+    if (o.takeProfitRp != null) {
+      const tp = Number(o.takeProfitRp);
+      if (!(tp > 0) || (isLong && tp <= refPx) || (!isLong && tp >= refPx))
+        return json({ error: `refusing order: target ${tp} is on the wrong side of entry ${refPx}` }, 400);
+    }
+
     const notional = qty * refPx;
     const maxNotional = Number(cfg("MAX_NOTIONAL_USDT"));
     if (notional > maxNotional)
       return json({ error: `notional ${notional.toFixed(2)} USDT exceeds cap ${maxNotional}` }, 403);
+
+    // Match the exchange's own price precision — 14-decimal prices get rejected outright.
+    const dp = (String(refPx).split(".")[1] || "").length || 2;
+    const px = (v) => String(Number(Number(v).toFixed(dp)));
 
     const order = {
       clOrdID: (o.clOrdID || "cipher-" + Date.now()).slice(0, 40),
       symbol, side, posSide, ordType,
       orderQtyRq: String(qty),
       timeInForce: o.timeInForce || "ImmediateOrCancel",
-      stopLossRp,
+      stopLossRp: px(stopLossRp),
       slTrigger: o.slTrigger || "ByMarkPrice",
       reduceOnly: false,
       text: "cipher-auto",
     };
-    if (ordType === "Limit") order.priceRp = String(o.priceRp);
-    if (o.takeProfitRp != null) { order.takeProfitRp = String(o.takeProfitRp); order.tpTrigger = o.tpTrigger || "ByLastPrice"; }
+    if (ordType === "Limit") order.priceRp = px(o.priceRp);
+    if (o.takeProfitRp != null) { order.takeProfitRp = px(o.takeProfitRp); order.tpTrigger = o.tpTrigger || "ByLastPrice"; }
 
     if (DRY) return json({ dryRun: true, wouldSend: order, notional, cap: maxNotional });
 

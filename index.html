@@ -7756,6 +7756,18 @@ document.addEventListener('click', function(e){
   function pushLog(entry){ let log=[]; try{ log=JSON.parse(get(LS.log,'[]'))||[]; }catch{} log.unshift(Object.assign({at:new Date().toISOString()},entry)); set(LS.log,JSON.stringify(log.slice(0,150))); renderPill(); try{ const bp=document.getElementById('bot-panel'); if(bp&&bp.classList.contains('show')) renderBot(); }catch{} }
   function notify(msg){ try{ if(typeof pushPhoneAlert==='function') return pushPhoneAlert(msg); }catch{} try{ if(window.Notification && Notification.permission==='granted') new Notification('Cipher Exec',{body:msg}); }catch{} console.log('[CipherExec]',msg); }
   function roundQty(q){ if(q>=100) return Math.round(q); if(q>=1) return Math.round(q*1e3)/1e3; return Math.round(q*1e6)/1e6; }
+  // HARD RULE (John, 2026-08-09): never place a trade without a stop, and never with a stop
+  // on the wrong side of entry. Checked here, and again server-side in the relay.
+  function planValid(t){
+    const en=+t.entry, sl=+t.sl, isLong=(t.dir||'long')!=='short';
+    if(!Number.isFinite(en)||en<=0) return 'no entry price';
+    if(!Number.isFinite(sl)||sl<=0) return 'no stop loss — hard rule, never trade stopless';
+    if(isLong && sl>=en) return 'LONG stop '+sl+' is not below entry '+en;
+    if(!isLong && sl<=en) return 'SHORT stop '+sl+' is not above entry '+en;
+    const tp=+t.tp1;
+    if(Number.isFinite(tp)&&tp>0&&((isLong&&tp<=en)||(!isLong&&tp>=en))) return 'target '+tp+' is on the wrong side of entry '+en;
+    return null;
+  }
   function buildOrder(t){
     const symbol=toSymbol(t.coin); const entry=Number(t.entry), sl=Number(t.sl), tp1=Number(t.tp1);
     if(!symbol||!Number.isFinite(entry)||!Number.isFinite(sl)) return {err:'no symbol / entry / stop'};
@@ -7786,6 +7798,8 @@ document.addEventListener('click', function(e){
       const cap=num('mc_exec_daycap',10);
       try{ const dayAgo=Date.now()-24*3600*1000; const fired24=JSON.parse(get(LS.log,'[]')).filter(e=>e.at&&new Date(e.at).getTime()>dayAgo&&(e.result==='PLACED'||e.result==='dry-run OK')).length;
         if(fired24>=cap){ pushLog(Object.assign({coin:t.coin,dir:t.dir,score,skipped:'daily cap reached ('+cap+' trades/24h)'},plan)); return; } }catch{}
+      const bad=planValid(t);
+      if(bad){ pushLog(Object.assign({coin:t.coin,dir:t.dir,score,skipped:'REFUSED — '+bad},plan)); notify('Refused '+t.coin+': '+bad); return; }
       const id=tradeId(t); if(firedSet()[id]) return;
       const built=buildOrder(t); if(built.err){ pushLog(Object.assign({id,skipped:built.err,coin:t.coin,dir:t.dir,score},plan)); return; }
       markFired(id);
@@ -7981,10 +7995,17 @@ document.addEventListener('click', function(e){
         if(armed[key] && Date.now()-armed[key] < 30*60*1000) continue;
         const root=String(p.symbol||'').replace(/USDT$/,'');
         let log=[]; try{ log=JSON.parse(get(LS.log,'[]'))||[]; }catch{}
-        const src=log.find(x=>x.coin===root&&Number(x.sl)>0&&!x.skipped);
-        if(!src){ notify('⚠ '+p.symbol+' '+(p.posSide||'')+' has NO STOP and no saved plan to rebuild one — close it manually.'); armed[key]=Date.now(); continue; }
+        // Must be the plan for THIS side — a long's stop used on a short is not a stop,
+        // it sits on the wrong side of price and the exchange throws it away.
+        const wantDir=(p.posSide==='Short')?'short':'long';
+        const src=log.find(x=>x.coin===root&&Number(x.sl)>0&&!x.skipped&&String(x.dir||'').toLowerCase()===wantDir);
+        const mark=Number(p.markPriceRp||p.markPrice||0);
+        if(!src){ notify('⚠ '+p.symbol+' '+(p.posSide||'')+' has NO STOP and no matching '+wantDir+' plan to rebuild one — close it manually.'); armed[key]=Date.now(); continue; }
+        const slOK = mark>0 ? (wantDir==='long' ? +src.sl<mark : +src.sl>mark) : true;
+        if(!slOK){ pushLog({coin:root,dir:wantDir,result:'ERR stop invalid',sl:src.sl,thesis:'Planned stop '+src.sl+' is on the wrong side of the market ('+mark+') for a '+wantDir+' — refusing to place a fake stop. Close this position manually.'});
+          notify('⚠ '+p.symbol+' stop '+src.sl+' is the wrong side of price — position NOT protected, close it.'); armed[key]=Date.now(); continue; }
         try{
-          const r=await callWorker('/stop',{symbol:p.symbol,posSide:p.posSide,stopPxRp:src.sl,orderQtyRq:p.size});
+          const r=await callWorker('/stop',{symbol:p.symbol,posSide:p.posSide,stopPxRp:src.sl,orderQtyRq:p.size,markPrice:mark});
           const ok=r.status===200&&!r.data.error;
           armed[key]=Date.now();
           pushLog({coin:root,dir:(p.posSide||'').toLowerCase(),result:ok?'STOP ATTACHED':'ERR stop '+(r.data.error||r.status),sl:src.sl,thesis:ok?'Position had no exchange stop — protective stop placed at '+src.sl:'Could not attach a stop: '+(r.data.error||r.status)});
