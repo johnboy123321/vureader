@@ -7941,18 +7941,19 @@ document.addEventListener('click', function(e){
         const key=p.symbol+'|'+(p.posSide||'');
         const hasSL=Number(p.stopLossRp||p.stopLoss||0)>0;
         if(hasSL){ if(armed[key]) { delete armed[key]; } continue; }
-        if(armed[key]) continue;                       // already tried this position
+        // retry a failed attach every 30 min rather than giving up forever
+        if(armed[key] && Date.now()-armed[key] < 30*60*1000) continue;
         const root=String(p.symbol||'').replace(/USDT$/,'');
         let log=[]; try{ log=JSON.parse(get(LS.log,'[]'))||[]; }catch{}
         const src=log.find(x=>x.coin===root&&Number(x.sl)>0&&!x.skipped);
-        if(!src){ notify('⚠ '+p.symbol+' '+(p.posSide||'')+' has NO STOP and no saved plan to rebuild one — close it manually.'); armed[key]=1; continue; }
+        if(!src){ notify('⚠ '+p.symbol+' '+(p.posSide||'')+' has NO STOP and no saved plan to rebuild one — close it manually.'); armed[key]=Date.now(); continue; }
         try{
           const r=await callWorker('/stop',{symbol:p.symbol,posSide:p.posSide,stopPxRp:src.sl,orderQtyRq:p.size});
           const ok=r.status===200&&!r.data.error;
-          armed[key]=1;
+          armed[key]=Date.now();
           pushLog({coin:root,dir:(p.posSide||'').toLowerCase(),result:ok?'STOP ATTACHED':'ERR stop '+(r.data.error||r.status),sl:src.sl,thesis:ok?'Position had no exchange stop — protective stop placed at '+src.sl:'Could not attach a stop: '+(r.data.error||r.status)});
           notify((ok?'Stop attached: ':'STOP FAILED: ')+p.symbol+' @ '+src.sl);
-        }catch(e){ armed[key]=1; }
+        }catch(e){ armed[key]=Date.now(); }
       }
       set('mc_exec_slarmed',JSON.stringify(armed));
       const bp=document.getElementById('bot-panel'); if(bp&&bp.classList.contains('show')) renderBot();

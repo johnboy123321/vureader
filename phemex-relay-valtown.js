@@ -140,7 +140,13 @@ export default async function (request) {
     };
     if (DRY) return json({ dryRun: true, wouldSend: stopOrder });
     const r = await phemex("POST", "/g-orders", "", stopOrder);
-    return json({ sent: stopOrder, phemex: r }, r.httpStatus === 200 ? 200 : 502);
+    // Phemex reports rejections INSIDE a 200 via code != 0 — surface that as a real error,
+    // otherwise the app logs "stop attached" for a stop that was never placed.
+    const code = r.data && r.data.code;
+    if (r.httpStatus !== 200 || (code !== 0 && code !== undefined)) {
+      return json({ error: `phemex ${code}: ${(r.data && r.data.msg) || "rejected"}`, sent: stopOrder, phemex: r }, 502);
+    }
+    return json({ ok: true, ordStatus: r.data?.data?.ordStatus, sent: stopOrder, phemex: r });
   }
 
   // ── Place order ──
@@ -185,7 +191,11 @@ export default async function (request) {
     if (DRY) return json({ dryRun: true, wouldSend: order, notional, cap: maxNotional });
 
     const r = await phemex("POST", "/g-orders", "", order);
-    return json({ sent: order, phemex: r }, r.httpStatus === 200 ? 200 : 502);
+    const code = r.data && r.data.code;
+    if (r.httpStatus !== 200 || (code !== 0 && code !== undefined)) {
+      return json({ error: `phemex ${code}: ${(r.data && r.data.msg) || "rejected"}`, sent: order, phemex: r }, 502);
+    }
+    return json({ sent: order, phemex: r });
   }
 
   return json({ error: "not found" }, 404);
