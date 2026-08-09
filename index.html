@@ -483,6 +483,13 @@ header {
 .bot-detail { display:none; margin-top:8px; padding-top:8px; border-top:1px dashed var(--line,#2a2a2a); font-size:11px; color:var(--muted,#aaa); line-height:1.55; }
 .bot-row.open .bot-detail { display:block; }
 .bot-nostop { color:#e88; font-weight:700; font-size:10px; letter-spacing:.05em; }
+.bot-spec { font-family:ui-monospace,monospace; font-size:11px; line-height:1.85; }
+.bot-spec div { display:flex; gap:10px; }
+.bot-spec span:first-child { color:var(--dim,#888); letter-spacing:.06em; }
+.bot-spec span:last-child { margin-left:auto; color:var(--text,#ddd); }
+.bot-spec .sl span:last-child { color:#e88; }
+.bot-spec .tp span:last-child { color:#9c9; }
+.bot-spec hr { border:0; border-top:1px solid var(--line,#2a2a2a); margin:6px 0; }
 .bot-row-top { display:flex; align-items:baseline; gap:8px; font-size:12px; }
 .bot-badge { font-size:10px; font-weight:700; letter-spacing:.06em; border:1px solid; border-radius:5px; padding:1px 6px; }
 .bot-nums { display:flex; flex-wrap:wrap; gap:10px 16px; font-size:11px; color:var(--muted,#aaa); margin-top:6px; font-family:ui-monospace,monospace; }
@@ -2759,6 +2766,8 @@ async function openPaperTrade(o) {
     entry, entryAt: new Date().toISOString(), status: 'open',
     sl: Number.isFinite(o.sl) ? o.sl : null,   // exact card plan — graded T1-before-stop
     tp1: Number.isFinite(o.tp1) ? o.tp1 : null,
+    tp2: Number.isFinite(o.tp2) ? o.tp2 : null,
+    tp3: Number.isFinite(o.tp3) ? o.tp3 : null,
     vetGrade: o.vetGrade || null,              // backtest vet result, lets the exec take vetted auto-scan hits
     peak: 0, trough: 0, d3: null, d7: null, exitPrice: null, exitAt: null, result: null
   });
@@ -5886,7 +5895,7 @@ async function execAutoTake(h) {
     const thesis = ((h.ev || []).slice(0, 3).join('; ') || h.label || '') + (h.vet && h.vet.line ? ' · backtest: ' + h.vet.line : '');
     if (!Number.isFinite(+h.sl) || !Number.isFinite(+h.px)) { CipherExec.logDecision({ coin, dir: h.dir, skipped: 'no complete plan (missing stop)', thesis }); return; }
     if (!h.vet || h.vet.grade !== 'positive') { CipherExec.logDecision({ coin, dir: h.dir, entry: h.px, sl: h.sl, tp1: h.tp1, skipped: 'backtest vet ' + (h.vet ? h.vet.grade : 'not run') + (h.vet && h.vet.line ? ' — ' + h.vet.line : ''), thesis }); return; }
-    const ok = await openPaperTrade({ coin, dir: h.dir, market: 'crypto', entry: h.px, sl: h.sl, tp1: h.tp1, source: 'auto-scan', vetGrade: 'positive', thesis });
+    const ok = await openPaperTrade({ coin, dir: h.dir, market: 'crypto', entry: h.px, sl: h.sl, tp1: h.tp1, tp2: h.tp2, tp3: h.tp3, source: 'auto-scan', vetGrade: 'positive', thesis });
     if (ok) {
       h.botTook = true;
       try {
@@ -6102,7 +6111,7 @@ async function autoScanRun() {
       for (const tf of ['1D', '4H', '1H']) {
         let c; try { c = await fetchCryptoCandles(sym, tf, 260); } catch {} // 260 bars so the 200 MA cross has history
         if (!c) continue;
-        for (const k of dets) { const det = PATTERN_DETECTORS[k]; if (!det) continue; const m = det.fn(c); if (m && m.match) { const _p = buildTradePlan(c, m.dir, c[c.length-1].c); hits.push({ coin: sym, pattern: k, label: m.label, dir: m.dir, stage: m.stage||'', ev: m.ev||[], px: c[c.length-1].c, tf, sl: _p?_p.stop:null, tp1: _p?_p.targets[0].px:null, risk: _p?_p.risk:null }); } }
+        for (const k of dets) { const det = PATTERN_DETECTORS[k]; if (!det) continue; const m = det.fn(c); if (m && m.match) { const _p = buildTradePlan(c, m.dir, c[c.length-1].c); hits.push({ coin: sym, pattern: k, label: m.label, dir: m.dir, stage: m.stage||'', ev: m.ev||[], px: c[c.length-1].c, tf, sl: _p?_p.stop:null, tp1: _p?_p.targets[0].px:null, tp2: _p&&_p.targets[1]?_p.targets[1].px:null, tp3: _p&&_p.targets[2]?_p.targets[2].px:null, risk: _p?_p.risk:null }); } }
         if (tf === '1D' || tf === '4H') { for (const dh of discoveredHits(sym, c, tf)) { dh.tf = tf; hits.push(dh); } } // auto-discovered patterns
       }
     }, 4);
@@ -7765,7 +7774,7 @@ document.addEventListener('click', function(e){
     try{
       const mode=get(LS.mode,'off'); if(mode==='off') return;
       if(!t||!t.coin) return; const score=Number(t.score||0);
-      const plan={ entry:t.entry, sl:t.sl, tp1:t.tp1, thesis:t.thesis||'', source:t.source||'' };
+      const plan={ entry:t.entry, sl:t.sl, tp1:t.tp1, tp2:t.tp2, tp3:t.tp3, thesis:t.thesis||'', source:t.source||'' };
       const vetOK=(t.source==='auto-scan'&&t.vetGrade==='positive');
       if(score<num(LS.min,8) && !vetOK){ pushLog(Object.assign({coin:t.coin,dir:t.dir,score,skipped:(t.score!=null?'score '+score+' below minimum '+num(LS.min,8):'no brain score and backtest vet not positive')},plan)); return; }
       // Correlation guard — alt majors move together; 4 shorts in one sweep is one bet, not four.
@@ -7828,6 +7837,26 @@ document.addEventListener('click', function(e){
     else s+=' · no first target set — rides until you or a signal closes it';
     return s;
   }
+  // MetaSignals-style spec sheet: the whole setup at a glance, RR per target.
+  function specSheet(e){
+    const en=+e.entry, sl=+e.sl, risk=num(LS.risk,10);
+    if(!Number.isFinite(en)&&!Number.isFinite(sl)) return '';
+    const row=(k,v,cls)=>'<div'+(cls?' class="'+cls+'"':'')+'><span>'+k+'</span><span>'+v+'</span></div>';
+    const R=Number.isFinite(en)&&Number.isFinite(sl)?Math.abs(en-sl):0;
+    const tgt=(n,px)=>{ if(!Number.isFinite(+px)) return '';
+      const rr=R?Math.abs(+px-en)/R:0;
+      return row('TARGET '+n, fnum(px)+(rr?'&nbsp;&nbsp;RR '+rr.toFixed(2):'')+(rr?'&nbsp;&nbsp;<span style="color:var(--dim)">£'+(risk*rr).toFixed(0)+'</span>':''),'tp'); };
+    let s='<div class="bot-spec">';
+    s+=row('PAIR', esc((e.coin||'')+'USDT'));
+    s+=row('DIRECTION', esc(String(e.dir||'').toUpperCase()||'—'));
+    if(e.qty) s+=row('SIZE', esc(e.qty));
+    if(Number.isFinite(en)) s+=row('ENTRY', fnum(en));
+    s+='<hr>';
+    if(Number.isFinite(sl)) s+=row('STOP LOSS', fnum(sl)+(Number.isFinite(en)?'&nbsp;&nbsp;<span style="color:var(--dim)">'+(Math.abs((sl-en)/en)*100).toFixed(1)+'%</span>':''),'sl');
+    s+=tgt(1,e.tp1)+tgt(2,e.tp2)+tgt(3,e.tp3);
+    s+='<hr>'+row('RISK', '£'+risk+' at stop');
+    return s+'</div>';
+  }
   function botBadge(e){
     if(e.kill) return ['KILL','#e88'];
     if(e.test) return ['TEST','#8bd'];
@@ -7869,10 +7898,9 @@ document.addEventListener('click', function(e){
       if(e.skipped) why='<div class="bot-why">Passed: '+esc(e.skipped)+(e.thesis?' — '+esc(String(e.thesis).slice(0,160)):'')+'</div>';
       else if(e.thesis) why='<div class="bot-why">Why: '+esc(String(e.thesis).slice(0,160))+(String(e.thesis).length>160?'… <span style="color:var(--dim)">(tap for full)</span>':'')+'</div>';
       else if(e.test) why='<div class="bot-why">Manual test fire from the pill.</div>';
-      let detail='<div class="bot-detail">';
-      if(e.thesis) detail+='<div style="margin-bottom:6px;"><span style="color:var(--dim)">REASON</span><br>'+esc(e.thesis)+'</div>';
-      const exp=expectedLine(e); if(exp) detail+='<div style="margin-bottom:6px;"><span style="color:var(--dim)">EXPECTED</span><br>'+exp+'</div>';
-      detail+='<div style="color:var(--dim)">'+[e.source?'source: '+esc(e.source):'',e.mode?'mode: '+esc(e.mode):'',e.orderID?'order: '+esc(e.orderID):''].filter(Boolean).join(' · ')+'</div></div>';
+      let detail='<div class="bot-detail">'+specSheet(e);
+      if(e.thesis) detail+='<div style="margin-top:8px;"><span style="color:var(--dim)">REASON</span><br>'+esc(e.thesis)+'</div>';
+      detail+='<div style="color:var(--dim);margin-top:6px;">'+[e.source?'source: '+esc(e.source):'',e.mode?'mode: '+esc(e.mode):'',e.orderID?'order: '+esc(e.orderID):''].filter(Boolean).join(' · ')+'</div></div>';
       return '<div class="bot-row" onclick="this.classList.toggle(\'open\')">'+head+nums+why+detail+'</div>';
     }).join('');
     if(posEl){ posEl.innerHTML='<div style="font-size:11px;color:var(--dim);">Loading…</div>';
@@ -7909,14 +7937,15 @@ document.addEventListener('click', function(e){
           const pcol=Number(pnl)>0?'#9c9':Number(pnl)<0?'#e88':'var(--muted)';
           const root=String(p.symbol||'').replace(/USDT$/,'');
           const src=log.find(x=>x.coin===root && !x.skipped && !x.kill && (x.result==='PLACED'||x.test));
-          const slBit=psl>0?'<span>stop <b>'+fnum(psl)+'</b></span>':'<span class="bot-nostop">NO STOP ON EXCHANGE</span>';
+          const rsl=Number(p._restingSL||0);
+          const slBit=psl>0?'<span>stop <b>'+fnum(psl)+'</b></span>':rsl>0?'<span>stop <b style="color:#9c9">'+fnum(rsl)+'</b> <span style="color:var(--dim)">(resting order)</span></span>':'<span class="bot-nostop">NO STOP ON EXCHANGE</span>';
           const tpBit=ptp>0?'<span>target <b>'+fnum(ptp)+'</b></span>':'';
           let d='<div class="bot-detail">';
           if(src&&src.thesis) d+='<div style="margin-bottom:6px;"><span style="color:var(--dim)">REASON (from the signal that placed it)</span><br>'+esc(src.thesis)+'</div>';
           else if(src&&src.test) d+='<div style="margin-bottom:6px;">This is the leftover of your manual test fires — no thesis, no real plan. Worth closing on Phemex.</div>';
           else d+='<div style="margin-bottom:6px;">No matching bot decision found for this position — it may have been opened outside the app.</div>';
-          if(src){ const exp=expectedLine(src); if(exp) d+='<div style="margin-bottom:6px;"><span style="color:var(--dim)">PLAN</span><br>'+exp+'</div>'; }
-          if(!(psl>0)) d+='<div class="bot-nostop" style="margin-top:4px;">No stop is attached on the exchange side. Set one on Phemex, or close the position — do not leave it naked.</div>';
+          if(src) d+=specSheet(Object.assign({},src,{qty:p.size}));
+          if(!(psl>0)&&!(rsl>0)) d+='<div class="bot-nostop" style="margin-top:4px;">No stop is attached on the exchange side. Set one on Phemex, or close the position — do not leave it naked.</div>';
           d+='</div>';
           return '<div class="bot-row" onclick="this.classList.toggle(\'open\')"><div class="bot-row-top"><b>'+esc(p.symbol)+' '+esc((p.posSide||p.side||'').toUpperCase())+'</b><span style="margin-left:auto;font-family:ui-monospace,monospace;color:'+pcol+'">'+(pnl!=null?(Number(pnl)>0?'+':'')+fnum(pnl)+' USDT':'')+'</span></div>'
             +'<div class="bot-nums"><span>size <b>'+esc(p.size)+'</b></span><span>entry <b>'+fnum(entry)+'</b></span><span>mark <b>'+fnum(mark)+'</b></span>'+slBit+tpBit+'</div>'+d+'</div>';
@@ -7939,7 +7968,14 @@ document.addEventListener('click', function(e){
       let armed={}; try{ armed=JSON.parse(get('mc_exec_slarmed','{}'))||{}; }catch{}
       for(const p of open){
         const key=p.symbol+'|'+(p.posSide||'');
-        const hasSL=Number(p.stopLossRp||p.stopLoss||0)>0;
+        // A protective stop can live EITHER on the position or as a resting conditional order.
+        let restingSL=0;
+        try{ const or=await (await fetch(url+'/orders?symbol='+encodeURIComponent(p.symbol),{headers:{Authorization:'Bearer '+get(LS.token,'')}})).json();
+          const s=(or.orders||[]).find(o=>/Stop/i.test(o.ordType||'')&&(o.closeOnTrigger||o.reduceOnly)&&Number(o.stopPxRp)>0);
+          if(s) restingSL=Number(s.stopPxRp);
+        }catch{}
+        const hasSL=Number(p.stopLossRp||p.stopLoss||0)>0 || restingSL>0;
+        p._restingSL=restingSL;
         if(hasSL){ if(armed[key]) { delete armed[key]; } continue; }
         // retry a failed attach every 30 min rather than giving up forever
         if(armed[key] && Date.now()-armed[key] < 30*60*1000) continue;

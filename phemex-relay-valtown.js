@@ -113,6 +113,22 @@ export default async function (request) {
     return json({ cancelled: r, note: "Open orders cancelled. Close any live position manually to be certain." });
   }
 
+  // ── Open orders for a symbol (so the app can SEE a resting protective stop) ──
+  // A stop placed as a conditional order does NOT appear on the position object —
+  // without this the app reports "no stop" for a position that is actually protected.
+  if (request.method === "GET" && seg === "/orders") {
+    const sym = (url.searchParams.get("symbol") || "").toUpperCase();
+    if (!sym) return json({ error: "symbol required" }, 400);
+    const r = await phemex("GET", "/g-orders/activeList", `symbol=${sym}`, null);
+    const rows = (r.data && r.data.data && (r.data.data.rows || r.data.data)) || [];
+    const orders = (Array.isArray(rows) ? rows : []).map((o) => ({
+      orderID: o.orderID, clOrdID: o.clOrdID, symbol: o.symbol, side: o.side, posSide: o.posSide,
+      ordType: o.ordType, ordStatus: o.ordStatus, orderQtyRq: o.orderQtyRq,
+      stopPxRp: o.stopPxRp, priceRp: o.priceRp, closeOnTrigger: o.closeOnTrigger, reduceOnly: o.reduceOnly,
+    }));
+    return json({ symbol: sym, orders, phemexCode: r.data && r.data.code });
+  }
+
   // ── Attach a protective stop to an EXISTING position ──
   // Belt and braces: entry orders carry stopLossRp, but if the exchange ever drops it the
   // position is naked. This places a reduce-only conditional stop that closes the position.
