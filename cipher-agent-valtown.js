@@ -92,7 +92,11 @@ async function setJSON(k, v) {
 }
 
 // ═══════════════════════ INDICATORS (identical maths to the app) ═══════════════════════
-const VMC = { chlen: 9, avg: 12, malen: 3, osLevel: -53, obLevel: 53, osLevel2: -60, obLevel2: 60, mfiPeriod: 60, mfiMult: 150, mfiPosY: 2.5 };
+// Exact VuManChu inputs from John's TradingView header. Divergence levels are ASYMMETRIC.
+const VMC = { chlen: 9, avg: 12, malen: 3,
+  osLevel: -53, obLevel: 53, osLevel2: -60, obLevel2: 60, osLevel3: -75, obLevel3: 100,
+  divOB: 45, divOS: -65,
+  mfiPeriod: 60, mfiMult: 150, mfiPosY: 2.5 };
 
 function emaArr(arr, p) {
   const k = 2 / (p + 1); const out = []; let e = arr[0];
@@ -140,21 +144,24 @@ function atrArr(c, p = 14) {
 }
 
 // ═══════════════════════ MARKET DATA (Binance, OKX fallback) ═══════════════════════
-const TF_MS = { "15m": 9e5, "1H": 36e5, "4H": 144e5, "1D": 864e5, "1W": 6048e5 };
+const TF_MS = { "15m": 9e5, "30m": 1.8e6, "1H": 36e5, "4H": 144e5, "1D": 864e5, "1W": 6048e5 };
 function dropUnclosed(arr, tf) {
   if (!arr || !arr.length) return arr;
   const ms = TF_MS[tf]; if (!ms) return arr;
   const t = +arr[arr.length - 1].t;
   return (Number.isFinite(t) && (t + ms) > Date.now()) ? arr.slice(0, -1) : arr;
 }
+let _binanceUp = true;   // Binance geo-blocks GitHub's US runners; after the first failure we
+                         // skip straight to OKX rather than paying the timeout on every call.
 async function fetchCandles(sym, tf, bars = 260) {
   const s = String(sym).toUpperCase().replace(/USDT$/, "");
-  const binInt = { "15m": "15m", "1H": "1h", "4H": "4h", "1D": "1d", "1W": "1w" }[tf];
-  const okxBar = { "15m": "15m", "1H": "1H", "4H": "4H", "1D": "1Dutc", "1W": "1Wutc" }[tf];
-  try {
+  const binInt = { "15m": "15m", "30m": "30m", "1H": "1h", "4H": "4h", "1D": "1d", "1W": "1w" }[tf];
+  const okxBar = { "15m": "15m", "30m": "30m", "1H": "1H", "4H": "4H", "1D": "1Dutc", "1W": "1Wutc" }[tf];
+  if (_binanceUp) try {
     const r = await fetch(`https://api.binance.com/api/v3/klines?symbol=${s}USDT&interval=${binInt}&limit=${Math.min(bars, 1000)}`);
+    if (!r.ok) _binanceUp = false;
     if (r.ok) { const d = await r.json(); if (Array.isArray(d) && d.length) return dropUnclosed(d.map(k => ({ t: k[0], o: +k[1], h: +k[2], l: +k[3], c: +k[4], v: +k[5] })), tf); }
-  } catch { /* fall through to OKX */ }
+  } catch { _binanceUp = false; }
   try {
     const r = await fetch(`https://www.okx.com/api/v5/market/candles?instId=${s}-USDT&bar=${okxBar}&limit=${Math.min(bars, 300)}`);
     if (r.ok) { const j = await r.json(); if (j.data && j.data.length) return dropUnclosed(j.data.map(k => ({ t: +k[0], o: +k[1], h: +k[2], l: +k[3], c: +k[4], v: +k[5] })).reverse(), tf); }
@@ -192,6 +199,189 @@ async function topUniverse(n) {
   } catch { /* fall through to the fixed list */ }
   console.warn("universe: BOTH exchanges unreachable — using the 10-coin fallback list");
   return ["BTC", "ETH", "SOL", "XRP", "BNB", "DOGE", "ADA", "LINK", "AVAX", "DOT"];
+}
+
+
+// ═══════════════════════ DETECTORS ═══════════════════════
+// EXTRACTED VERBATIM from index.html so the server and the app cannot drift. Do not hand-edit:
+// re-extract if the app's versions change. Ported 2026-08-11 to bring the agent to parity —
+// before this it only had confluence scoring and missed everything these catch.
+function formatPrice(p) {
+  const n = Number(p);
+  if (!Number.isFinite(n)) return String(p);
+  if (n >= 1000) return n.toFixed(1);
+  if (n >= 1) return n.toFixed(4);
+  if (n >= 0.01) return n.toFixed(6);
+  return n.toPrecision(6);
+}
+
+function ema200At(c, i) {
+  if (!c || c.length < 200) return null;
+  const k = 2 / 201; let e = c[0].c;
+  for (let j = 1; j <= i; j++) e = c[j].c * k + e * (1 - k);
+  return e;
+}
+
+function volRatio(c, i) {
+  if (i == null || i < 20) return null;
+  let s = 0; for (let k = i - 20; k < i; k++) s += (c[k].v || 0);
+  const avg = s / 20;
+  return avg > 0 ? (c[i].v || 0) / avg : null;
+}
+
+function wtPivots(wt, kind, left = 2, right = 2) {
+  const out = [];
+  for (let i = left; i < wt.length - right; i++) {
+    const v = wt[i]; if (!Number.isFinite(v)) continue;
+    let ok = true;
+    for (let k = i - left; k <= i + right; k++) {
+      if (k === i || !Number.isFinite(wt[k])) continue;
+      if (kind === 'high' ? wt[k] > v : wt[k] < v) { ok = false; break; }
+    }
+    if (ok) out.push(i);
+  }
+  return out;
+}
+
+function vmcVwapWave(c) {
+  const { wt1, wt2 } = waveTrend(c);
+  return wt1.map((v, i) => v - wt2[i]);
+}
+
+function detectWTDivergence(c) {
+  if (!c || c.length < 80) return null;
+  const { wt1, wt2 } = waveTrend(c), n = c.length, i = n - 1;
+  const mf = vmcMoneyFlow(c);
+  const FRESH = 4; // the confirming cross must be on one of the last few closed bars
+
+  for (const dir of ['short', 'long']) {
+    const bear = dir === 'short';
+    const piv = wtPivots(wt2, bear ? 'high' : 'low');
+    if (piv.length < 2) continue;
+    const b = piv[piv.length - 1], a = piv[piv.length - 2];
+    if (n - 1 - b > 30 || b - a < 3) continue;          // stale, or the two pivots are the same swing
+
+    // price extreme at each pivot (small window around it, since price and WT rarely peak on the same bar)
+    const pxAt = (idx) => { const s = Math.max(0, idx - 2), e = Math.min(n, idx + 3); const seg = c.slice(s, e);
+      return bear ? Math.max(...seg.map(x => x.h)) : Math.min(...seg.map(x => x.l)); };
+    const pA = pxAt(a), pB = pxAt(b), wA = wt2[a], wB = wt2[b];
+
+    const priceExtends = bear ? pB > pA * 1.001 : pB < pA * 0.999;   // genuinely higher high / lower low
+    const wtFails = bear ? wB < wA - 1 : wB > wA + 1;                 // momentum did not follow
+    if (!priceExtends || !wtFails) continue;
+    const extreme = bear ? wB >= VMC.divOB : wB <= VMC.divOS;         // VuManChu divergence zones (+45 / −65)
+    if (!extreme) continue;
+
+    // ── COMPARABILITY CHECK (2026-08-10, found in testing — do not remove) ──
+    // WaveTrend divides by recent volatility. If volatility EXPANDED between the two pivots, the
+    // second WT reading is scaled down by a bigger divisor, so it prints a "lower high" even when
+    // real momentum grew — a permanent fake divergence that would short every strong rally.
+    // Measured on test cases: genuine divergences ran at 0.87–0.93× ATR (a grind, volatility flat
+    // or contracting); false ones at 2.8–3.4× (blow-off expansion). 1.5× sits clear of both.
+    const atr = atrArr(c, 14);
+    const atrA = atr[a], atrB = atr[b];
+    if (Number.isFinite(atrA) && Number.isFinite(atrB) && atrA > 0 && atrB / atrA > 1.5) continue;
+
+    // Confirmation: a WT cross in our direction that happened AT OR AFTER the second pivot.
+    // Anchoring to the pivot (not to "the last N bars") is what makes this robust — the pivot
+    // itself is only confirmed 2 bars late, so a fixed window near `now` misses real signals.
+    // wt1 leads wt2, so the cross lands ON the wt2 pivot bar or 1–2 bars before it — searching
+    // strictly after the pivot finds nothing at all (caught in testing, 2026-08-10).
+    // Take the FIRST cross following the pivot, not the most recent one: searching backwards
+    // picks up an unrelated cross made 30 bars into the move and reports it as fresh.
+    let crossIdx = -1;
+    for (let k = Math.max(1, b - 2); k < n; k++) {
+      const d0 = wt1[k] - wt2[k], d1 = wt1[k - 1] - wt2[k - 1];
+      if (bear ? (d1 >= 0 && d0 < 0) : (d1 <= 0 && d0 > 0)) { crossIdx = k; break; }
+    }
+    if (crossIdx < 0) continue;
+    const barsSince = n - 1 - crossIdx;
+    if (barsSince > 10) continue;                      // the move is long gone — not a signal any more
+
+    const ev = [
+      `${bear ? 'Bearish' : 'Bullish'} divergence: price ${bear ? 'higher high' : 'lower low'} (${formatPrice(pA)} → ${formatPrice(pB)}), WaveTrend ${bear ? 'lower high' : 'higher low'} (${wA.toFixed(0)} → ${wB.toFixed(0)})`,
+      `Pivot in the ${bear ? 'overbought' : 'oversold'} zone (WT ${wB.toFixed(0)})`,
+      `${bear ? 'Red' : 'Green'} dot confirmed ${barsSince === 0 ? 'on the last closed bar' : barsSince + ' bars ago'}`
+    ];
+    const mfAgrees = bear ? mf[i] < mf[Math.max(0, i - 3)] : mf[i] > mf[Math.max(0, i - 3)];
+    if (mfAgrees) ev.push(`Money flow ${bear ? 'rolling over' : 'turning up'}`);
+    if (barsSince > FRESH) ev.push(`Note: already ${barsSince} bars into the move — chasing risk`);
+    return { match: true, dir, label: `Class A ${bear ? 'Bearish' : 'Bullish'} Divergence`,
+      stage: barsSince <= FRESH ? 'fresh' : 'late', ev };
+  }
+  return null;
+}
+
+function detectMomentumRollover(c) {
+  if (!c || c.length < 80) return null;
+  const { wt1, wt2 } = waveTrend(c), mf = vmcMoneyFlow(c), vw = vmcVwapWave(c);
+  // 6-bar window, not 3: on a daily chart the cross prints, then price takes a few bars to
+  // confirm the roll — a 3-bar window missed a cross that was only 4 bars old (caught in testing).
+  const n = c.length, i = n - 1, FRESH = 6;
+  for (const dir of ['short', 'long']) {
+    const bear = dir === 'short';
+    // a cross in our direction on one of the last few closed bars
+    let xi = -1;
+    for (let k = i; k >= n - FRESH && k >= 1; k--) {
+      const d0 = wt1[k] - wt2[k], d1 = wt1[k - 1] - wt2[k - 1];
+      if (bear ? (d1 >= 0 && d0 < 0) : (d1 <= 0 && d0 > 0)) { xi = k; break; }
+    }
+    if (xi < 0) continue;
+    // it must be rolling over from the right side of zero — not a cross deep in the opposite zone
+    const zoneOK = bear ? wt2[xi] > 10 : wt2[xi] < -10;
+    if (!zoneOK) continue;
+    // VWAP wave (the early-warning wave) must agree, and be falling/rising into the cross
+    const vwOK = bear ? (vw[i] < vw[Math.max(0, i - 2)] && vw[i] < 0) : (vw[i] > vw[Math.max(0, i - 2)] && vw[i] > 0);
+    if (!vwOK) continue;
+    // money flow turning with it
+    const mfOK = bear ? mf[i] < mf[Math.max(0, i - 3)] : mf[i] > mf[Math.max(0, i - 3)];
+    if (!mfOK) continue;
+    const ev = [
+      `${bear ? 'Bearish' : 'Bullish'} WaveTrend cross at ${wt2[xi].toFixed(0)}${bear ? (wt2[xi] >= VMC.obLevel ? ' (overbought)' : ' (rolling over from above zero)') : (wt2[xi] <= VMC.osLevel ? ' (oversold)' : ' (turning up from below zero)')}`,
+      `VWAP wave ${bear ? 'below zero and falling' : 'above zero and rising'} (${vw[i].toFixed(1)}) — the early-warning wave agrees`,
+      `Money flow ${bear ? 'rolling over' : 'turning up'}`
+    ];
+    const extreme = bear ? wt2[xi] >= VMC.obLevel : wt2[xi] <= VMC.osLevel;
+    if (extreme) ev.push('Cross happened in the extreme zone — higher quality');
+    const age = i - xi;
+    ev.push(age === 0 ? 'Cross on the last closed bar' : `Cross ${age} bar${age === 1 ? '' : 's'} ago`);
+    return { match: true, dir, label: `Momentum Rollover ${bear ? 'Short' : 'Long'}`,
+      stage: extreme ? 'extreme' : 'mid-range', ev };
+  }
+  return null;
+}
+
+function detectGreenDotMFReversal(c) {
+  if (!c || c.length < 80) return null;
+  const { wt1, wt2 } = waveTrend(c); const mf = vmcMoneyFlow(c); const n = c.length, i = n-1;
+  // green dot must have printed on the last 1–2 closed bars (fresh), in oversold
+  let greenDot=false, gI=i;
+  for (let k=n-1;k>=n-2 && k>=1;k--){ const d0=wt1[k]-wt2[k], d1=wt1[k-1]-wt2[k-1]; if(d1<=0&&d0>0&&wt2[k]<=VMC.osLevel){greenDot=true;gI=k;break;} }
+  if (!greenDot) return null;
+  const mfUp = mf[i] > mf[Math.max(0,i-3)];                 // money flow turning up
+  if (!mfUp) return null;
+  // recent swing low (last 20 bars) for the stop
+  let lo=Infinity; for (let k=Math.max(0,n-20);k<n;k++){ if(c[k].l<lo) lo=c[k].l; }
+  if (!isFinite(lo)||lo<=0) return null;
+  const movePct = (c[i].c-lo)/lo*100;
+  if (movePct >= 40) return null;                            // already run too far — not a fresh reversal
+  // — scoring: deeper oversold, MF acceleration, volume, daily-trend gate —
+  let score = 4;
+  const ev = ['oversold green dot just fired', 'money flow turning up'];
+  const deepOS = wt2[gI] <= -60;
+  if (deepOS) { score++; ev.push('deep oversold (WT ≤ -60)'); } else ev.push('mild oversold');
+  const mfAccel = (mf[i] - mf[Math.max(0,i-2)]) > (mf[Math.max(0,i-2)] - mf[Math.max(0,i-4)]);
+  if (mfAccel) { score++; ev.push('MF accelerating, not just rising'); }
+  const vr = Math.max(volRatio(c, gI) || 0, volRatio(c, i) || 0);
+  if (vr >= 1.5) { score++; ev.push(`volume ${vr.toFixed(1)}× the 20-bar avg`); } else ev.push(`volume ${vr.toFixed(1)}× avg (modest)`);
+  const ema200 = ema200At(c, i);
+  const withTrend = ema200 == null ? null : c[i].c > ema200;
+  if (withTrend === true)  { score++; ev.push('above daily 200 EMA — with trend'); }
+  if (withTrend === false) { score--; ev.push('below daily 200 EMA — counter-trend, half size or skip'); }
+  ev.push(`+${movePct.toFixed(0)}% off the low (early)`);
+  const risk = c[i].c - lo*0.985;
+  return { match:true, dir:'long', label:'Green Dot MF Reversal', stage: withTrend === false ? 'counter-trend reversal' : 'reversal', score, base:lo,
+    entry:c[i].c, stop:lo*0.985, target:c[i].c + (risk>0?risk:c[i].c*0.02)*2, ev };
 }
 
 // ═══════════════════════ SIGNAL: confluence score (mirrors scanCoin) ═══════════════════════
@@ -352,7 +542,12 @@ export default async function cipherAgent() {
 
   const positions = await openPositions();
   const held = new Set(positions.map(p => String(p.symbol || "").replace(/USDT$/, "").toUpperCase()));
-  const sameDir = dir => positions.filter(p => String(p.posSide || p.side || "").toLowerCase() === dir).length;
+  // Positions are read ONCE per run, so trades opened during this run must be counted too —
+  // otherwise a single pass can stack far past CORR_MAX before the next run notices. Found when
+  // the ported detectors made one run place 10 orders (2026-08-11).
+  const openedThisRun = [];
+  const sameDir = dir => positions.filter(p => String(p.posSide || p.side || "").toLowerCase() === dir).length
+                       + openedThisRun.filter(d => d === dir).length;
 
   const log24 = (await getJSON(KEY.log, [])).filter(e => e.result === "PLACED" || e.result === "dry-run OK");
   const dayAgo = Date.now() - 864e5;
@@ -365,10 +560,30 @@ export default async function cipherAgent() {
     if (!coin || NOT_CRYPTO.test(coin)) continue;
     scanned++;
 
-    const tfData = {};
-    for (const tf of ["1D", "4H", "1H"]) tfData[tf] = analyzeTF(await fetchCandles(coin, tf, 260));
-    const sig = scoreCoin(tfData);
-    if (!sig || sig.score < CFG.minScore()) continue;
+    // Confluence timeframes, keeping the candles so the detectors can reuse them.
+    const bars = {}, tfData = {};
+    for (const tf of ["1D", "4H", "1H"]) { bars[tf] = await fetchCandles(coin, tf, 260); tfData[tf] = analyzeTF(bars[tf]); }
+    // Detector-only timeframes — the BTC 30m top the app missed lived here.
+    for (const tf of ["30m", "15m"]) bars[tf] = await fetchCandles(coin, tf, 260);
+
+    // Two independent sources of a trade: the confluence score, and the pattern detectors.
+    // Detectors carry no score, so they use the configured minimum — the guards below still bind.
+    let sig = scoreCoin(tfData);
+    if (sig && sig.score < CFG.minScore()) sig = null;
+    if (!sig) {
+      for (const tf of ["1D", "4H", "1H", "30m", "15m"]) {
+        const c = bars[tf]; if (!c || c.length < 80) continue;
+        let m = null, label = "";
+        for (const [nm, fn] of [["divergence", detectWTDivergence], ["rollover", detectMomentumRollover], ["greendot", detectGreenDotMFReversal]]) {
+          try { const r = fn(c); if (r && r.match) { m = r; label = nm; break; } } catch {}
+        }
+        if (!m) continue;
+        sig = { bias: m.dir, score: CFG.minScore(), ev: [m.label || label, ...(m.ev || [])].slice(0, 4),
+                price: c[c.length - 1].c, planTf: tf, detector: label };
+        break;
+      }
+    }
+    if (!sig) continue;
     candidates++;
 
     const key = `${coin}|${sig.bias}|${day}`;
@@ -377,7 +592,7 @@ export default async function cipherAgent() {
     if (sameDir(sig.bias) >= CFG.corrMax()) { await pushLog({ coin, dir: sig.bias, score: sig.score, skipped: `correlation guard — already ${sameDir(sig.bias)} ${sig.bias} positions` }); continue; }
     if (placedToday >= CFG.dayCap()) { await pushLog({ coin, dir: sig.bias, score: sig.score, skipped: `daily cap reached (${CFG.dayCap()})` }); break; }
 
-    const planBars = await fetchCandles(coin, sig.planTf || "1D", 260);
+    const planBars = bars[sig.planTf] || await fetchCandles(coin, sig.planTf || "1D", 260);
     const plan = planBars ? buildTradePlan(planBars, sig.bias, sig.price) : null;
     if (!plan) { await pushLog({ coin, dir: sig.bias, score: sig.score, skipped: "could not build a trade plan" }); continue; }
 
@@ -390,15 +605,16 @@ export default async function cipherAgent() {
 
     fired[key] = Date.now();
     if (mode === "dry") {
-      await pushLog({ ...t, qty: built.meta.qty, mode, result: "dry-run OK", thesis: sig.ev.join("; ") + " · plan from " + (sig.planTf || "1D") });
+      openedThisRun.push(sig.bias);
+      await pushLog({ ...t, qty: built.meta.qty, mode, result: "dry-run OK", thesis: sig.ev.join("; ") + " · plan from " + (sig.planTf || "1D") + (sig.detector ? " · " + sig.detector + " detector" : " · confluence") });
       placed++; placedToday++;
       continue;
     }
     const r = await relay("/order", built.order);
     const ok = r.status === 200 && !r.data.error;
     const oid = (r.data?.phemex?.data?.data?.orderID) || "";
-    await pushLog({ ...t, qty: built.meta.qty, mode, orderID: oid, result: ok ? (r.data.dryRun ? "dry-run OK" : "PLACED") : "ERR " + (r.data.error || r.status), thesis: sig.ev.join("; ") + " · plan from " + (sig.planTf || "1D") });
-    if (ok) { placed++; placedToday++; }
+    await pushLog({ ...t, qty: built.meta.qty, mode, orderID: oid, result: ok ? (r.data.dryRun ? "dry-run OK" : "PLACED") : "ERR " + (r.data.error || r.status), thesis: sig.ev.join("; ") + " · plan from " + (sig.planTf || "1D") + (sig.detector ? " · " + sig.detector + " detector" : " · confluence") });
+    if (ok) { placed++; placedToday++; openedThisRun.push(sig.bias); held.add(coin); }
   }
 
   await setJSON(KEY.fired, fired);
