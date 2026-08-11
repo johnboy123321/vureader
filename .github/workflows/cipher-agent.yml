@@ -1,0 +1,51 @@
+name: Cipher Agent
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch: {}
+
+concurrency:
+  group: cipher-agent
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      MODE: dry
+      RISK_GBP: "10"
+      MIN_SCORE: "6"
+      DAY_CAP: "25"
+      CORR_MAX: "6"
+      BATCH: "20"
+      UNIVERSE: "100"
+      RELAY_URL: ${{ secrets.RELAY_URL }}
+      RELAY_TOKEN: ${{ secrets.RELAY_TOKEN }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Run the agent
+        run: node cipher-agent-valtown.js
+
+      - name: Save state back to the repo
+        run: |
+          if [[ -n "$(git status --porcelain agent-state.json)" ]]; then
+            git config user.name  "cipher-agent"
+            git config user.email "cipher-agent@users.noreply.github.com"
+            git add agent-state.json
+            git commit -m "agent state $(date -u '+%Y-%m-%d %H:%M UTC')"
+            git pull --rebase --autostash origin "${GITHUB_REF_NAME}" || true
+            git push
+          else
+            echo "no state change this run"
+          fi
