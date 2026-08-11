@@ -1357,11 +1357,23 @@ body.layout-edit #layout-bar { display:flex; flex-wrap:wrap; justify-content:cen
 <!-- ══ BOT TRADES PANEL ══ -->
 <div id="bot-panel" onclick="closeBot(event)">
   <div class="kb-box">
-    <div class="kb-title">Bot Trades <button class="s-close" onclick="toggleBot()">✕</button></div>
+    <div class="kb-title">Bot Trades <button class="s-close" onclick="toggleBot()">✕</button><button class="s-close" style="right:52px;font-size:13px;" onclick="CipherExec.renderBot()" title="Refresh — re-read the exchange and decisions">⟳</button></div>
     <div style="font-size:12px;color:var(--dim);margin-bottom:12px;line-height:1.5;">
       Nothing here is random: the bot only acts when a signal you save (or an auto-scan entry) scores at or above the minimum, and it copies that card's exact entry, stop and first target. Below is every decision it has made — including trades it looked at and passed on — and any live positions on the exchange.
     </div>
-    <div id="bot-status" style="font-size:11px;color:var(--dim);margin-bottom:10px;font-family:ui-monospace,monospace;"></div>
+    <div id="bot-status" style="font-size:11px;color:var(--dim);margin-bottom:6px;font-family:ui-monospace,monospace;"></div>
+    <div id="bot-heartbeat" style="font-size:11px;color:var(--dim);margin-bottom:10px;font-family:ui-monospace,monospace;"></div>
+    <div style="display:flex;align-items:center;gap:8px;margin-bottom:10px;">
+      <span style="font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.8px;">Fires at score</span>
+      <select id="bot-minscore" class="t-input" style="width:auto;flex:0 0 auto;padding:4px 8px;font-size:12px;" onchange="CipherExec.setMinScore(this.value);CipherExec.renderBot();">
+        <option value="6">6+</option>
+        <option value="7">7+</option>
+        <option value="8">8+</option>
+        <option value="9">9+</option>
+      </select>
+      <span style="font-size:11px;color:var(--dim);">backtest-vetted auto-scan hits fire regardless</span>
+    </div>
+    <div id="bot-brain" style="margin-bottom:10px;"></div>
     <div id="bot-pnl" style="margin-bottom:14px;"></div>
     <div style="font-size:11px;font-weight:700;color:var(--muted);margin-bottom:6px;">OPEN POSITIONS (EXCHANGE)</div>
     <div id="bot-positions" style="margin-bottom:16px;"><div style="font-size:11px;color:var(--dim);">Loading…</div></div>
@@ -1500,6 +1512,7 @@ body.layout-edit #layout-bar { display:flex; flex-wrap:wrap; justify-content:cen
         <option value="0">Show all</option>
       </select>
       <span id="scan-filter-count" style="font-size:11px;color:var(--dim);"></span>
+      <button id="scan-bot-btn" class="t-input" style="width:auto;flex:0 0 auto;padding:6px 12px;font-size:12px;cursor:pointer;margin-left:auto;" onclick="sendAllScanToBot()">Send all to bot</button>
     </div>
     <div id="scan-results" style="margin-top:14px;"></div>
 
@@ -1770,7 +1783,7 @@ HIERARCHY OF STRENGTH:
 1. Weekly divergence = major cycle signal, plays out over weeks/months.
 2. Daily divergence = the bread-and-butter swing signal.
 3. 4H divergence = entry timing inside a Daily setup. The indicator defaults are tuned for 4H — most reliable single TF for divergence dots.
-4. Sub-4H divergences = noise for a swing trader. Ignore.
+4. 1H/15m divergence = intraday timing. Noisier and needs tighter stops, but it is TRADEABLE — the bot trades every timeframe, so judge these on the setup rather than dismissing them for being fast.
 
 GRADE A DIVERGENCE (all of):
 - Pivot in the extreme zone: WT low <= -65 (bullish) or WT high >= 45 (bearish); best at/beyond -75/+60
@@ -2674,7 +2687,7 @@ function closeQROutside(e) {
 // ═══════════════════════════ SETTINGS ═══════════════════════════
 // Model routing: 'smart' = deep-analysis model (chart reads/verdicts); 'light' = cheap model for mechanical jobs.
 // Build stamp — bump on every deploy so "which version am I running?" has a true answer.
-const APP_BUILD = 'v3.3 · 16 Jul 2026 · grounding fix — explicit signal-state (no more phantom dots), vision can\'t override computed values, auto-scan out of chat, Opus 4.8 default reads';
+const APP_BUILD = 'v3.9 · 10 Aug 2026 · accuracy pass — exact VuManChu divergence levels (+45/−65, was ±45) and an R-based drift guard so stale plans never get placed; confirmations checked on the timeframe BELOW the signal (no more waiting on the daily close) and fired straight into the bot; VWAP wave computed + Momentum Rollover; exits at T2 (2.25R); Class A divergence; 30m/15m scanning; 56-token vocabulary';
 function modelFor(tier) {
   if (tier === 'light') return localStorage.getItem('mc_model_light') || 'claude-haiku-4-5-20251001';
   return localStorage.getItem('mc_model') || 'claude-opus-4-8';
@@ -2775,6 +2788,8 @@ async function openPaperTrade(o) {
   // ── EXEC HOOK: fire a real (testnet) order iff this trade carries a stop.
   // No-op unless exec mode is armed/dry; idempotent; refuses anything stopless.
   try { if (window.CipherExec) CipherExec.onTrade(p[0]); } catch (e) { console.warn('exec hook', e); }
+  // ── SHADOW BRAIN: advisory verdict on the same candidate — logged + graded, changes nothing (Phase 1).
+  try { if (window.CipherExec && CipherExec.shadowVerdict) CipherExec.shadowVerdict(p[0]); } catch (e) {}
   return true;
 }
 
@@ -2936,6 +2951,8 @@ async function checkPaperTrades(force) {
     }
   }
   savePaper(p);
+  // Newly resolved trades grade any waiting shadow-brain verdicts (Phase 1 record building).
+  try { if (window.CipherExec && CipherExec.gradeBrain) CipherExec.gradeBrain(); } catch (e) {}
   renderPaper();
 }
 
@@ -3689,7 +3706,7 @@ function alertsContext() {
 function appSelfContext() {
   return `
 
-YOUR OWN APP (you are the brain INSIDE this program — you have full knowledge of it; never claim you cannot see the app or its workings): MarketCipherAI, a single-page trading app. Its parts: (1) AUTO-SCAN — sweeps the top-100 coins on 1D/4H/1H every cycle with VuManChu + traditional pattern detectors (golden/death cross, double top/bottom, H&S, flags, trendline breaks) plus lab-discovered patterns; every hit gets a built trade plan (entry/stop/targets from ATR) and a FREE local backtest vet (win rate + expectancy on that coin/side). (2) SIGNAL PILL/CARD — new hits pop a pill; the card shows entry/SL/3 targets/RR with your read. (3) THE BOT (Cipher Exec) — auto-places orders on Phemex TESTNET via a signing relay; it fires when a saved trade scores >= its minimum OR an auto-scan hit's backtest vet is POSITIVE on a whitelisted coin (currently BTC/ETH/SOL); modes off/dry/armed, kill switch, £risk/trade sizing; every take AND pass is logged with its reason in the Bot Trades panel (left rail). (4) LEARNING — every saved/bot trade is graded target-1-before-stop (retroactively on app open); outcomes feed pattern win rates that throttle future firing; the Discovery Lab grid-searches new patterns daily, out-of-sample gated, and self-retires losers. (5) ALERTS — price alerts, confirmation-trigger alerts, market-shift feed, phone push via ntfy, 5-min sweeps. (6) Chart log, knowledge base, macro calendar, watchlist digest. The BOT EXECUTION block below is your live feed of positions and decisions. If asked "why didn't the bot take X": check the decisions log — common reasons: exec mode off, coin not whitelisted, no stop in the plan, backtest vet not positive, score below minimum, or already holding that coin+direction.`;
+YOUR OWN APP (you are the brain INSIDE this program — you have full knowledge of it; never claim you cannot see the app or its workings): MarketCipherAI, a single-page trading app. Its parts: (1) AUTO-SCAN — sweeps the top-100 coins on 1D/4H/1H every cycle with VuManChu + traditional pattern detectors (golden/death cross, double top/bottom, H&S, flags, trendline breaks) plus lab-discovered patterns; every hit gets a built trade plan (entry/stop/targets from ATR) and a FREE local backtest vet (win rate + expectancy on that coin/side). (2) SIGNAL PILL/CARD — new hits pop a pill; the card shows entry/SL/3 targets/RR with your read. (3) THE BOT (Cipher Exec) — auto-places orders on Phemex TESTNET via a signing relay; it fires when a saved trade scores >= its minimum OR an auto-scan hit's backtest vet is POSITIVE; the whitelist is OPEN (any coin the scanner surfaces can trade — testnet); modes off/dry/armed, kill switch, £risk/trade sizing; every take AND pass is logged with its reason in the Bot Trades panel (left rail); since Aug 2026 a SHADOW BRAIN GATE also records your own advisory TAKE/PASS/RESIZE verdict on each candidate and grades it against real outcomes — advisory only until its record beats the numeric path over 20+ graded verdicts, then it earns the gate automatically. (4) LEARNING — every saved/bot trade is graded target-1-before-stop (retroactively on app open); outcomes feed pattern win rates that throttle future firing; the Discovery Lab grid-searches new patterns daily, out-of-sample gated, and self-retires losers. (5) ALERTS — price alerts, confirmation-trigger alerts, market-shift feed, phone push via ntfy, 5-min sweeps. (6) Chart log, knowledge base, macro calendar, watchlist digest. The BOT EXECUTION block below is your live feed of positions and decisions. If asked "why didn't the bot take X": check the decisions log — common reasons: exec mode off, coin not whitelisted, no stop in the plan, backtest vet not positive, score below minimum, or already holding that coin+direction.`;
 }
 
 // ── BOT EXEC CONTEXT: give the brain live knowledge of the bot's decisions + exchange positions ──
@@ -3718,6 +3735,23 @@ function botContext() {
         out += line;
       });
     } else out += '\nRECENT BOT DECISIONS: none logged yet.';
+    try {
+      const bl = JSON.parse(g('mc_exec_brainlog') || '[]') || [];
+      if (bl.length) {
+        const gr = bl.filter(e => e.outcome);
+        out += '\nSHADOW BRAIN GATE (Phase 1, advisory): you give a TAKE/PASS/RESIZE verdict on every exec candidate; it changes nothing yet but is graded on real outcomes. Record: '
+          + (gr.length ? gr.filter(e => e.brainRight).length + '/' + gr.length + ' right vs the numeric path\'s ' + gr.filter(e => e.botRight).length + '/' + gr.length : 'no graded verdicts yet')
+          + (bl.length - gr.length ? ' (' + (bl.length - gr.length) + ' awaiting outcome)' : '')
+          + '. At 20+ graded, if you are ahead, the gate goes live automatically.';
+      }
+    } catch (e) {}
+    try {
+      const sw = JSON.parse(g('mc_autoscan_lastsweep') || 'null');
+      if (sw) out += '\nLAST SCANNER SWEEP (' + Math.round((Date.now()-sw.at)/60000) + ' min ago): ' + sw.hits + ' pattern matches across the top 100 on 1D/4H/1H/30m/15m, ' + sw.fresh + ' of them NEW'
+        + (sw.alreadyToday ? ', ' + sw.alreadyToday + ' already fired earlier today (each coin+pattern+timeframe only fires once per day)' : '')
+        + (sw.suppressed ? ', ' + sw.suppressed + ' suppressed for negative backtest edge' : '')
+        + '. If the user asks why there are no trades, use THESE numbers — distinguish "the market is quiet" (few matches) from "the same setups already fired today" (many matches, few new). Never guess at settings; the minimum score and mode are stated above.';
+    } catch (e) {}
     out += '\nWhen asked why a trade was taken or passed, quote its logged reason/thesis. If an open position shows no stop or a test-fire origin, tell the user plainly and urge closing it or setting a stop on Phemex.';
     return out;
   } catch (e) { return ''; }
@@ -3728,7 +3762,7 @@ function buildSystemPrompt(query, opts) {
   const kb = opts.full ? getKB() : selectKB(query);
   const kbLabel = opts.full ? 'FULL KNOWLEDGE BASE (use all of it):' : 'RELEVANT KNOWLEDGE BASE (selected for this question):';
   return `You are the user's personal market-analysis brain. They follow Market Cipher / Vu Man Chu style charts, market structure, risk management, and a library of trader knowledge and opinions they have fed you. Read the signals, apply the setup rules and scoring from the knowledge base, and give a plain verdict.
-${appSelfContext()}${botContext()}
+${appSelfContext()}${opts.noBot ? '' : botContext()}
 
 OVERRIDE STALE DENIALS: if earlier messages in this conversation claim you have "no bot feed", "no account data" or "only know what you're told" — those were sent BEFORE the feeds above existed. They exist now, in this very prompt. Never repeat those claims; answer bot/position/decision questions directly from the BOT EXECUTION and YOUR OWN APP blocks above.
 
@@ -4346,7 +4380,7 @@ OUTPUT FORMAT — this is strict: respond with NOTHING but the JSON object below
   "alertType": "POWER 1.0" or "POWER 2.0",
   "exchange": "BINANCE",
   "pair": "${coin}-USDT",
-  "timeFrame": "4H" or "1D" or "1W" (the user swing trades — never below 4H),
+  "timeFrame": "15m" | "1H" | "4H" | "1D" | "1W" — whichever the setup actually sits on,
   "price": number,
   "dateTime": "YYYY-MM-DD AT HH:MM",
   "slLevel": number,
@@ -4494,8 +4528,8 @@ function dailyRead() {
   const input = document.getElementById('txt');
   if (!input.value.trim()) {
     input.value = pendingImages.length
-      ? 'Daily swing read on these chart(s): direction, key level, action (enter now / enter on confirmation / hold / add / reduce / wait) — 4H/Daily/Weekly lens only.'
-      : `Daily swing read on ${coin}: direction, key level, action (enter now / enter on confirmation / hold / add / reduce / wait) — 4H/Daily/Weekly lens only.`;
+      ? 'Read these chart(s): direction, key level, action (enter now / enter on confirmation / hold / add / reduce / wait). Use whatever timeframe the setup lives on.'
+      : `Read ${coin}: direction, key level, action (enter now / enter on confirmation / hold / add / reduce / wait). Use whatever timeframe the setup lives on.`;
   }
   send();
 }
@@ -4960,7 +4994,7 @@ function saveWatchlist(market, arr) { localStorage.setItem(WL_KEYS[market||'cryp
 
 // ─ Crypto candles: Binance first, OKX fallback (UK-safe) ─
 // Duration of one bar, in ms — used to detect (and drop) the still-forming candle.
-const _TF_MS = { '15m':9e5, '1H':36e5, '4H':1.44e7, '1D':8.64e7, '1W':6.048e8 };
+const _TF_MS = { '15m':9e5, '30m':1.8e6, '1H':36e5, '4H':1.44e7, '1D':8.64e7, '1W':6.048e8 };
 // VuManChu dots only confirm on a CLOSED candle. Exchange APIs return the current,
 // still-forming bar as the last element — evaluating it causes "repaint" mismatches with
 // TradingView. Drop it whenever its open-time + one interval is still in the future.
@@ -4974,10 +5008,10 @@ function dropUnclosed(arr, tf) {
 async function fetchCryptoCandles(coinSym, tf, bars) {
   bars = bars || 200;
   const sym = coinSym.toUpperCase().replace(/USDT$/, '');
-  const binInt = { '15m':'15m', '1H':'1h', '4H':'4h', '1D':'1d', '1W':'1w' }[tf];
+  const binInt = { '15m':'15m', '30m':'30m', '1H':'1h', '4H':'4h', '1D':'1d', '1W':'1w' }[tf];
   // OKX aligns plain 1D/1W to Hong Kong time (UTC+8); use the *utc variants so daily/weekly
   // candles match TradingView's UTC chart. (4H/1H/15m divide evenly, so no utc variant needed.)
-  const okxBar = { '15m':'15m', '1H':'1H', '4H':'4H', '1D':'1Dutc', '1W':'1Wutc' }[tf];
+  const okxBar = { '15m':'15m', '30m':'30m', '1H':'1H', '4H':'4H', '1D':'1Dutc', '1W':'1Wutc' }[tf];
   try {
     const r = await fetch(`https://api.binance.com/api/v3/klines?symbol=${sym}USDT&interval=${binInt}&limit=${Math.min(bars,1000)}`);
     if (r.ok) { const d = await r.json(); if (Array.isArray(d) && d.length) return dropUnclosed(d.map(k => ({ t:k[0], o:+k[1], h:+k[2], l:+k[3], c:+k[4], v:+k[5] })), tf); }
@@ -5028,7 +5062,14 @@ function smaArr(arr, p) {
   const out = []; for (let i=0;i<arr.length;i++){ if (i<p-1){out.push(NaN);continue;} let s=0; for(let j=i-p+1;j<=i;j++)s+=arr[j]; out.push(s/p);} return out;
 }
 // VuManChu Cipher B WaveTrend — exact open-source defaults: chlen 9, avg 12, MA 3, src=hlc3
-const VMC = { chlen:9, avg:12, malen:3, osLevel:-53, obLevel:53, osLevel2:-60, obLevel2:60, mfiPeriod:60, mfiMult:150, mfiPosY:2.5 };
+// Exact VuManChu Cipher B inputs, read off John's own TradingView header (2026-08-10):
+//   9 12 hlc3 3 | 53 60 100 | -53 -60 -75 | 45 -65 | 15 -40 | 60 150 2.5 | close 14 30 60 60
+// Note the DIVERGENCE levels are ASYMMETRIC — +45 bearish but −65 bullish. Using ±45 for both
+// (as this app did until now) made bullish divergences fire 20 points too easily.
+const VMC = { chlen:9, avg:12, malen:3,
+  osLevel:-53, obLevel:53, osLevel2:-60, obLevel2:60, osLevel3:-75, obLevel3:100,
+  divOB:45, divOS:-65,
+  mfiPeriod:60, mfiMult:150, mfiPosY:2.5 };
 function waveTrend(c) {
   const src = c.map(x => (x.h+x.l+x.c)/3);
   const esa = emaArr(src, VMC.chlen);
@@ -5083,6 +5124,141 @@ function detectDivergence(c, wt1, look=40) {
   if (hiB>hiA && wtHiB<wtHiA) return 'bearish';
   return null;
 }
+// ═══ VMC VWAP WAVE (2026-08-10) ═══
+// The yellow wave on the Cipher B pane: WT1 − WT2. The knowledge base has described it since
+// day one ("crossing zero → a dot is likely incoming shortly") but nothing ever COMPUTED it,
+// so no signal could use it. It leads the dots, which is exactly why John reads it.
+function vmcVwapWave(c) {
+  const { wt1, wt2 } = waveTrend(c);
+  return wt1.map((v, i) => v - wt2[i]);
+}
+
+// ═══ MOMENTUM ROLLOVER (2026-08-10) — the BTC daily read the bot could not see ═══
+// John: "vwap pointing down, red dot, money flow turning down." That is a real setup, but the
+// scanner missed it: its `redDot` requires the cross to happen while OVERBOUGHT (WT ≥ 53), and
+// this cross came at ~+20. A cross rolling over from ABOVE ZERO, with the VWAP wave turning down
+// and money flow following, is the same idea one step earlier. Mirrored for longs.
+function detectMomentumRollover(c) {
+  if (!c || c.length < 80) return null;
+  const { wt1, wt2 } = waveTrend(c), mf = vmcMoneyFlow(c), vw = vmcVwapWave(c);
+  // 6-bar window, not 3: on a daily chart the cross prints, then price takes a few bars to
+  // confirm the roll — a 3-bar window missed a cross that was only 4 bars old (caught in testing).
+  const n = c.length, i = n - 1, FRESH = 6;
+  for (const dir of ['short', 'long']) {
+    const bear = dir === 'short';
+    // a cross in our direction on one of the last few closed bars
+    let xi = -1;
+    for (let k = i; k >= n - FRESH && k >= 1; k--) {
+      const d0 = wt1[k] - wt2[k], d1 = wt1[k - 1] - wt2[k - 1];
+      if (bear ? (d1 >= 0 && d0 < 0) : (d1 <= 0 && d0 > 0)) { xi = k; break; }
+    }
+    if (xi < 0) continue;
+    // it must be rolling over from the right side of zero — not a cross deep in the opposite zone
+    const zoneOK = bear ? wt2[xi] > 10 : wt2[xi] < -10;
+    if (!zoneOK) continue;
+    // VWAP wave (the early-warning wave) must agree, and be falling/rising into the cross
+    const vwOK = bear ? (vw[i] < vw[Math.max(0, i - 2)] && vw[i] < 0) : (vw[i] > vw[Math.max(0, i - 2)] && vw[i] > 0);
+    if (!vwOK) continue;
+    // money flow turning with it
+    const mfOK = bear ? mf[i] < mf[Math.max(0, i - 3)] : mf[i] > mf[Math.max(0, i - 3)];
+    if (!mfOK) continue;
+    const ev = [
+      `${bear ? 'Bearish' : 'Bullish'} WaveTrend cross at ${wt2[xi].toFixed(0)}${bear ? (wt2[xi] >= VMC.obLevel ? ' (overbought)' : ' (rolling over from above zero)') : (wt2[xi] <= VMC.osLevel ? ' (oversold)' : ' (turning up from below zero)')}`,
+      `VWAP wave ${bear ? 'below zero and falling' : 'above zero and rising'} (${vw[i].toFixed(1)}) — the early-warning wave agrees`,
+      `Money flow ${bear ? 'rolling over' : 'turning up'}`
+    ];
+    const extreme = bear ? wt2[xi] >= VMC.obLevel : wt2[xi] <= VMC.osLevel;
+    if (extreme) ev.push('Cross happened in the extreme zone — higher quality');
+    const age = i - xi;
+    ev.push(age === 0 ? 'Cross on the last closed bar' : `Cross ${age} bar${age === 1 ? '' : 's'} ago`);
+    return { match: true, dir, label: `Momentum Rollover ${bear ? 'Short' : 'Long'}`,
+      stage: extreme ? 'extreme' : 'mid-range', ev };
+  }
+  return null;
+}
+
+// ═══ DIVERGENCE DETECTOR (2026-08-10) — the gap that missed the BTC 30m top ═══
+// The old detectDivergence() compares two window halves: fine as context, useless as a signal.
+// This one finds real FRACTAL pivots (confirmed 2 bars later, per the KB lag rule), compares the
+// last two, and only fires when a WT cross confirms the turn. Class A only: the second pivot must
+// be in the extreme zone, and price must make a genuinely higher high / lower low.
+function wtPivots(wt, kind, left = 2, right = 2) {
+  const out = [];
+  for (let i = left; i < wt.length - right; i++) {
+    const v = wt[i]; if (!Number.isFinite(v)) continue;
+    let ok = true;
+    for (let k = i - left; k <= i + right; k++) {
+      if (k === i || !Number.isFinite(wt[k])) continue;
+      if (kind === 'high' ? wt[k] > v : wt[k] < v) { ok = false; break; }
+    }
+    if (ok) out.push(i);
+  }
+  return out;
+}
+function detectWTDivergence(c) {
+  if (!c || c.length < 80) return null;
+  const { wt1, wt2 } = waveTrend(c), n = c.length, i = n - 1;
+  const mf = vmcMoneyFlow(c);
+  const FRESH = 4; // the confirming cross must be on one of the last few closed bars
+
+  for (const dir of ['short', 'long']) {
+    const bear = dir === 'short';
+    const piv = wtPivots(wt2, bear ? 'high' : 'low');
+    if (piv.length < 2) continue;
+    const b = piv[piv.length - 1], a = piv[piv.length - 2];
+    if (n - 1 - b > 30 || b - a < 3) continue;          // stale, or the two pivots are the same swing
+
+    // price extreme at each pivot (small window around it, since price and WT rarely peak on the same bar)
+    const pxAt = (idx) => { const s = Math.max(0, idx - 2), e = Math.min(n, idx + 3); const seg = c.slice(s, e);
+      return bear ? Math.max(...seg.map(x => x.h)) : Math.min(...seg.map(x => x.l)); };
+    const pA = pxAt(a), pB = pxAt(b), wA = wt2[a], wB = wt2[b];
+
+    const priceExtends = bear ? pB > pA * 1.001 : pB < pA * 0.999;   // genuinely higher high / lower low
+    const wtFails = bear ? wB < wA - 1 : wB > wA + 1;                 // momentum did not follow
+    if (!priceExtends || !wtFails) continue;
+    const extreme = bear ? wB >= VMC.divOB : wB <= VMC.divOS;         // VuManChu divergence zones (+45 / −65)
+    if (!extreme) continue;
+
+    // ── COMPARABILITY CHECK (2026-08-10, found in testing — do not remove) ──
+    // WaveTrend divides by recent volatility. If volatility EXPANDED between the two pivots, the
+    // second WT reading is scaled down by a bigger divisor, so it prints a "lower high" even when
+    // real momentum grew — a permanent fake divergence that would short every strong rally.
+    // Measured on test cases: genuine divergences ran at 0.87–0.93× ATR (a grind, volatility flat
+    // or contracting); false ones at 2.8–3.4× (blow-off expansion). 1.5× sits clear of both.
+    const atr = atrArr(c, 14);
+    const atrA = atr[a], atrB = atr[b];
+    if (Number.isFinite(atrA) && Number.isFinite(atrB) && atrA > 0 && atrB / atrA > 1.5) continue;
+
+    // Confirmation: a WT cross in our direction that happened AT OR AFTER the second pivot.
+    // Anchoring to the pivot (not to "the last N bars") is what makes this robust — the pivot
+    // itself is only confirmed 2 bars late, so a fixed window near `now` misses real signals.
+    // wt1 leads wt2, so the cross lands ON the wt2 pivot bar or 1–2 bars before it — searching
+    // strictly after the pivot finds nothing at all (caught in testing, 2026-08-10).
+    // Take the FIRST cross following the pivot, not the most recent one: searching backwards
+    // picks up an unrelated cross made 30 bars into the move and reports it as fresh.
+    let crossIdx = -1;
+    for (let k = Math.max(1, b - 2); k < n; k++) {
+      const d0 = wt1[k] - wt2[k], d1 = wt1[k - 1] - wt2[k - 1];
+      if (bear ? (d1 >= 0 && d0 < 0) : (d1 <= 0 && d0 > 0)) { crossIdx = k; break; }
+    }
+    if (crossIdx < 0) continue;
+    const barsSince = n - 1 - crossIdx;
+    if (barsSince > 10) continue;                      // the move is long gone — not a signal any more
+
+    const ev = [
+      `${bear ? 'Bearish' : 'Bullish'} divergence: price ${bear ? 'higher high' : 'lower low'} (${formatPrice(pA)} → ${formatPrice(pB)}), WaveTrend ${bear ? 'lower high' : 'higher low'} (${wA.toFixed(0)} → ${wB.toFixed(0)})`,
+      `Pivot in the ${bear ? 'overbought' : 'oversold'} zone (WT ${wB.toFixed(0)})`,
+      `${bear ? 'Red' : 'Green'} dot confirmed ${barsSince === 0 ? 'on the last closed bar' : barsSince + ' bars ago'}`
+    ];
+    const mfAgrees = bear ? mf[i] < mf[Math.max(0, i - 3)] : mf[i] > mf[Math.max(0, i - 3)];
+    if (mfAgrees) ev.push(`Money flow ${bear ? 'rolling over' : 'turning up'}`);
+    if (barsSince > FRESH) ev.push(`Note: already ${barsSince} bars into the move — chasing risk`);
+    return { match: true, dir, label: `Class A ${bear ? 'Bearish' : 'Bullish'} Divergence`,
+      stage: barsSince <= FRESH ? 'fresh' : 'late', ev };
+  }
+  return null;
+}
+
 // ─ Volume analytics: profile (POC / HVN floor & ceiling) + open fair value gaps ─
 function volumeProfile(c, bins) {
   const n = c.length; if (n < 60) return null;
@@ -5563,7 +5739,9 @@ const PATTERN_DETECTORS = {
   ma_cross:           { label:'Golden/Death Cross',          dir:'any',   fn: detectMACross },
   double_tb:          { label:'Double Top/Bottom',           dir:'any',   fn: detectDoubleTopBottom },
   head_shoulders:     { label:'Head & Shoulders',            dir:'any',   fn: detectHeadShoulders },
-  flag:               { label:'Bull/Bear Flag',              dir:'any',   fn: detectFlag }
+  flag:               { label:'Bull/Bear Flag',              dir:'any',   fn: detectFlag },
+  divergence:         { label:'Class A Divergence',          dir:'any',   fn: detectWTDivergence },
+  momentum_rollover:  { label:'Momentum Rollover (VWAP+MF)', dir:'any',   fn: detectMomentumRollover }
 };
 
 // Scan the universe with a coded detector (daily candles only — fast: 1 fetch/coin)
@@ -5600,7 +5778,21 @@ async function universeScanPattern(detKey, opts) {
 // Continuously sweeps the top-150 for the enabled coded detectors and pings on new hits.
 let _autoScanTimer = null, _autoScanBusy = false;
 function autoScanEnabled() { return localStorage.getItem('mc_autoscan') === '1'; }
-function autoScanPatterns() { try { return JSON.parse(localStorage.getItem('mc_autoscan_patterns')||'null') || ['parabolic_short','ignition_long','ma_cross','double_tb','head_shoulders','flag']; } catch { return ['parabolic_short','ignition_long']; } }
+function autoScanPatterns() {
+  const DEF = ['parabolic_short','ignition_long','ma_cross','double_tb','head_shoulders','flag','divergence','green_dot_reversal','momentum_rollover'];
+  try {
+    let l = JSON.parse(localStorage.getItem('mc_autoscan_patterns')||'null') || DEF;
+    // Divergence + green-dot reversal were never in the saved default list — that's how the
+    // BTC 30m divergence top went unseen (2026-08-10). Add them once to existing installs.
+    if (!localStorage.getItem('mc_patterns_div') || !localStorage.getItem('mc_patterns_roll')) {
+      for (const k of ['divergence','green_dot_reversal','momentum_rollover']) if (!l.includes(k)) l.push(k);
+      localStorage.setItem('mc_patterns_roll','1');
+      localStorage.setItem('mc_autoscan_patterns', JSON.stringify(l));
+      localStorage.setItem('mc_patterns_div','1');
+    }
+    return l;
+  } catch { return DEF; }
+}
 // One-time migration: switch the traditional detectors ON for existing settings.
 (function(){ try {
   if (localStorage.getItem('mc_tradpat_v1')) return;
@@ -5655,7 +5847,7 @@ function fireAutoAlarm(fresh) {
   // AUTO-VET pipeline: backtest each new match (free, local) and only escalate real edges
   fresh.slice(0, 2).forEach((h, ix) => setTimeout(() => { autoVet(h); }, 1500 + ix * 5000));
   // Bot-tradeable coins ALWAYS get vetted (and auto-taken if the vet is positive), wherever they rank.
-  try { fresh.slice(2).filter(h => window.CipherExec && CipherExec.symbols().includes(String(h.coin||'').toUpperCase()))
+  try { fresh.slice(2).filter(h => window.CipherExec && CipherExec.symOK(h.coin))
     .forEach((h, ix) => setTimeout(() => { autoVet(h); }, 12000 + ix * 5000)); } catch {}
 }
 
@@ -5756,7 +5948,7 @@ async function openSignalCard(hit) {
       <button id="sig-verdict-btn" onclick="sigFullVerdict()">Full verdict</button>
     </div>
     <div class="sig-note">Levels are computed (10-bar structure + ATR) — confirm on your own chart. Not financial advice.</div>`;
-  _sigCardHit = { coin: hit.coin, label: hit.label, ev: hit.ev, score: hit.score, dir, entry, plan, verdict: null, saved: false };
+  _sigCardHit = { coin: hit.coin, label: hit.label, ev: hit.ev, score: hit.score, dir, entry, plan, tf: hit.tf || '1D', verdict: null, saved: false };
   _sigMinimised = false;
   sigBrainRead(_sigCardHit);
 }
@@ -5779,12 +5971,92 @@ async function sigBrainRead(h) {
         messages: [{ role:'user', content:
 `The auto-scan flagged ${h.coin} ${h.dir.toUpperCase()}: ${h.label || 'setup'}. Evidence: ${(h.ev || []).join('; ') || 'n/a'}.
 Computed plan (1D): entry ${formatPrice(h.entry)}${h.plan ? `, stop ${formatPrice(h.plan.stop)}, T1 ${formatPrice(h.plan.targets[0].px)} / T2 ${formatPrice(h.plan.targets[1].px)} / T3 ${formatPrice(h.plan.targets[2].px)}` : ''}.
-MAX 45 words. First words must be ENTER NOW, ENTER ON CONFIRMATION (then the ONE exact trigger), or PASS — then one line why. If it's unclear, still give your best lean and the trigger; never answer with a bare "wait".` }] })
+MAX 45 words. First words must be ENTER NOW, ENTER ON CONFIRMATION (then the ONE exact trigger), or PASS — then one line why. If it's unclear, still give your best lean and the trigger; never answer with a bare "wait".
+
+CONFIRMATION RULES — these matter, John's confirmations have been arriving too late:
+1. The trigger MUST be a specific price that is MEANINGFULLY away from the current price (${formatPrice(h.entry)}) — a real level (the cross bar's high/low, a swing high/low, a round number). "Close above ${formatPrice(h.entry)}" is not a trigger, it is where we already are.
+2. Confirmation is measured on the NEXT TIMEFRAME DOWN from the signal, never the signal's own close. A ${h.tf || '1D'} signal confirms on a ${({'1W':'1D','1D':'4H','4H':'1H','1H':'15m','30m':'15m','15m':'15m'})[h.tf || '1D'] || '4H'} close. Waiting for the daily close on a momentum signal means missing the move.
+3. Write the trigger as: "close above/below <price> on the <timeframe>". The app parses this and arms the bot on it automatically.` }] })
     });
     if (!res.ok) { const err = await res.json().catch(() => ({})); throw new Error(err.error?.message || ('HTTP ' + res.status)); }
     const txt = (extractText(await res.json()) || '').trim();
     const e = el(); if (e) e.textContent = txt || 'No read returned.';
+    // ENTER ON CONFIRMATION → arm the watcher automatically. No button: the trade fires the
+    // moment a lower-timeframe bar closes through the trigger, rather than waiting on the daily.
+    try {
+      const trig = parseConfirmTrigger(txt, h.dir, h.entry, h.tf);
+      if (trig && armConfirmWatch(h, trig)) {
+        const note = document.getElementById('sig-brain-txt');
+        if (note) note.textContent = txt + `\n\n⌁ Armed: watching ${trig.tf} closes for ${h.dir === 'short' ? 'a close below' : 'a close above'} ${formatPrice(trig.px)}. The bot takes it automatically when that prints.`;
+      }
+    } catch (x) {}
   } catch (err) { const e = el(); if (e) e.textContent = 'Read failed: ' + err.message; }
+}
+
+// ═══ CONFIRMATION WATCHER (2026-08-10) ═══
+// John: "its confirmations are too late". A 1D signal saying "close above X" meant waiting up to
+// 24 hours — the move is gone by then. Confirmation is now checked on the NEXT TIMEFRAME DOWN,
+// on closed bars only, every 5-minute sweep. When it triggers, the trade goes straight into the
+// bot pipeline (exec hook + shadow verdict) with no button to press.
+const CONFIRM_TF_DOWN = { '1W':'1D', '1D':'4H', '4H':'1H', '1H':'15m', '30m':'15m', '15m':'15m' };
+function getConfirmWatch() { try { return JSON.parse(localStorage.getItem('mc_confirm_watch') || '[]'); } catch { return []; } }
+function saveConfirmWatch(w) { localStorage.setItem('mc_confirm_watch', JSON.stringify(w.slice(0, 40))); }
+
+// Pull "close above 67,875 on the 4H" out of the brain's read. Returns null if it named no real level.
+function parseConfirmTrigger(text, dir, entry, sigTf) {
+  if (!/ENTER ON CONFIRMATION/i.test(String(text || ''))) return null;
+  const m = String(text).match(/\b(?:above|below|over|under|breaks?|reclaims?)\s*\$?\s*([0-9][0-9,]*\.?[0-9]*)/i);
+  if (!m) return null;
+  const px = parseFloat(m[1].replace(/,/g, ''));
+  if (!Number.isFinite(px) || px <= 0) return null;
+  // Reject a "trigger" that is really just the current price (within 0.15%) — that is not a trigger.
+  if (Number.isFinite(entry) && Math.abs(px - entry) / entry < 0.0015) return null;
+  const tfM = String(text).match(/\bon the (1W|1D|4H|1H|30m|15m)\b/i);
+  const tf = tfM ? tfM[1] : (CONFIRM_TF_DOWN[sigTf || '1D'] || '4H');
+  return { px, tf };
+}
+
+function armConfirmWatch(hit, trig) {
+  const w = getConfirmWatch();
+  const key = hit.coin + '|' + hit.dir + '|' + trig.px;
+  if (w.some(x => x.key === key && x.status === 'watching')) return false;
+  w.unshift({ key, coin: hit.coin, dir: hit.dir, trigger: trig.px, tf: trig.tf,
+    entry: hit.entry, sl: hit.plan ? hit.plan.stop : null,
+    tp1: hit.plan ? hit.plan.targets[0].px : null, tp2: hit.plan ? hit.plan.targets[1].px : null,
+    label: hit.label || '', score: hit.score || null,
+    armedAt: Date.now(), expiresAt: Date.now() + 48 * 3600 * 1000, status: 'watching' });
+  saveConfirmWatch(w);
+  return true;
+}
+
+// Runs on every auto-scan sweep (5 min). Checks CLOSED bars only — an intrabar poke through
+// the level is not a confirmation, which is the whole point of waiting.
+async function checkConfirmWatches() {
+  const w = getConfirmWatch();
+  const live = w.filter(x => x.status === 'watching');
+  if (!live.length) return;
+  let changed = false;
+  for (const x of live) {
+    if (Date.now() > x.expiresAt) { x.status = 'expired'; changed = true; continue; }
+    let c = null;
+    try { c = await fetchCryptoCandles(x.coin, x.tf, 30); } catch {}
+    if (!c || !c.length) continue;
+    const last = c[c.length - 1];                       // fetchCryptoCandles already drops the unclosed bar
+    const hit = x.dir === 'short' ? last.c < x.trigger : last.c > x.trigger;
+    if (!hit) continue;
+    x.status = 'triggered'; x.triggeredAt = Date.now(); x.triggerClose = last.c; changed = true;
+    // Straight into the pipeline — the bot and the shadow brain both see it.
+    try {
+      const ok = await openPaperTrade({ coin: x.coin, dir: x.dir, market: 'crypto', score: x.score,
+        entry: last.c, sl: x.sl, tp1: x.tp1, tp2: x.tp2,
+        thesis: (x.label ? x.label + ' — ' : '') + `confirmed: ${x.tf} closed ${x.dir === 'short' ? 'below' : 'above'} ${formatPrice(x.trigger)}`,
+        source: 'confirmed' });
+      const msg = `**Confirmation hit — ${x.coin} ${x.dir.toUpperCase()}.** The ${x.tf} just closed ${x.dir === 'short' ? 'below' : 'above'} ${formatPrice(x.trigger)} at ${formatPrice(last.c)}. ${ok ? 'Logged and handed to the bot.' : 'Already tracked.'}`;
+      if (typeof addAIMsg === 'function') addAIMsg(msg);
+      if (typeof pushPhoneAlert === 'function') pushPhoneAlert(`${x.coin} ${x.dir.toUpperCase()} confirmed on the ${x.tf} — ${formatPrice(last.c)}`);
+    } catch (e) { console.warn('confirm fire', e); }
+  }
+  if (changed) saveConfirmWatch(w);
 }
 
 // Save trade: logs it as a paper trade, then the card tucks up into the pill so it sits at the top.
@@ -5900,11 +6172,16 @@ async function execAutoTake(h) {
       if (okL) { h.botTook = true; try { CipherExec.logDecision({ coin, dir: h.dir, entry: h.px, sl: h.sl, tp1: h.tp1, tp2: h.tp2, result: 'LEDGER', thesis: thesisL, source: 'ledger' }); } catch {} }
       return;
     }
-    if (!CipherExec.symbols().includes(coin)) return; // not tradeable by the bot — stays a normal alert
+    if (!CipherExec.symOK(coin)) return; // not tradeable by the bot — stays a normal alert
     const thesis = ((h.ev || []).slice(0, 3).join('; ') || h.label || '') + (h.vet && h.vet.line ? ' · backtest: ' + h.vet.line : '');
     if (!Number.isFinite(+h.sl) || !Number.isFinite(+h.px)) { CipherExec.logDecision({ coin, dir: h.dir, skipped: 'no complete plan (missing stop)', thesis }); return; }
-    if (!h.vet || h.vet.grade !== 'positive') { CipherExec.logDecision({ coin, dir: h.dir, entry: h.px, sl: h.sl, tp1: h.tp1, skipped: 'backtest vet ' + (h.vet ? h.vet.grade : 'not run') + (h.vet && h.vet.line ? ' — ' + h.vet.line : ''), thesis }); return; }
-    const ok = await openPaperTrade({ coin, dir: h.dir, market: 'crypto', entry: h.px, sl: h.sl, tp1: h.tp1, tp2: h.tp2, tp3: h.tp3, source: 'auto-scan', vetGrade: 'positive', thesis });
+    // DEMO PHASE (2026-08-09 handbrake off): 'positive' was too strict — almost nothing earns it,
+    // so the bot sat idle all night. Now only a NEGATIVE vet blocks; caution/unproven/not-run
+    // proceed and get graded. Restore the strict test before live: set mc_exec_vetstrict='1'.
+    const vetGrade = (h.vet && h.vet.grade) || 'not run';
+    const vetBlocks = (localStorage.getItem('mc_exec_vetstrict') === '1') ? (vetGrade !== 'positive') : (vetGrade === 'negative');
+    if (vetBlocks) { CipherExec.logDecision({ coin, dir: h.dir, entry: h.px, sl: h.sl, tp1: h.tp1, skipped: 'backtest vet ' + vetGrade + (h.vet && h.vet.line ? ' — ' + h.vet.line : ''), thesis }); return; }
+    const ok = await openPaperTrade({ coin, dir: h.dir, market: 'crypto', entry: h.px, sl: h.sl, tp1: h.tp1, tp2: h.tp2, tp3: h.tp3, source: 'auto-scan', vetGrade, thesis });
     if (ok) {
       h.botTook = true;
       try {
@@ -6109,6 +6386,7 @@ function learningAdjust(coin, dir) {
 async function autoScanRun() {
   if (_autoScanBusy) return;
   try { await gradeAutoFeed(); } catch {}
+  try { await checkConfirmWatches(); } catch {}   // armed confirmations checked every sweep, not on the HTF close
   const dets = autoScanPatterns();
   if (!dets.length) { setAutoStatus('No patterns selected.'); return; }
   _autoScanBusy = true;
@@ -6117,22 +6395,23 @@ async function autoScanRun() {
   try {
     const uni = await fetchTopUniverse(100);
     await mapPool(uni, async (sym) => {
-      for (const tf of ['1D', '4H', '1H']) {
+      // 30m + 15m added 2026-08-10 — the BTC divergence top happened on 30m, which wasn't scanned.
+      for (const tf of ['1D', '4H', '1H', '30m', '15m']) {
         let c; try { c = await fetchCryptoCandles(sym, tf, 260); } catch {} // 260 bars so the 200 MA cross has history
         if (!c) continue;
         for (const k of dets) { const det = PATTERN_DETECTORS[k]; if (!det) continue; const m = det.fn(c); if (m && m.match) { const _p = buildTradePlan(c, m.dir, c[c.length-1].c); hits.push({ coin: sym, pattern: k, label: m.label, dir: m.dir, stage: m.stage||'', ev: m.ev||[], px: c[c.length-1].c, tf, sl: _p?_p.stop:null, tp1: _p?_p.targets[0].px:null, tp2: _p&&_p.targets[1]?_p.targets[1].px:null, tp3: _p&&_p.targets[2]?_p.targets[2].px:null, risk: _p?_p.risk:null }); } }
-        if (tf === '1D' || tf === '4H') { for (const dh of discoveredHits(sym, c, tf)) { dh.tf = tf; hits.push(dh); } } // auto-discovered patterns
+        for (const dh of discoveredHits(sym, c, tf)) { dh.tf = tf; hits.push(dh); } // auto-discovered patterns (1D/4H/1H)
       }
     }, 4);
   } catch (e) { _autoScanBusy = false; setAutoStatus('Scan error — will retry next cycle.'); return; }
 
   const fired = getAutoFired(); const now = Date.now(); const day = new Date().toISOString().slice(0,10);
   Object.keys(fired).forEach(k => { if (now - fired[k] > 24*3600*1000) delete fired[k]; }); // expire 24h
-  const edges = backtestEdges(); let suppressed = 0;
+  const edges = backtestEdges(); let suppressed = 0, alreadyToday = 0;
   const fresh = [];
   for (const h of hits) {
     const key = h.coin+'|'+h.pattern+'|'+(h.tf||'1D')+'|'+day;
-    if (fired[key]) continue;
+    if (fired[key]) { alreadyToday++; continue; }   // counted so "nothing found" and "all seen already" stop looking identical
     fired[key] = now;
     // Backtest-aware firing: don't surface a side the coin has no proven edge on.
     if ((edges[h.coin] || {})[h.dir] === 'negative') { suppressed++; continue; }
@@ -6145,14 +6424,22 @@ async function autoScanRun() {
     localStorage.setItem('mc_autoscan_feed', JSON.stringify(feed.slice(-200)));
     fireAutoAlarm(fresh);
   }
-  setAutoStatus(`Last sweep ${new Date().toLocaleTimeString()} · ${hits.length} match${hits.length===1?'':'es'}, ${fresh.length} new${suppressed?`, ${suppressed} skipped (no backtest edge)`:''}`);
+  // Full accounting — every match is explained, so silence is never ambiguous.
+  const bits = [`${hits.length} match${hits.length===1?'':'es'}`, `${fresh.length} new`];
+  if (alreadyToday) bits.push(`${alreadyToday} already fired today`);
+  if (suppressed) bits.push(`${suppressed} skipped (negative backtest edge)`);
+  if (!hits.length) bits.push('market genuinely quiet — no detector matched on any coin/timeframe');
+  else if (!fresh.length) bits.push('nothing NEW — the same setups are still standing');
+  setAutoStatus(`Last sweep ${new Date().toLocaleTimeString()} · ${bits.join(' · ')}`);
+  try { localStorage.setItem('mc_autoscan_lastsweep', JSON.stringify({ at: Date.now(), hits: hits.length, fresh: fresh.length, alreadyToday, suppressed })); } catch {}
+  try { localStorage.setItem('mc_autoscan_lastrun', String(Date.now())); } catch {} // heartbeat for the Bot Trades panel
   renderAutoFeed();
   _autoScanBusy = false;
 }
 
 function startAutoScan() {
   if (_autoScanTimer) return;
-  _autoScanTimer = setInterval(() => { if (autoScanEnabled()) autoScanRun(); }, 15*60*1000); // every 15 min
+  _autoScanTimer = setInterval(() => { if (autoScanEnabled()) autoScanRun(); }, 5*60*1000); // every 5 min (was 15 — John, 2026-08-10)
   setTimeout(() => { if (autoScanEnabled()) autoScanRun(); }, 8000);
 }
 function setAutoScan(on) {
@@ -6288,7 +6575,36 @@ const DISCOVERY_VOCAB = {
   engulfBear:   'Bearish engulfing candle (red body fully engulfs the prior green body)',
   ema21Above50: '21 EMA above the 50 EMA (bullish moving-average structure)',
   ema21Below50: '21 EMA below the 50 EMA (bearish moving-average structure)',
-  nearEma50:    'Close within 0.5 ATR of the 50 EMA (pullback/retest zone)'
+  nearEma50:    'Close within 0.5 ATR of the 50 EMA (pullback/retest zone)',
+  // ── vocabulary v3 (2026-08-10): new raw materials so the lab can find setups it previously
+  // had no words for. Volatility regime, long-trend context, divergence, range position,
+  // exhaustion and participation. Every one still has to earn its place out-of-sample.
+  aboveEma200:  'Close above the 200 EMA (long-term uptrend)',
+  belowEma200:  'Close below the 200 EMA (long-term downtrend)',
+  ribbonUp:     '21 EMA above 50 EMA above 200 EMA (fully stacked bullish)',
+  ribbonDown:   '21 EMA below 50 EMA below 200 EMA (fully stacked bearish)',
+  squeeze:      'ATR contracted to ≤0.7× its own 20-bar average (coiled, pre-breakout)',
+  expansion:    'ATR expanded to ≥1.4× its own 20-bar average (volatility running)',
+  volDry:       'Volume ≤0.7× average (quiet — accumulation or exhaustion of sellers)',
+  bullDiv:      'Bullish WaveTrend divergence: price lower low, WT higher low',
+  bearDiv:      'Bearish WaveTrend divergence: price higher high, WT lower high',
+  gpLong:       'Price in the Fibonacci golden pocket of an up-leg (0.618–0.65 retrace)',
+  gpShort:      'Price in the Fibonacci golden pocket of a down-leg',
+  rangeHigh:    'Close in the top 20% of the 60-bar range',
+  rangeLow:     'Close in the bottom 20% of the 60-bar range',
+  consecUp3:    'Three or more consecutive green closes',
+  consecDown3:  'Three or more consecutive red closes',
+  bigBody:      'Candle body ≥1.2 ATR (decisive conviction bar)',
+  insideBar:    'Inside bar — range contained by the previous bar (coil)',
+  wtRising:     'WaveTrend rising over the last 3 bars',
+  wtFalling:    'WaveTrend falling over the last 3 bars',
+  // VuManChu VWAP wave (WT1−WT2, the yellow wave) — leads the dots, so it is early warning
+  vwapUp:       'VWAP wave above zero and rising (momentum building up)',
+  vwapDown:     'VWAP wave below zero and falling (momentum building down)',
+  vwapCrossUp:  'VWAP wave just crossed above zero (a green dot is likely incoming)',
+  vwapCrossDown:'VWAP wave just crossed below zero (a red dot is likely incoming)',
+  rollDown:     'Bearish WT cross from above zero (rolling over, not necessarily overbought)',
+  rollUp:       'Bullish WT cross from below zero (turning up, not necessarily oversold)'
 };
 
 // Token pairs that can never both be true in a sensible setup — used to prune mutations.
@@ -6296,7 +6612,17 @@ const DISC_CONTRA = [
   ['trendUp','trendDown'],['mfPositive','mfNegative'],['wtOversold','wtOverbought'],
   ['deepOS','deepOB'],['higherLow','lowerHigh'],['ema21Above50','ema21Below50'],
   ['bullFvg','bearFvg'],['engulfBull','engulfBear'],['breakout20','breakdown20'],
-  ['rsiBelow30','rsiAbove60'],['rsiBelow30','rsiAbove70'],['rsiBelow40','rsiAbove60'],['rsiBelow40','rsiAbove70']
+  ['rsiBelow30','rsiAbove60'],['rsiBelow30','rsiAbove70'],['rsiBelow40','rsiAbove60'],['rsiBelow40','rsiAbove70'],
+  // v3 pairs — pruning these stops the lab wasting runs on setups that can never fire
+  ['aboveEma200','belowEma200'],['ribbonUp','ribbonDown'],['squeeze','expansion'],
+  ['bullDiv','bearDiv'],['gpLong','gpShort'],['rangeHigh','rangeLow'],
+  ['consecUp3','consecDown3'],['wtRising','wtFalling'],
+  ['squeeze','bigBody'],['squeeze','volSpike'],['insideBar','bigBody'],
+  ['ribbonUp','belowEma200'],['ribbonDown','aboveEma200'],['ribbonUp','trendDown'],['ribbonDown','trendUp'],
+  ['ribbonUp','ema21Below50'],['ribbonDown','ema21Above50'],['volDry','volSpike'],['volDry','volAboveAvg'],
+  ['rangeHigh','breakdown20'],['rangeLow','breakout20'],
+  ['vwapUp','vwapDown'],['vwapCrossUp','vwapCrossDown'],['vwapUp','vwapCrossDown'],['vwapDown','vwapCrossUp'],
+  ['rollUp','rollDown'],['rollUp','crossDown'],['rollDown','crossUp']
 ];
 function condsContradict(list) { return DISC_CONTRA.some(([a, b]) => list.includes(a) && list.includes(b)); }
 
@@ -6306,6 +6632,9 @@ function discoveryFeatures(c) {
   const { wt1, wt2 } = waveTrend(c);
   const rsi = rsiArr(c), mf = vmcMoneyFlow(c);
   const closes = c.map(x => x.c), e50 = emaArr(closes, 50), e21 = emaArr(closes, 21), atr = atrArr(c, 14);
+  const e200 = emaArr(closes, 200);                       // long-trend context (v3 vocabulary)
+  const wtPivHi = wtPivots(wt2, 'high'), wtPivLo = wtPivots(wt2, 'low'); // for the divergence tokens
+  const vw = wt1.map((v, k) => v - wt2[k]);              // VuManChu VWAP wave (yellow), leads the dots
   const F = {}; for (const k in DISCOVERY_VOCAB) F[k] = new Array(n).fill(false);
   let lastLo = null, prevLo = null, lastHi = null, prevHi = null;
   for (let i = 1; i < n; i++) {
@@ -6350,6 +6679,70 @@ function discoveryFeatures(c) {
     F.engulfBull[i] = c[i].c > c[i].o && c[i-1].c < c[i-1].o && body > pBody && c[i].c >= Math.max(c[i-1].o, c[i-1].c) && c[i].o <= Math.min(c[i-1].o, c[i-1].c);
     F.engulfBear[i] = c[i].c < c[i].o && c[i-1].c > c[i-1].o && body > pBody && c[i].o >= Math.max(c[i-1].o, c[i-1].c) && c[i].c <= Math.min(c[i-1].o, c[i-1].c);
     F.ema21Above50[i] = e21[i] > e50[i]; F.ema21Below50[i] = e21[i] < e50[i];
+
+    // ── vocabulary v3 tokens ──
+    // Long-trend context + ribbon stack
+    const e2 = e200[i];
+    if (Number.isFinite(e2)) {
+      F.aboveEma200[i] = closes[i] > e2; F.belowEma200[i] = closes[i] < e2;
+      F.ribbonUp[i]   = e21[i] > e50[i] && e50[i] > e2;
+      F.ribbonDown[i] = e21[i] < e50[i] && e50[i] < e2;
+    }
+    // Volatility regime: ATR against its OWN recent average (scale-free, works on any coin)
+    if (i >= 34 && Number.isFinite(a) && a > 0) {
+      let s = 0, cnt = 0;
+      for (let k = i - 20; k < i; k++) { if (Number.isFinite(atr[k])) { s += atr[k]; cnt++; } }
+      if (cnt > 10) { const avg = s / cnt; F.squeeze[i] = a <= 0.7 * avg; F.expansion[i] = a >= 1.4 * avg; }
+    }
+    F.volDry[i] = Number.isFinite(vx) && vx <= 0.7;
+    // Divergence: compare the last two confirmed WT pivots against price at those pivots
+    if (i >= 40) {
+      const hs = wtPivHi.filter(p => p <= i - 2).slice(-2), ls = wtPivLo.filter(p => p <= i - 2).slice(-2);
+      if (hs.length === 2 && i - hs[1] <= 12) {
+        const [pa, pb] = hs;
+        if (c[pb].h > c[pa].h && wt2[pb] < wt2[pa] - 1) F.bearDiv[i] = true;
+      }
+      if (ls.length === 2 && i - ls[1] <= 12) {
+        const [pa, pb] = ls;
+        if (c[pb].l < c[pa].l && wt2[pb] > wt2[pa] + 1) F.bullDiv[i] = true;
+      }
+    }
+    // Range position over 60 bars + golden pocket of the dominant leg
+    if (i >= 60) {
+      let hh = -Infinity, ll = Infinity, hiI = i - 60, loI = i - 60;
+      for (let k = i - 60; k <= i; k++) { if (c[k].h > hh) { hh = c[k].h; hiI = k; } if (c[k].l < ll) { ll = c[k].l; loI = k; } }
+      const span = hh - ll;
+      if (span > 0) {
+        const pos = (closes[i] - ll) / span;
+        F.rangeHigh[i] = pos >= 0.8; F.rangeLow[i] = pos <= 0.2;
+        // up-leg if the low came first → retracement measured down from the high
+        const zHi = hiI > loI ? hh - span * 0.618 : ll + span * 0.618;
+        const zLo = hiI > loI ? hh - span * 0.65  : ll + span * 0.65;
+        const lo2 = Math.min(zHi, zLo), hi2 = Math.max(zHi, zLo);
+        const inZone = closes[i] >= lo2 && closes[i] <= hi2;
+        if (inZone) { if (hiI > loI) F.gpLong[i] = true; else F.gpShort[i] = true; }
+      }
+    }
+    // Consecutive closes, conviction bar, inside bar, WT slope
+    if (i >= 3) {
+      F.consecUp3[i]   = c[i].c > c[i].o && c[i-1].c > c[i-1].o && c[i-2].c > c[i-2].o;
+      F.consecDown3[i] = c[i].c < c[i].o && c[i-1].c < c[i-1].o && c[i-2].c < c[i-2].o;
+      F.wtRising[i]  = Number.isFinite(wt2[i]) && Number.isFinite(wt2[i-3]) && wt2[i] > wt2[i-3];
+      F.wtFalling[i] = Number.isFinite(wt2[i]) && Number.isFinite(wt2[i-3]) && wt2[i] < wt2[i-3];
+    }
+    if (Number.isFinite(a) && a > 0) F.bigBody[i] = body >= 1.2 * a;
+    F.insideBar[i] = c[i].h <= c[i-1].h && c[i].l >= c[i-1].l;
+    // VWAP wave (WT1−WT2) — leads the dots, so these fire before greenDot/redDot can
+    if (i >= 3) {
+      const v0 = vw[i], v1 = vw[i-1], v3 = vw[i-3];
+      F.vwapUp[i]   = v0 > 0 && v0 > v3;
+      F.vwapDown[i] = v0 < 0 && v0 < v3;
+      F.vwapCrossUp[i]   = v1 <= 0 && v0 > 0;
+      F.vwapCrossDown[i] = v1 >= 0 && v0 < 0;
+    }
+    // Rolling over from the right side of zero — the mid-range cross the dot tokens miss
+    F.rollDown[i] = cd && wt2[i] > 10;
+    F.rollUp[i]   = cu && wt2[i] < -10;
   }
   return { F, atr, n };
 }
@@ -6411,7 +6804,10 @@ function evaluateCandidate(preps, cand) {
 }
 
 // A candidate is only a KEEPER if it holds up on data it wasn't built on.
-const DISC_MIN_OOS = 20, DISC_MIN_EXP = 0.05;
+// Raised with the wider search (2026-08-10): testing 500+ candidates instead of 144 means more
+// pass the gate on luck alone (multiple-comparisons problem). A bigger sample and a real
+// expectancy edge — not a hair above zero — keep the survivors meaningful rather than numerous.
+const DISC_MIN_OOS = 25, DISC_MIN_EXP = 0.12;
 function candidateKeeps(res) {
   return !!(res && res.ok && res.oos && res.is &&
     res.oos.n >= DISC_MIN_OOS && res.oos.expectancy > DISC_MIN_EXP &&
@@ -6436,21 +6832,49 @@ function addBinnedKey(k) { const b = getBinnedKeys(); if (!b.includes(k)) { b.pu
 // Free idea source: a deterministic seed grid — sensible template setups × stop/target
 // variants, all judged locally by the SAME out-of-sample gate. Zero API cost.
 function seedGridCandidates() {
+  // WIDENED 2026-08-10 (John: let the lab find setups itself rather than importing them).
+  // 12 → 26 templates per side, 3 → 5 param sets. Every one still faces the same OOS gate,
+  // so a wider net costs compute, never rigour. Unused vocab tokens now get their turn:
+  // volSpike, wtOversold/Overbought, rsiBelow40/Above60, structure + momentum combos.
   const L = [
-    ['greenDot'], ['greenDot','trendUp'], ['crossUp','deepOS'], ['crossUp','mfPositive','trendUp'],
-    ['breakout20','volAboveAvg'], ['breakout20','trendUp'], ['wickRejectLow','nearEma50','trendUp'],
-    ['engulfBull','trendUp'], ['higherLow','crossUp'], ['bullFvg','trendUp'], ['rsiBelow30','crossUp'], ['ema21Above50','nearEma50']
+    ['greenDot'], ['greenDot','trendUp'], ['greenDot','volAboveAvg'], ['greenDot','higherLow'],
+    ['crossUp','deepOS'], ['crossUp','mfPositive','trendUp'], ['crossUp','wtOversold','volAboveAvg'],
+    ['breakout20','volAboveAvg'], ['breakout20','trendUp'], ['breakout20','volSpike','ema21Above50'],
+    ['wickRejectLow','nearEma50','trendUp'], ['wickRejectLow','deepOS'], ['wickRejectLow','higherLow'],
+    ['engulfBull','trendUp'], ['engulfBull','nearEma50'], ['engulfBull','volSpike'],
+    ['higherLow','crossUp'], ['higherLow','nearEma50','ema21Above50'],
+    ['bullFvg','trendUp'], ['bullFvg','volAboveAvg'], ['bullFvg','higherLow'],
+    ['rsiBelow30','crossUp'], ['rsiBelow40','greenDot','trendUp'], ['rsiBelow40','wickRejectLow'],
+    ['ema21Above50','nearEma50'], ['ema21Above50','crossUp','mfPositive'],
+    // v3 vocabulary seeds — compression, long-trend context, divergence, exhaustion
+    ['squeeze','breakout20'], ['squeeze','volDry','aboveEma200'],
+    ['bullDiv','crossUp'], ['bullDiv','rangeLow'],
+    ['ribbonUp','nearEma50','wtRising'], ['ribbonUp','gpLong'],
+    ['rangeLow','wickRejectLow','volAboveAvg'], ['insideBar','aboveEma200','wtRising'],
+    ['consecDown3','deepOS','crossUp'], ['gpLong','crossUp','mfPositive']
   ];
   const S = [
-    ['redDot'], ['redDot','trendDown'], ['crossDown','deepOB'], ['crossDown','mfNegative','trendDown'],
-    ['breakdown20','volAboveAvg'], ['breakdown20','trendDown'], ['wickRejectHigh','nearEma50','trendDown'],
-    ['engulfBear','trendDown'], ['lowerHigh','crossDown'], ['bearFvg','trendDown'], ['rsiAbove70','crossDown'], ['ema21Below50','nearEma50']
+    ['redDot'], ['redDot','trendDown'], ['redDot','volAboveAvg'], ['redDot','lowerHigh'],
+    ['crossDown','deepOB'], ['crossDown','mfNegative','trendDown'], ['crossDown','wtOverbought','volAboveAvg'],
+    ['breakdown20','volAboveAvg'], ['breakdown20','trendDown'], ['breakdown20','volSpike','ema21Below50'],
+    ['wickRejectHigh','nearEma50','trendDown'], ['wickRejectHigh','deepOB'], ['wickRejectHigh','lowerHigh'],
+    ['engulfBear','trendDown'], ['engulfBear','nearEma50'], ['engulfBear','volSpike'],
+    ['lowerHigh','crossDown'], ['lowerHigh','nearEma50','ema21Below50'],
+    ['bearFvg','trendDown'], ['bearFvg','volAboveAvg'], ['bearFvg','lowerHigh'],
+    ['rsiAbove70','crossDown'], ['rsiAbove60','redDot','trendDown'], ['rsiAbove60','wickRejectHigh'],
+    ['ema21Below50','nearEma50'], ['ema21Below50','crossDown','mfNegative'],
+    // v3 vocabulary seeds — mirror side
+    ['squeeze','breakdown20'], ['squeeze','volDry','belowEma200'],
+    ['bearDiv','crossDown'], ['bearDiv','rangeHigh'],
+    ['ribbonDown','nearEma50','wtFalling'], ['ribbonDown','gpShort'],
+    ['rangeHigh','wickRejectHigh','volAboveAvg'], ['insideBar','belowEma200','wtFalling'],
+    ['consecUp3','deepOB','crossDown'], ['gpShort','crossDown','mfNegative']
   ];
   const out = [];
-  for (const tf of ['1D','4H']) for (const [dir, sets] of [['long',L],['short',S]])
-    for (const conditions of sets) for (const [stopAtr, targetR] of [[1.5,2],[2,2],[2,3]])
+  for (const tf of ['1D','4H','1H']) for (const [dir, sets] of [['long',L],['short',S]])
+    for (const conditions of sets) for (const [stopAtr, targetR] of [[1.5,2],[1.5,3],[2,2],[2,3],[3,2]])
       out.push({ name: `${conditions.join('+')} (${stopAtr}ATR/${targetR}R)`, dir, tf, conditions: [...conditions], stopAtr, targetR, origin: 'grid' });
-  return out; // 2 tf × 2 dir × 12 templates × 3 param sets = 144 candidates
+  return out; // 2 tf × 2 dir × 26 templates × 5 param sets = 520 candidates
 }
 
 // Ask the smart model to PROPOSE candidate patterns — strictly from the vocabulary, as JSON.
@@ -6458,7 +6882,7 @@ async function proposeCandidates(apiKey, n) {
   const vocab = Object.entries(DISCOVERY_VOCAB).map(([k, v]) => `  ${k} — ${v}`).join('\n');
   const hr = feedHitRates().byDir, edges = backtestEdges();
   const have = [...getDiscovered().map(discKey), ...getBinnedKeys()];
-  const sys = `You are a quantitative research assistant proposing CANDIDATE entry patterns for a VuManChu Cipher B swing scanner (4H/Daily). You do NOT decide whether they work — a backtester judges every idea on out-of-sample data. Propose smart, varied hypotheses worth TESTING.
+  const sys = `You are a quantitative research assistant proposing CANDIDATE entry patterns for a VuManChu Cipher B scanner running on 1H, 4H and Daily (intraday patterns are as welcome as swing ones — the bot trades every timeframe). You do NOT decide whether they work — a backtester judges every idea on out-of-sample data. Propose smart, varied hypotheses worth TESTING.
 
 Use ONLY these condition tokens (a setup fires when ALL its conditions are true on a bar):
 ${vocab}
@@ -6495,7 +6919,7 @@ async function discoveryUniverse() {
   const wl = getWatchlist('crypto') || [];
   let top = []; try { top = (await fetchTopUniverse(40)) || []; } catch {}
   const seen = new Set(), out = [];
-  for (const s of [...wl, ...top]) { const u = String(s).toUpperCase(); if (u && !seen.has(u)) { seen.add(u); out.push(u); } if (out.length >= 15) break; }
+  for (const s of [...wl, ...top]) { const u = String(s).toUpperCase(); if (u && !seen.has(u)) { seen.add(u); out.push(u); } if (out.length >= 22) break; } // 15 → 22 coins: more out-of-sample evidence per candidate
   return out;
 }
 
@@ -6507,9 +6931,9 @@ async function runDiscovery(manual) {
   _discBusy = true; setLabStatus('Building the test universe…');
   try {
     const coins = await discoveryUniverse();
-    const preps = { '1D': [], '4H': [] };
+    const preps = { '1D': [], '4H': [], '1H': [] }; // 1H added 2026-08-10 — the swing-only lean is gone
     for (const coin of coins) {
-      for (const tf of ['1D', '4H']) {
+      for (const tf of ['1D', '4H', '1H']) {
         let c = null; try { c = await fetchCryptoCandles(coin, tf, 1000); } catch {}
         if (c && c.length >= 300) { const p = prepCoin(c); p.coin = coin; preps[tf].push(p); }
       }
@@ -6536,7 +6960,7 @@ async function runDiscovery(manual) {
     }
     // ── Idea source 2: the brain proposes fresh combinations ──
     setLabStatus('Asking the brain for candidate patterns…');
-    const { valid, invalid } = await proposeCandidates(apiKey, 8);
+    const { valid, invalid } = await proposeCandidates(apiKey, 14);
     setLabStatus(`Backtesting ${valid.length} candidates out-of-sample (1D + 4H)…`);
     for (const cand of valid) {
       if (haveKeys.has(discKey(cand))) continue;
@@ -6552,12 +6976,12 @@ async function runDiscovery(manual) {
     // ── mutation pass: the closest near-misses earn a free round of local variants (no API cost) ──
     const near = tested
       .filter(x => x.res.ok && x.res.oos && x.res.oos.n >= 8 && (x.res.oos.expectancy ?? -9) > -0.2 && !candidateKeeps(x.res))
-      .sort((a, b) => (b.res.oos.expectancy || 0) - (a.res.oos.expectancy || 0)).slice(0, 3);
+      .sort((a, b) => (b.res.oos.expectancy || 0) - (a.res.oos.expectancy || 0)).slice(0, 6);
     let mutTested = 0, mutKept = 0;
     if (near.length) setLabStatus(`Mutating ${near.length} near-miss pattern${near.length > 1 ? 's' : ''}…`);
     for (const nm of near) {
       for (const v of mutateCandidate(nm.cand)) {
-        if (mutTested >= 120) break;
+        if (mutTested >= 300) break;
         if (validateCandidate(v) || haveKeys.has(discKey(v))) continue;
         const vres = evaluateCandidate(preps[v.tf], v); mutTested++;
         if (candidateKeeps(vres)) { v.mutatedFrom = nm.cand.name || discKey(nm.cand); keepCand(v, vres); mutKept++; }
@@ -6978,6 +7402,7 @@ async function runScan() {
   try {
     const results = await scanWatchlist(scanMarket);
     renderScanResults(results);
+    autoSendScanToBot(); // no review step — every directional hit goes to the bot + shadow brain
   } catch (e) {
     document.getElementById('scan-results').innerHTML = `<div class="scan-err">Scan failed: ${esc(e.message)}</div>`;
   } finally {
@@ -7025,6 +7450,7 @@ async function runUniverseScan() {
       out.innerHTML = `<div class="scan-err" style="grid-column:1/-1;">No "${esc(patLabel)}" matches in the top 200 right now. That's normal — these setups are rare. Try later or a different pattern.</div>`;
     } else {
       renderScanResults(hits);
+      autoSendScanToBot(); // no review step — every directional hit goes to the bot + shadow brain
     }
   } catch (e) {
     out.innerHTML = `<div class="scan-err" style="grid-column:1/-1;">Scan failed: ${esc(e.message)}</div>`;
@@ -7066,8 +7492,66 @@ function renderScanResults(results) {
       </div>
       ${evHtml}
       <button class="scan-ask" onclick="scanVerdict(${idx})">Ask the brain for a full verdict →</button>
+      ${(r.bias === 'long' || r.bias === 'short') ? `<button class="scan-ask" onclick="sendScanToBotBtn(${idx}, this)">Send to bot →</button>` : ''}
     </div>`;
   }).join('');
+}
+
+// ── Send manual-scan hits into the bot pipeline (kick-starts the shadow brain sample) ──
+// Builds a real plan (10-bar structure + ATR off the 1D, same as signal cards), logs a
+// tracked trade, and lets the exec hook + shadow brain judge it like any auto-scan hit.
+async function sendScanToBot(idx) {
+  const r = lastScan[idx]; if (!r || r.error) return null;
+  const dir = r.bias === 'short' ? 'short' : r.bias === 'long' ? 'long' : null;
+  if (!dir) return null; // neutral = no trade to send
+  // Plan is built from the timeframe the signal actually fired on (2026-08-10). Using daily
+  // candles for a 1H signal gave a swing-width stop on an intraday idea — the trade could never
+  // work. `entryName` is the trigger TF from scanCoin ('1H' or '15m'), else fall back to daily.
+  const planTf = ['15m','1H','4H','1D'].includes(r.entryName) ? r.entryName : '1D';
+  let plan = null;
+  try { const c = await fetchCandles(r.coin, planTf, scanMarket); if (c && c.length > 20) plan = buildTradePlan(c, dir, r.price || c[c.length - 1].c); } catch {}
+  // Sanity: after a parabolic move the structure stop can be absurdly far (HEI: stop 187% away,
+  // negative target). Same bounds the exec enforces — a plan it would refuse isn't worth tracking.
+  if (plan) {
+    const dist = Math.abs(plan.entry - plan.stop) / plan.entry;
+    if (dist > 0.35 || dist < 0.003 || plan.targets[0].px <= 0) plan = null;
+  }
+  if (!plan) return null; // no honest plan = ungradeable, skip rather than pollute the sample
+  return openPaperTrade({ coin: r.coin, dir, market: scanMarket, score: r.score,
+    entry: plan ? plan.entry : r.price,
+    sl: plan ? plan.stop : null, tp1: plan ? plan.targets[0].px : null,
+    tp2: plan ? plan.targets[1].px : null, tp3: plan ? plan.targets[2].px : null,
+    thesis: (r.ev || []).slice(0, 3).join('; ') + ' · plan from ' + planTf, source: 'manual-scan' });
+}
+async function sendScanToBotBtn(idx, btn) {
+  if (btn) { btn.disabled = true; btn.textContent = 'Sending…'; }
+  const ok = await sendScanToBot(idx);
+  if (btn) btn.textContent = ok ? 'Sent — shadow verdict incoming' : (ok === false ? 'Already tracked' : 'No directional setup');
+}
+async function sendAllScanToBot() {
+  const btn = document.getElementById('scan-bot-btn');
+  const minScore = parseInt((document.getElementById('scan-minscore') || {}).value || '5', 10);
+  const picks = lastScan.map((r, idx) => ({ r, idx })).filter(o => !o.r.error && (o.r.bias === 'long' || o.r.bias === 'short') && (o.r.score || 0) >= minScore);
+  if (!picks.length) { alert('Nothing to send — no directional setups at the current Min score.'); return; }
+  if (btn) { btn.disabled = true; btn.textContent = 'Sending…'; }
+  let sent = 0, skipped = 0;
+  for (const o of picks) { const ok = await sendScanToBot(o.idx); if (ok) sent++; else skipped++; }
+  if (btn) { btn.disabled = false; btn.textContent = 'Send all to bot'; }
+  alert(sent + ' setup' + (sent === 1 ? '' : 's') + ' sent to the bot pipeline' + (skipped ? ' (' + skipped + ' skipped — already tracked or no plan)' : '') + '.\nEach gets a shadow brain verdict now and is graded on the real outcome — watch the Bot Trades panel.');
+}
+
+// Auto-send: the moment a scan finishes, every directional hit ≥5/10 flows straight into
+// the bot pipeline — no button, no review step (John's rule). Dedupe skips already-tracked
+// trades; exec-side guards (score ≥ min or positive vet, correlation, daily cap, DRY mode)
+// still decide what actually places. The shadow brain gets a verdict on every one.
+async function autoSendScanToBot() {
+  const picks = lastScan.map((r, idx) => ({ r, idx }))
+    .filter(o => !o.r.error && (o.r.bias === 'long' || o.r.bias === 'short') && (o.r.score || 0) >= 5);
+  let sent = 0;
+  for (const o of picks) { try { if (await sendScanToBot(o.idx)) sent++; } catch {} }
+  try { const cnt = document.getElementById('scan-filter-count');
+    if (cnt && sent) cnt.textContent = (cnt.textContent || '') + ' · ' + sent + ' auto-sent to bot'; } catch {}
+  return sent;
 }
 
 // Hand a scan result to the brain for a written, calibrated verdict (uses the full brain).
@@ -7754,10 +8238,26 @@ document.addEventListener('click', function(e){
   if(!get(LS.token,'')) set(LS.token,'cx7Kp9mR2vQ8nL4wT6yB3fH5jD1sG0aZ');
   if(!get(LS.risk,'')) set(LS.risk,'10');
   if(!get(LS.min,'')) set(LS.min,'8');
+  // One-time drop to 7+ (John, 2026-08-09): testnet data-gathering — near-misses like BOME/INJ 7s
+  // should fire. Runs once so the new Bot Trades panel control still rules after this.
+  if(!get('mc_exec_min7','')){ set(LS.min,'7'); set('mc_exec_min7','1'); }
+  // ═══ HANDBRAKE OFF (John, 2026-08-09): demo money = maximum data. Fires at 6+, 25 trades/day,
+  // 6 same-direction positions, edge guard advisory-only. Even losers are good data on testnet.
+  // BEFORE LIVE: min back to 8, cap to 10, corr to 3, edge guard on ('mc_exec_edgeguard'='1'),
+  // whitelist re-tightened — then build the proper risk system.
+  if(!get('mc_exec_handbrake','')){ set(LS.min,'6'); set('mc_exec_daycap','25'); set('mc_exec_corrmax','6'); set('mc_exec_handbrake','off'); }
   // Wide whitelist for the data-gathering phase (2026-08-08, John: "let it fly — not my money yet").
   // Must stay mirrored with the val's WHITELIST. Old 3-coin value gets upgraded once.
   const WIDE='BTC,ETH,SOL,XRP,BNB,DOGE,ADA,LINK,AVAX,DOT,LTC,BCH,UNI,ATOM,NEAR,APT,ARB,OP,SUI,TON,TRX,POL,FIL,INJ,AAVE';
   if(!get('mc_exec_symbols','')||get('mc_exec_symbols','')==='BTC,ETH,SOL') set('mc_exec_symbols',WIDE);
+  // OPENED 2026-08-09 (John): whitelist was the bottleneck — scanner sees the top 200, bot could
+  // only fire 25. '*' = any coin (relay opened to match). One-time; the guards still bind.
+  if(!get('mc_exec_openlist','')){ set('mc_exec_symbols','*'); set('mc_exec_openlist','1'); }
+  // Leveraged-ETF / stock tickers (SPYB, QQQB, MUB, TQQQ…) were reaching the pipeline once the
+  // whitelist opened — Phemex has no such pair, so an order would just error. Blocked at source.
+  const NOT_CRYPTO=/^(SPY|QQQ|MU|DIA|IWM|TLT|GLD|SLV|VOO|VTI|ARKK|TQQQ|SQQQ|SOXL|SPXL|UPRO|LABU|NVDL|TSLL|MSTU|MSTX)[A-Z]?$/;
+  function symOK(c){ const s=String(c||'').toUpperCase(); if(!s||NOT_CRYPTO.test(s)) return false;
+    const l=String(get('mc_exec_symbols','')).split(',').map(x=>x.trim().toUpperCase()); return l.includes('*')||l.includes(s); }
   function toSymbol(coin){ if(!coin) return null; const c=String(coin).toUpperCase().replace(/[^A-Z0-9]/g,''); const map={XBT:'BTC'}; return (map[c]||c)+'USDT'; }
   function firedSet(){ try{ return JSON.parse(get(LS.fired,'{}'))||{}; }catch{ return {}; } }
   function markFired(id){ const s=firedSet(); s[id]=Date.now(); set(LS.fired,JSON.stringify(s)); }
@@ -7765,6 +8265,10 @@ document.addEventListener('click', function(e){
   function pushLog(entry){ let log=[]; try{ log=JSON.parse(get(LS.log,'[]'))||[]; }catch{} log.unshift(Object.assign({at:new Date().toISOString()},entry)); set(LS.log,JSON.stringify(log.slice(0,150))); renderPill(); try{ const bp=document.getElementById('bot-panel'); if(bp&&bp.classList.contains('show')) renderBot(); }catch{} }
   function notify(msg){ try{ if(typeof pushPhoneAlert==='function') return pushPhoneAlert(msg); }catch{} try{ if(window.Notification && Notification.permission==='granted') new Notification('Cipher Exec',{body:msg}); }catch{} console.log('[CipherExec]',msg); }
   function roundQty(q){ if(q>=100) return Math.round(q); if(q>=1) return Math.round(q*1e3)/1e3; return Math.round(q*1e6)/1e6; }
+  // Price precision has to scale with the price — see the note at the cross-price line below.
+  function roundPx(p){ if(!Number.isFinite(p)||p<=0) return p;
+    if(p>=1000) return +p.toFixed(1); if(p>=100) return +p.toFixed(2);
+    if(p>=1) return +p.toFixed(4); if(p>=0.01) return +p.toFixed(6); return +p.toPrecision(6); }
   // HARD RULE (John, 2026-08-09): never place a trade without a stop, and never with a stop
   // on the wrong side of entry. Checked here, and again server-side in the relay.
   function planValid(t){
@@ -7788,21 +8292,179 @@ document.addEventListener('click', function(e){
     const stopDist=Math.abs(entry-sl); if(!(stopDist>0)) return {err:'zero stop distance'};
     const risk=num(LS.risk,10); const qty=roundQty(risk/stopDist); if(!(qty>0)) return {err:'computed qty <= 0'};
     const isLong=(t.dir||'long')==='long';
-    const cross=+((isLong?entry*1.01:entry*0.99)).toFixed(1); // 1% through the market → fills, else rests
-    return { order:{ symbol, side:isLong?'Buy':'Sell', posSide:isLong?'Long':'Short', ordType:'Limit', priceRp:cross, timeInForce:'GoodTillCancel', orderQtyRq:qty, refPx:entry, stopLossRp:sl, slTrigger:'ByMarkPrice', takeProfitRp:Number.isFinite(tp1)?tp1:undefined, clOrdID:'cipher-'+tradeId(t).replace(/[^a-zA-Z0-9]/g,'').slice(0,30) }, meta:{ symbol, qty, risk, dir:t.dir, score:t.score } };
+    // 1% through the market → fills, else rests. Rounding MUST scale with price: .toFixed(1)
+    // turned a 0.7035 entry into a 0.7 buy limit (below market — rests forever) and 0.0006307
+    // into 0.0 (rejected). That was being blamed on testnet liquidity. Fixed 2026-08-10.
+    const cross=roundPx(isLong?entry*1.01:entry*0.99);
+    // ── EXIT RULE (2026-08-09, the FIL trade) ──────────────────────────────────────────────
+    // T1 is 1R by construction, but the backtester and discovery lab both validate a ~2R exit.
+    // Taking a vetted setup and exiting at 1R throws the measured edge away: FIL at 35% wins
+    // was +0.14R at 2.25R, and −0.30R at 1:1. Target T2 (2.25R) so the bot trades the strategy
+    // that was actually proven. Falls back to T1 only if no T2 exists on the plan.
+    const tp2 = Number(t.tp2);
+    const exitPx = Number.isFinite(tp2) && tp2 > 0 ? tp2 : (Number.isFinite(tp1) ? tp1 : undefined);
+    const exitAtR = (Number.isFinite(exitPx) && stopDist > 0) ? +(Math.abs(exitPx - entry) / stopDist).toFixed(2) : null;
+    return { order:{ symbol, side:isLong?'Buy':'Sell', posSide:isLong?'Long':'Short', ordType:'Limit', priceRp:cross, timeInForce:'GoodTillCancel', orderQtyRq:qty, refPx:entry, stopLossRp:sl, slTrigger:'ByMarkPrice', takeProfitRp:exitPx, clOrdID:'cipher-'+tradeId(t).replace(/[^a-zA-Z0-9]/g,'').slice(0,30) }, meta:{ symbol, qty, risk, dir:t.dir, score:t.score, exitPx, exitAtR } };
   }
   async function callWorker(pathname, body){
     const url=get(LS.url,'').replace(/\/+$/,''); const token=get(LS.token,''); if(!url) throw new Error('Exec Worker URL not set');
     const res=await fetch(url+pathname,{ method:'POST', headers:{'Content-Type':'application/json','Authorization':'Bearer '+token}, body:JSON.stringify(body||{}) });
     let data; try{ data=await res.json(); }catch{ data={raw:await res.text()}; } return { status:res.status, data };
   }
+  // ═══ SHADOW BRAIN GATE — Phase 1 (2026-08-09, advisory only) ═══
+  // The trained brain judges every exec candidate: TAKE / PASS / RESIZE + one line why.
+  // It changes NOTHING yet — the numeric path fires exactly as before. Every verdict is
+  // stored, then graded against the trade's real T1-before-stop outcome, building the
+  // record that decides (automatically, no review step) whether the brain earns the gate:
+  // Phase 2 promotes it once 20+ graded verdicts beat the numeric record. Runs in ALL
+  // modes including LEDGER, so the sample builds even before real money.
+  const BRAIN_LS='mc_exec_brainlog', BRAIN_PROMOTE_N=20, VERDICT_V=2; // v2 = blind judgement prompt
+  function brainLog(){ try{ return JSON.parse(get(BRAIN_LS,'[]'))||[]; }catch{ return []; } }
+  // One-time purge: v1 verdicts were made while the brain could see the numeric rule and just
+  // echoed it ("score 5 below minimum 8"). Ungraded ones are dropped so the record starts clean;
+  // anything already graded is kept — real outcomes are real evidence.
+  try{ if(!get('mc_brain_v2','')){ const kept=brainLog().filter(e=>e.outcome); set(BRAIN_LS,JSON.stringify(kept)); set('mc_brain_v2','1'); } }catch(e){}
+  function saveBrainLog(l){ set(BRAIN_LS,JSON.stringify(l.slice(0,200))); }
+  // Idempotent front door: one API call per trade, whoever asks first (openPaperTrade's shadow
+  // hook or the Phase 2 gate inside onTrade) — the second caller gets the same promise/entry.
+  const _pendingV={};
+  function shadowVerdict(t){
+    if(!t||!t.id) return Promise.resolve(null);
+    const done=brainLog().find(e=>e.id===t.id); if(done) return Promise.resolve(done);
+    if(_pendingV[t.id]) return _pendingV[t.id];
+    _pendingV[t.id]=_verdictCall(t).finally(()=>{ delete _pendingV[t.id]; });
+    return _pendingV[t.id];
+  }
+  async function _verdictCall(t){
+    try{
+      if(!t||!t.id||!t.coin) return;
+      if((t.market||'crypto')!=='crypto') return;                    // the bot only trades crypto
+      if(!Number.isFinite(+t.sl)||!Number.isFinite(+t.tp1)) return;  // no plan = ungradeable, skip
+      const key=localStorage.getItem('mc_key'); if(!key) return;     // no API key = shadow stays silent
+      if(brainLog().some(e=>e.id===t.id)) return;                    // one verdict per trade
+      const score=Number(t.score||0);
+      const vetOK=(t.source==='auto-scan'&&t.vetGrade&&t.vetGrade!=='negative'); // demo phase: only a negative vet disqualifies
+      const botTook=(score>=num(LS.min,8))||vetOK;                   // the numeric rule's call (pre-guards)
+      // noBot: the decision log is full of "score X below minimum 8" — showing it would anchor
+      // the verdict on the very rule we're testing it against. KB + pattern stats still attached.
+      const sys=(typeof buildSystemPrompt==='function')?buildSystemPrompt(t.coin+' '+(t.dir||'long')+' exec verdict',{noBot:true}):'You are a disciplined crypto trading brain.';
+      // BLIND JUDGEMENT (2026-08-09): the numeric verdict and the raw score are deliberately
+      // WITHHELD. Shown them, the brain just echoed "score 5 below minimum 8" — anchoring on the
+      // rule instead of reading the setup, which makes the brain-vs-numeric comparison worthless.
+      // It judges the evidence only; the app compares the two afterwards.
+      const user='EXEC VERDICT — judge this trade on its own merits, using everything you know: the knowledge base, pattern track records, per-coin backtests, current positions and market context.\n'
+        +t.coin+' '+String(t.dir||'long').toUpperCase()+' — entry '+t.entry+', stop '+t.sl+', target1 '+t.tp1+(Number.isFinite(+t.tp2)?', target2 '+t.tp2:'')
+        +'. Risk/reward to target1: '+((Math.abs(t.tp1-t.entry)/Math.abs(t.entry-t.sl))||0).toFixed(2)+':1'
+        +(Number.isFinite(+t.tp2)?', to target2: '+((Math.abs(t.tp2-t.entry)/Math.abs(t.entry-t.sl))||0).toFixed(2)+':1':'')
+        +'. THE BOT EXITS AT TARGET 2. Setup: '+(String(t.thesis||'').slice(0,200)||'n/a')+'.\n'
+        // Told to the brain explicitly after the FIL trade (2026-08-09): it approved a 1:1 trade
+        // citing a "+0.15R edge" that was measured on a 2R exit. It could not have known the
+        // exit rule behind the figure. Now it can, and is asked to check the arithmetic.
+        +'IMPORTANT — audit the numbers: any win-rate/expectancy figure in the setup text comes from a backtest that exits at 2R with a 1× stop. It does NOT describe a 1:1 trade. Check the quoted edge is consistent with the exit the bot is actually taking, and say so if it is not. A 35% win rate is profitable at 2R (+0.14R) but loses at 1:1 (−0.30R).\n'
+        +'Would YOU put money on this? Judge the setup, the levels and the risk/reward — not any rule or threshold.\n'
+        +'Reply with ONLY this JSON, nothing else: {"verdict":"TAKE"|"PASS"|"RESIZE","size":<0.25-1, only if RESIZE>,"reason":"<one plain sentence about THIS setup, max 20 words — never mention scores, minimums or thresholds>"}. No bare wait — commit.';
+      const res=await fetch('https://api.anthropic.com/v1/messages',{ method:'POST',
+        headers:{'Content-Type':'application/json','x-api-key':key,'anthropic-version':'2023-06-01','anthropic-dangerous-direct-browser-access':'true'},
+        body:JSON.stringify({ model:(typeof modelFor==='function')?modelFor('light'):'claude-haiku-4-5-20251001', max_tokens:120, system:sys, messages:[{role:'user',content:user}] }) });
+      if(!res.ok) return;
+      const txt=((typeof extractText==='function')?extractText(await res.json()):'')||'';
+      const m=String(txt).match(/\{[\s\S]*\}/); if(!m) return;
+      let v; try{ v=JSON.parse(m[0]); }catch{ return; }
+      const verdict=String(v.verdict||'').toUpperCase();
+      if(verdict!=='TAKE'&&verdict!=='PASS'&&verdict!=='RESIZE') return;
+      const l=brainLog();
+      l.unshift({ id:t.id, at:new Date().toISOString(), coin:t.coin, dir:t.dir||'long', entry:t.entry, sl:t.sl, tp1:t.tp1, score, source:t.source||'',
+        botTook, verdict, v:VERDICT_V, size:(verdict==='RESIZE'&&Number.isFinite(+v.size))?+v.size:null, reason:String(v.reason||'').slice(0,140),
+        outcome:null, result:null, brainRight:null, botRight:null });
+      const entry=l[0];
+      saveBrainLog(l);
+      try{ const bp=document.getElementById('bot-panel'); if(bp&&bp.classList.contains('show')) renderBot(); }catch{}
+      // ── SPEAK UP (John, 2026-08-09): the brain has a voice, not the wheel. When its verdict
+      // DISAGREES with the numeric path, it posts its opinion into chat unprompted — an opinion,
+      // never an approval request. Agreements stay silent. Real order + brain against it = phone ping too.
+      try{
+        const D=String(t.dir||'long').toUpperCase(), why=String(v.reason||'').trim();
+        const disagree=((verdict!=='PASS')!==botTook)||verdict==='RESIZE';
+        if(!gateLive()&&disagree&&typeof addAIMsg==='function'){
+          let msg;
+          if(!botTook) msg='**Brain differs on '+t.coin+' '+D+' ('+(score||'?')+'/10):** the bot passed, I would TAKE it — '+(why||'setup quality outweighs the score')+'.';
+          else if(verdict==='PASS') msg='**Brain differs on '+t.coin+' '+D+' ('+(score||'?')+'/10):** the bot takes this, I would PASS — '+(why||'edge not there')+'.';
+          else msg='**Brain says smaller on '+t.coin+' '+D+':** take it at ×'+(Number.isFinite(+v.size)?v.size:0.5)+' size — '+(why||'conviction only partial')+'.';
+          addAIMsg(msg+'\n\n_Shadow only — nothing changed. This call is on my record and gets graded on the outcome._');
+          if(botTook&&verdict==='PASS'&&get(LS.mode,'off')==='armed') notify('Brain would PASS on '+t.coin+' '+D+' — see chat.');
+        }
+      }catch(e){}
+      return entry;
+    }catch(e){ console.warn('shadow verdict',e); }
+  }
+  // Grade stored verdicts against the same honest T1-before-stop outcomes the app already computes.
+  function gradeBrain(){
+    try{
+      if(typeof getPaper!=='function') return;
+      const paper=getPaper(); const l=brainLog(); let dirty=false;
+      l.forEach(e=>{
+        if(e.outcome) return;
+        const t=paper.find(p=>p.id===e.id); if(!t) return;
+        if(!(t.status==='win'||t.status==='loss'||t.status==='closed')) return;
+        const won=(t.status==='win')||(t.status==='closed'&&Number(t.result)>0);
+        e.outcome=t.status; e.result=t.result;
+        const brainSaidTake=(e.verdict!=='PASS');
+        e.brainRight=(brainSaidTake===won);   // TAKE/RESIZE right iff it won; PASS right iff it lost
+        e.botRight=(!!e.botTook===won);       // same test for the numeric path, same trades
+        dirty=true;
+      });
+      if(dirty) saveBrainLog(l);
+      // Promotion / demotion announcements — the gate flips itself; John just gets told.
+      if(dirty&&gateLive()&&!get('mc_brain_gate_live','')){
+        set('mc_brain_gate_live','1'); const s=brainScore();
+        try{ if(typeof addAIMsg==='function') addAIMsg('**The brain has earned the gate.** '+s.graded+' graded verdicts — brain '+s.brain+' right vs numeric '+s.bot+'. From the next signal on my verdict decides: TAKE fires, PASS vetoes, RESIZE scales the position. The numeric path keeps running in shadow, everything stays graded, and if I fall behind the gate hands itself back.'); }catch(x){}
+        notify('BRAIN GATE LIVE — the brain now decides the bot\'s trades.');
+      } else if(dirty&&!gateLive()&&get('mc_brain_gate_live','')){
+        set('mc_brain_gate_live','');
+        try{ if(typeof addAIMsg==='function') addAIMsg('**Gate handed back.** My graded record slipped behind the numeric path, so the numbers decide again while I rebuild the case in shadow. Everything stays on the record.'); }catch(x){}
+        notify('Brain gate handed back — numeric rules deciding again.');
+      }
+    }catch(e){}
+  }
+  // Re-judge: any still-open tracked trade with no v2 verdict gets one, blind. Recovers the
+  // sample the v1 purge dropped instead of waiting for fresh signals. Paced so 20 trades don't
+  // hammer the API; runs once per session, silently.
+  async function rejudgeOpen(){
+    try{
+      if(typeof getPaper!=='function') return 0;
+      const have=new Set(brainLog().map(e=>e.id));
+      const open=getPaper().filter(t=>t.status==='open'&&!have.has(t.id)&&Number.isFinite(+t.sl)&&Number.isFinite(+t.tp1));
+      let n=0;
+      for(const t of open){ await shadowVerdict(t); n++; await new Promise(r=>setTimeout(r,1200)); }
+      if(n){ try{ const bp=document.getElementById('bot-panel'); if(bp&&bp.classList.contains('show')) renderBot(); }catch{} }
+      return n;
+    }catch(e){ return 0; }
+  }
+  function brainScore(){
+    const g=brainLog().filter(e=>e.outcome);
+    return { graded:g.length, brain:g.filter(e=>e.brainRight).length, bot:g.filter(e=>e.botRight).length, pending:brainLog().length-g.length };
+  }
+  // ═══ PHASE 2 — THE GATE ═══ Live only when EARNED: 20+ graded verdicts AND ahead of the
+  // numeric path. Re-checked on every trade, so it also hands itself back if the record slips.
+  // 'mc_brain_gate'='off' is the manual override to force numeric-only (console: CipherExec.setBrainGate('off')).
+  function gateLive(){ if(get('mc_brain_gate','auto')==='off') return false; const s=brainScore(); return s.graded>=BRAIN_PROMOTE_N && s.brain>s.bot; }
+  function raceVerdict(t,ms){ return Promise.race([shadowVerdict(t), new Promise(r=>setTimeout(()=>r(null),ms||25000))]).catch(()=>null); }
   async function onTrade(t){
     try{
       const mode=get(LS.mode,'off'); if(mode==='off') return;
       if(!t||!t.coin) return; const score=Number(t.score||0);
       const plan={ entry:t.entry, sl:t.sl, tp1:t.tp1, tp2:t.tp2, tp3:t.tp3, thesis:t.thesis||'', source:t.source||'' };
-      const vetOK=(t.source==='auto-scan'&&t.vetGrade==='positive');
-      if(score<num(LS.min,8) && !vetOK){ pushLog(Object.assign({coin:t.coin,dir:t.dir,score,skipped:(t.score!=null?'score '+score+' below minimum '+num(LS.min,8):'no brain score and backtest vet not positive')},plan)); return; }
+      const vetOK=(t.source==='auto-scan'&&t.vetGrade&&t.vetGrade!=='negative'); // demo phase: only a negative vet disqualifies
+      // ═══ PHASE 2 BRAIN GATE ═══ once earned, the brain's verdict IS the decision:
+      // TAKE fires (whatever the score), PASS vetoes, RESIZE scales. No verdict within 25s
+      // (API down/slow) → numeric rules decide, logged as the fallback. The hard guards
+      // below (correlation, daily cap, plan validity, edge) bind BOTH deciders — always.
+      const gateOn=gateLive(); let bv=null;
+      if(gateOn) bv=await raceVerdict(t,25000);
+      if(gateOn&&bv){
+        if(bv.verdict==='PASS'){ pushLog(Object.assign({coin:t.coin,dir:t.dir,score,brain:'PASS',skipped:'BRAIN GATE — vetoed: '+(bv.reason||'no edge')},plan)); notify('Brain vetoed '+t.coin+' '+String(t.dir||'long').toUpperCase()+(bv.reason?' — '+String(bv.reason).slice(0,80):'')); return; }
+        // TAKE or RESIZE → proceed past the score bar on the brain's authority
+      } else if(score<num(LS.min,8) && !vetOK){ pushLog(Object.assign({coin:t.coin,dir:t.dir,score,skipped:(t.score!=null?'score '+score+' below minimum '+num(LS.min,8):'no brain score and backtest vet not positive')+(gateOn?' — brain gave no verdict in time, numeric fallback':'')},plan)); return; }
       // Correlation guard — alt majors move together; 4 shorts in one sweep is one bet, not four.
       const corrMax=num('mc_exec_corrmax',3);
       try{ const snap=JSON.parse(get('mc_exec_possnap','{}'))||{}; const dir=(t.dir==='short')?'Short':'Long';
@@ -7814,12 +8476,33 @@ document.addEventListener('click', function(e){
         if(fired24>=cap){ pushLog(Object.assign({coin:t.coin,dir:t.dir,score,skipped:'daily cap reached ('+cap+' trades/24h)'},plan)); return; } }catch{}
       const bad=planValid(t);
       if(bad){ pushLog(Object.assign({coin:t.coin,dir:t.dir,score,skipped:'REFUSED — '+bad},plan)); notify('Refused '+t.coin+': '+bad); return; }
+      // ── DRIFT GUARD (2026-08-10) ── The plan is anchored to a CLOSED bar, but the order goes in
+      // later and on a different venue (signals: Binance spot; execution: Phemex perps). If price
+      // has already moved, the real risk/reward is not what the plan says. Measured in R, because
+      // a fixed % means nothing across coins: >0.4R against = most of the stop already spent
+      // before entry; >0.5R in favour = chasing, and the R:R no longer justifies the trade.
+      try{
+        const live = (typeof getQuote==='function') ? await getQuote(t.coin, t.market||'crypto') : null;
+        const R = Math.abs(+t.entry - +t.sl);
+        if(Number.isFinite(live) && R>0){
+          const sgn = (t.dir||'long')==='short' ? -1 : 1;
+          const moved = (live - +t.entry) * sgn / R;          // +ve = in our favour, in R
+          if(moved < -0.4){ pushLog(Object.assign({coin:t.coin,dir:t.dir,score,skipped:'price drifted '+Math.abs(moved).toFixed(2)+'R against the plan before entry (live '+formatPrice(live)+' vs planned '+formatPrice(t.entry)+') — the setup is gone'},plan)); return; }
+          if(moved > 0.5){ pushLog(Object.assign({coin:t.coin,dir:t.dir,score,skipped:'price already ran '+moved.toFixed(2)+'R in our favour (live '+formatPrice(live)+') — chasing, R:R no longer stands'},plan)); return; }
+        }
+      }catch(e){}
+      // Edge guard (2026-08-09): if this coin's own backtest says this SIDE loses, don't fire it.
+      // DEMO PHASE: advisory-only unless 'mc_exec_edgeguard'='1' — even known-bad sides are
+      // execution data on testnet. Flip to '1' as part of the pre-live tightening.
+      try{ if(get('mc_exec_edgeguard','0')==='1'&&typeof backtestEdge==='function'&&backtestEdge(t.coin,t.dir||'long')==='negative'){ pushLog(Object.assign({coin:t.coin,dir:t.dir,score,skipped:'backtest shows NEGATIVE edge for '+t.coin+' '+(t.dir||'long')+'s — not firing live'},plan)); return; } }catch(e){}
       const id=tradeId(t); if(firedSet()[id]) return;
       const built=buildOrder(t); if(built.err){ pushLog(Object.assign({id,skipped:built.err,coin:t.coin,dir:t.dir,score},plan)); return; }
+      // Brain gate RESIZE: scale the position (0.25×–1×) on the brain's authority.
+      if(gateOn&&bv&&bv.verdict==='RESIZE'){ const f=Math.min(1,Math.max(0.25,Number(bv.size)||0.5)); built.meta.qty=roundQty(built.meta.qty*f); built.order.orderQtyRq=built.meta.qty; if(!(built.meta.qty>0)){ pushLog(Object.assign({coin:t.coin,dir:t.dir,score,skipped:'BRAIN GATE — resize made qty 0'},plan)); return; } }
       markFired(id);
       const r=await callWorker('/order',built.order); const ok=r.status===200 && !r.data.error;
       const oid=(r.data&&r.data.phemex&&r.data.phemex.data&&r.data.phemex.data.data&&r.data.phemex.data.data.orderID)||'';
-      pushLog(Object.assign({ id, mode, coin:t.coin, dir:t.dir, qty:built.meta.qty, score, orderID:oid, result: ok?(r.data.dryRun?'dry-run OK':'PLACED'):('ERR '+(r.data.error||r.status)), detail:r.data },plan));
+      pushLog(Object.assign({ id, mode, coin:t.coin, dir:t.dir, qty:built.meta.qty, score, orderID:oid, exitAtR:built.meta.exitAtR, takeProfit:built.meta.exitPx, brain: gateOn?(bv?bv.verdict+(bv.verdict==='RESIZE'&&bv.size?' ×'+bv.size:''):'no verdict — numeric fallback'):null, result: ok?(r.data.dryRun?'dry-run OK':'PLACED'):('ERR '+(r.data.error||r.status)), detail:r.data },plan));
       notify(`${mode==='dry'?'DRY':'EXEC'} ${t.coin} ${(t.dir||'long').toUpperCase()} x${built.meta.qty} — ${ok?(r.data.dryRun?'would place':'order sent'):'FAILED: '+(r.data.error||r.status)}`);
     }catch(e){ pushLog({coin:t&&t.coin,error:String(e&&e.message||e)}); }
   }
@@ -7940,11 +8623,48 @@ document.addEventListener('click', function(e){
   function renderBot(){
     const logEl=document.getElementById('bot-log'), stEl=document.getElementById('bot-status'), posEl=document.getElementById('bot-positions');
     if(!logEl) return;
+    gradeBrain();
+    try{ const ms=document.getElementById('bot-minscore'); if(ms) ms.value=String(num(LS.min,8)); }catch(e){}
+    // ── Shadow brain scoreboard: its record vs the numeric path, on the same trades ──
+    try{
+      const brEl=document.getElementById('bot-brain');
+      if(brEl){
+        const s=brainScore(), tot=s.graded+s.pending, live=gateLive();
+        const status=live
+          ? 'GATE LIVE — the brain decides; numeric path runs in shadow'
+          : s.graded>=BRAIN_PROMOTE_N
+          ? (s.brain>s.bot?'brain is AHEAD — eligible for the gate (Phase 2)':'brain not ahead — stays advisory')
+          : 'gate goes live at '+BRAIN_PROMOTE_N+'+ graded if ahead';
+        brEl.innerHTML=tot
+          ? '<div class="bot-row" style="cursor:default"><div class="bot-row-top"><span class="bot-badge" style="color:var(--muted);border-color:var(--muted)">'+(live?'BRAIN · GATE LIVE':'BRAIN · SHADOW')+'</span>'
+            +'<span style="font-size:10px;color:var(--dim);">'+(live?'TAKE fires · PASS vetoes · RESIZE scales — hands back if the record slips':'advisory — every verdict graded on real outcomes')+'</span></div>'
+            +'<div class="bot-nums"><span>verdicts <b>'+tot+'</b></span><span>graded <b>'+s.graded+'</b></span>'
+            +(s.graded?'<span>brain right <b>'+s.brain+'/'+s.graded+'</b></span><span>numeric right <b>'+s.bot+'/'+s.graded+'</b></span>':'')
+            +'<span style="color:var(--dim);">'+status+'</span></div></div>'
+          : '<div style="font-size:11px;color:var(--dim);">Shadow brain armed — it will give a graded advisory verdict on every exec candidate from now on.</div>';
+      }
+    }catch(e){}
+    const brainByTrade=(e)=>{ try{ const at=e.at?new Date(e.at).getTime():0;
+      return brainLog().find(b=>b.coin===e.coin&&b.dir===(e.dir||'long')&&Math.abs(new Date(b.at).getTime()-at)<15*60000); }catch{ return null; } };
     const mode=get(LS.mode,'off');
     if(stEl) stEl.textContent=(mode==='off'
       ? 'mode: LEDGER ONLY — vetted signals tracked and graded on real prices, no orders placed'
       : 'mode: '+mode.toUpperCase()+' · fires at score ≥ '+num(LS.min,8)+' · exchange: Phemex testnet')
-      +' · risk £'+num(LS.risk,10)+'/trade';
+      +' · risk £'+num(LS.risk,10)+'/trade'
+      +' · panel read '+new Date().toLocaleTimeString(undefined,{hour:'2-digit',minute:'2-digit',second:'2-digit'});
+    // Heartbeat: is the scanner actually sweeping? (auto-scan runs every 15 min while the tab is open)
+    try{ const hb=document.getElementById('bot-heartbeat');
+      if(hb){ const lr=parseInt(localStorage.getItem('mc_autoscan_lastrun')||'0',10);
+        const mins=lr?Math.round((Date.now()-lr)/60000):null;
+        const stale=(mins===null||mins>8); // 5-min sweeps: anything past 8 means it stalled
+        let sw=null; try{ sw=JSON.parse(localStorage.getItem('mc_autoscan_lastsweep')||'null'); }catch{}
+        const detail = sw ? ' · '+sw.hits+' matches, '+sw.fresh+' new'
+          +(sw.alreadyToday?', '+sw.alreadyToday+' already fired today':'')
+          +(sw.suppressed?', '+sw.suppressed+' negative-edge':'') : '';
+        hb.innerHTML='<span style="color:'+(stale?'#e88':'#9c9')+'">●</span> '
+          +(mins===null?'scanner has not swept yet this session — it runs 8s after load, then every 5 min'
+            :'scanner swept '+(mins<1?'less than a minute':mins+' min')+' ago'+(stale?' — looks stalled, reload the page':' — running')+detail);
+      } }catch(e){}
     const log=(()=>{ try{ return JSON.parse(get(LS.log,'[]'))||[]; }catch{ return []; } })();
     if(!log.length){ logEl.innerHTML='<div style="font-size:11px;color:var(--dim);">No decisions yet. When a signal scores ≥ '+num(LS.min,8)+' and gets saved, it shows up here — taken or passed.</div>'; }
     else logEl.innerHTML=log.map(e=>{
@@ -7968,6 +8688,12 @@ document.addEventListener('click', function(e){
       if(e.skipped) why='<div class="bot-why">Passed: '+esc(e.skipped)+(e.thesis?' — '+esc(String(e.thesis).slice(0,160)):'')+'</div>';
       else if(e.thesis) why='<div class="bot-why">Why: '+esc(String(e.thesis).slice(0,160))+(String(e.thesis).length>160?'… <span style="color:var(--dim)">(tap for full)</span>':'')+'</div>';
       else if(e.test) why='<div class="bot-why">Manual test fire from the pill.</div>';
+      // Shadow brain's advisory verdict on this same candidate, with its grade once the trade resolves.
+      try{ const bv=brainByTrade(e);
+        if(bv) why+='<div class="bot-why" style="color:var(--muted);">Brain (shadow): <b>'+esc(bv.verdict)+(bv.verdict==='RESIZE'&&bv.size?' ×'+bv.size:'')+'</b>'
+          +(bv.reason?' — '+esc(bv.reason):'')
+          +(bv.outcome?' · <b>'+(bv.brainRight?'RIGHT':'WRONG')+'</b> (trade '+esc(bv.outcome)+(Number.isFinite(+bv.result)?' '+(bv.result>0?'+':'')+bv.result+'%':'')+')':' · awaiting outcome')+'</div>';
+      }catch(x){}
       let detail='<div class="bot-detail">'+specSheet(e);
       if(e.thesis) detail+='<div style="margin-top:8px;"><span style="color:var(--dim)">REASON</span><br>'+esc(e.thesis)+'</div>';
       detail+='<div style="color:var(--dim);margin-top:6px;">'+[e.source?'source: '+esc(e.source):'',e.mode?'mode: '+esc(e.mode):'',e.orderID?'order: '+esc(e.orderID):''].filter(Boolean).join(' · ')+'</div></div>';
@@ -8040,9 +8766,20 @@ document.addEventListener('click', function(e){
         const key=p.symbol+'|'+(p.posSide||'');
         // A protective stop can live EITHER on the position or as a resting conditional order.
         let restingSL=0;
+        // Loosened 2026-08-10: Phemex conditionals don't always carry closeOnTrigger/reduceOnly,
+        // and ordType varies (Stop / StopLimit / MarketIfTouched). What actually makes an order a
+        // protective stop is a trigger price on the CLOSING side of the position — test that.
         try{ const or=await (await fetch(url+'/orders?symbol='+encodeURIComponent(p.symbol),{headers:{Authorization:'Bearer '+get(LS.token,'')}})).json();
-          const s=(or.orders||[]).find(o=>/Stop/i.test(o.ordType||'')&&(o.closeOnTrigger||o.reduceOnly)&&Number(o.stopPxRp)>0);
-          if(s) restingSL=Number(s.stopPxRp);
+          const isLong=/long/i.test(p.posSide||p.side||'');
+          const mark=Number(p.markPriceRp||p.markPrice||p.avgEntryPriceRp||0);
+          const cands=(or.orders||[]).filter(o=>{
+            const sp=Number(o.stopPxRp||0); if(!(sp>0)) return false;
+            const closing=isLong?/sell/i.test(o.side||''):/buy/i.test(o.side||'');
+            if(!closing) return false;
+            // a stop sits the protective side of price; a take-profit sits the other side
+            return mark>0 ? (isLong ? sp<mark : sp>mark) : true;
+          }).map(o=>Number(o.stopPxRp));
+          if(cands.length) restingSL=isLong?Math.max(...cands):Math.min(...cands); // tightest protection
         }catch{}
         const hasSL=Number(p.stopLossRp||p.stopLoss||0)>0 || restingSL>0;
         p._restingSL=restingSL;
@@ -8073,10 +8810,11 @@ document.addEventListener('click', function(e){
     }catch(e){}
   }
   setInterval(sweepPositions,5*60*1000); setTimeout(sweepPositions,20000);
+  setTimeout(rejudgeOpen,30000); // blind re-judge of open trades left without a v2 verdict
   document.addEventListener('visibilitychange',()=>{ if(!document.hidden) sweepPositions(); });
   window.toggleBot=function(){ const p=document.getElementById('bot-panel'); if(!p) return; p.classList.toggle('show'); if(p.classList.contains('show')) renderBot(); };
   window.closeBot=function(e){ if(e.target===document.getElementById('bot-panel')) window.toggleBot(); };
-  window.CipherExec={ onTrade, panic, status, renderPill, renderBot, buildOrder, testFire, logDecision:pushLog, symbols:()=>String(get('mc_exec_symbols','BTC,ETH,SOL')).split(',').map(s=>s.trim().toUpperCase()), setUrl:u=>set(LS.url,u), setToken:t=>set(LS.token,t), setMode:m=>{set(LS.mode,m);renderPill();}, setMinScore:s=>set(LS.min,String(s)), setRisk:r=>set(LS.risk,String(r)), getLog:()=>{ try{ return JSON.parse(get(LS.log,'[]')); }catch{ return []; } } };
+  window.CipherExec={ onTrade, panic, status, renderPill, renderBot, buildOrder, testFire, logDecision:pushLog, shadowVerdict, gradeBrain, brainScore, getBrainLog:brainLog, gateLive, setBrainGate:g=>set('mc_brain_gate',g), symOK, rejudgeOpen, symbols:()=>String(get('mc_exec_symbols','BTC,ETH,SOL')).split(',').map(s=>s.trim().toUpperCase()), setUrl:u=>set(LS.url,u), setToken:t=>set(LS.token,t), setMode:m=>{set(LS.mode,m);renderPill();}, setMinScore:s=>set(LS.min,String(s)), setRisk:r=>set(LS.risk,String(r)), getLog:()=>{ try{ return JSON.parse(get(LS.log,'[]')); }catch{ return []; } } };
   if(document.readyState==='loading') document.addEventListener('DOMContentLoaded',renderPill); else renderPill();
 })();
 </script>
