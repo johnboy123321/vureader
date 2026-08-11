@@ -164,16 +164,33 @@ async function fetchCandles(sym, tf, bars = 260) {
 async function topUniverse(n) {
   const EXCL = /(UP|DOWN|BULL|BEAR)$/;
   const STABLE = new Set(["USDC", "BUSD", "FDUSD", "TUSD", "DAI", "USDP", "USTC", "EUR", "GBP", "AEUR", "PAXG", "USDT", "EURI"]);
+  const keep = (sym) => sym && !EXCL.test(sym) && !STABLE.has(sym);
+  // Binance blocks US IPs, and GitHub's runners are US-hosted — on Actions this call fails and we
+  // fall through to OKX. Without the OKX step the agent silently dropped to a 10-coin hardcoded
+  // list and scanned the same coins twice per run (found on the first live run, 2026-08-11).
   try {
     const r = await fetch("https://api.binance.com/api/v3/ticker/24hr");
     if (r.ok) {
       const d = await r.json();
-      return d.filter(x => x.symbol.endsWith("USDT"))
-        .map(x => ({ sym: x.symbol.slice(0, -4), vol: parseFloat(x.quoteVolume) }))
-        .filter(x => x.sym && !EXCL.test(x.sym) && !STABLE.has(x.sym) && Number.isFinite(x.vol))
-        .sort((a, b) => b.vol - a.vol).map(x => x.sym).slice(0, n);
+      const list = d.filter((x) => x.symbol.endsWith("USDT"))
+        .map((x) => ({ sym: x.symbol.slice(0, -4), vol: parseFloat(x.quoteVolume) }))
+        .filter((x) => keep(x.sym) && Number.isFinite(x.vol))
+        .sort((a, b) => b.vol - a.vol).map((x) => x.sym).slice(0, n);
+      if (list.length >= 20) return list;
     }
-  } catch { /* fall through */ }
+  } catch { /* fall through to OKX */ }
+  try {
+    const r = await fetch("https://www.okx.com/api/v5/market/tickers?instType=SPOT");
+    if (r.ok) {
+      const j = await r.json();
+      const list = (j.data || []).filter((x) => x.instId.endsWith("-USDT"))
+        .map((x) => ({ sym: x.instId.split("-")[0], vol: parseFloat(x.volCcy24h) }))
+        .filter((x) => keep(x.sym) && Number.isFinite(x.vol))
+        .sort((a, b) => b.vol - a.vol).map((x) => x.sym).slice(0, n);
+      if (list.length >= 20) { console.log("universe: OKX (" + list.length + " coins) — Binance unreachable"); return list; }
+    }
+  } catch { /* fall through to the fixed list */ }
+  console.warn("universe: BOTH exchanges unreachable — using the 10-coin fallback list");
   return ["BTC", "ETH", "SOL", "XRP", "BNB", "DOGE", "ADA", "LINK", "AVAX", "DOT"];
 }
 
@@ -321,7 +338,11 @@ export default async function cipherAgent() {
   const cursor = await getJSON(KEY.cursor, 0);
   const batch = Math.max(5, CFG.batch());
   const slice = [];
-  for (let i = 0; i < batch; i++) slice.push(uni[(cursor + i) % uni.length]);
+  const seenThisRun = new Set();
+  for (let i = 0; i < batch && seenThisRun.size < uni.length; i++) {
+    const sym = uni[(cursor + i) % uni.length];
+    if (!seenThisRun.has(sym)) { seenThisRun.add(sym); slice.push(sym); }
+  }
   await setJSON(KEY.cursor, (cursor + batch) % uni.length);
 
   // Day-scoped dedupe: one trade per coin+direction per day, same as the app.
