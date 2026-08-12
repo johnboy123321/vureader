@@ -503,9 +503,29 @@ async function relay(path, body) {
     headers: { "Content-Type": "application/json", Authorization: "Bearer " + CFG.relayToken() },
     body: body ? JSON.stringify(body) : undefined,
   });
-  let data; try { data = await res.json(); } catch { data = { raw: await res.text() }; }
+  // Read the body ONCE as text, then try to parse. Calling res.json() and falling back to
+  // res.text() in the catch throws "Body is unusable" — the failure handler itself failed, and
+  // that killed every scheduled run overnight (2026-08-12). Never re-read a consumed body.
+  const raw = await res.text();
+  let data; try { data = raw ? JSON.parse(raw) : {}; } catch { data = { raw: raw.slice(0, 500), parseError: true }; }
   return { status: res.status, data };
 }
+// Ask the relay what it will actually accept, and scan only those coins. The relay's whitelist
+// is the real gate — trading outside it just generates rejected orders and noise in the log.
+// Making it the single source of truth means the two can never disagree (2026-08-12).
+async function relayWhitelist() {
+  try {
+    const url = CFG.relayUrl(); if (!url) return null;
+    const res = await fetch(url + "/status", { headers: { Authorization: "Bearer " + CFG.relayToken() } });
+    const raw = await res.text();
+    const j = JSON.parse(raw);
+    const wl = j && j.whitelist;
+    if (!Array.isArray(wl) || !wl.length) return null;
+    if (wl.includes("*")) return null;                       // open relay — scan everything
+    return new Set(wl.map(x => String(x).toUpperCase().replace(/USDT$/, "")));
+  } catch { return null; }                                    // unreachable → don't block the run
+}
+
 async function openPositions() {
   try { const r = await relay("/positions"); return ((r.data && r.data.data && r.data.data.positions) || []).filter(p => Number(p.size) > 0); }
   catch { return []; }
@@ -524,7 +544,14 @@ export default async function cipherAgent() {
   if (mode === "off") { console.log("MODE=off — agent idle"); return; }
 
   // Rotate through the universe a batch at a time so every run finishes well inside 60s.
-  const uni = await topUniverse(CFG.universe());
+  let uni = await topUniverse(CFG.universe());
+  const allowed = await relayWhitelist();
+  if (allowed) {
+    const before = uni.length;
+    uni = uni.filter(c => allowed.has(c));
+    if (!uni.length) uni = [...allowed];                      // none of the top movers are allowed
+    console.log(`universe: ${uni.length} tradeable of ${before} (relay whitelist)`);
+  }
   const cursor = await getJSON(KEY.cursor, 0);
   const batch = Math.max(5, CFG.batch());
   const slice = [];
@@ -610,8 +637,16 @@ export default async function cipherAgent() {
       placed++; placedToday++;
       continue;
     }
-    const r = await relay("/order", built.order);
-    const ok = r.status === 200 && !r.data.error;
+    let r;
+    try { r = await relay("/order", built.order); }
+    catch (e) {
+      // A relay hiccup on one coin should cost that coin, not the rest of the sweep.
+      await pushLog({ ...t, qty: built.meta.qty, mode, result: "ERR relay unreachable — " + String(e && e.message || e).slice(0, 120) });
+      continue;
+    }
+    // An empty 200 is NOT a fill — require the relay to have actually said something back,
+    // or a blank response gets logged as a placed trade that doesn't exist.
+    const ok = r.status === 200 && r.data && !r.data.error && !r.data.parseError && Object.keys(r.data).length > 0;
     const oid = (r.data?.phemex?.data?.data?.orderID) || "";
     await pushLog({ ...t, qty: built.meta.qty, mode, orderID: oid, result: ok ? (r.data.dryRun ? "dry-run OK" : "PLACED") : "ERR " + (r.data.error || r.status), thesis: sig.ev.join("; ") + " · plan from " + (sig.planTf || "1D") + (sig.detector ? " · " + sig.detector + " detector" : " · confluence") });
     if (ok) { placed++; placedToday++; openedThisRun.push(sig.bias); held.add(coin); }
