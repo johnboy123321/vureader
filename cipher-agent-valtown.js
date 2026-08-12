@@ -327,9 +327,18 @@ function detectMomentumRollover(c) {
       if (bear ? (d1 >= 0 && d0 < 0) : (d1 <= 0 && d0 > 0)) { xi = k; break; }
     }
     if (xi < 0) continue;
-    // it must be rolling over from the right side of zero — not a cross deep in the opposite zone
-    const zoneOK = bear ? wt2[xi] > 10 : wt2[xi] < -10;
-    if (!zoneOK) continue;
+    // Tightened 2026-08-12: |wt2| > 10 fired on almost every coin (15 candidates from 20) — it
+    // described the market rather than finding anything. A mid-range cross now has to agree with
+    // the 50 EMA trend; only a genuine extreme-zone cross may go against it.
+    const w = wt2[xi];
+    const extremeZone = bear ? w >= VMC.obLevel : w <= VMC.osLevel;
+    const midRange = bear ? w >= 25 : w <= -25;
+    if (!extremeZone && !midRange) continue;
+    if (!extremeZone) {
+      const closes = c.map(x => x.c), e50 = emaArr(closes, 50);
+      const trendAgrees = bear ? closes[i] < e50[i] : closes[i] > e50[i];
+      if (!trendAgrees) continue;                 // counter-trend mid-range fade = noise
+    }
     // VWAP wave (the early-warning wave) must agree, and be falling/rising into the cross
     const vwOK = bear ? (vw[i] < vw[Math.max(0, i - 2)] && vw[i] < 0) : (vw[i] > vw[Math.max(0, i - 2)] && vw[i] > 0);
     if (!vwOK) continue;
@@ -437,6 +446,11 @@ function buildTradePlan(candles, dir, entry) {
   let stop;
   if (dir === "short") { stop = Math.max(...last10.map(k => k.h)) + 0.25 * a; if (stop - entry < 0.6 * a) stop = entry + 1.5 * a; }
   else { stop = Math.min(...last10.map(k => k.l)) - 0.25 * a; if (entry - stop < 0.6 * a) stop = entry - 1.5 * a; }
+  // A structure stop can be enormous on a volatile coin — ADA came out 14.4% away, giving a
+  // 32% target from a momentum cross that has no edge over a move that size. If structure
+  // demands more than 3 ATR, the setup is not tradeable on this timeframe: refuse it rather
+  // than stretch the plan to fit (2026-08-12).
+  if (Math.abs(entry - stop) > 3 * a) return null;
   const risk = Math.abs(entry - stop); if (!(risk > 0)) return null;
   const sgn = dir === "short" ? -1 : 1;
   return { entry, stop, risk, targets: [1, 2.25, 4].map(m => entry + sgn * risk * m) };
@@ -598,16 +612,37 @@ export default async function cipherAgent() {
     let sig = scoreCoin(tfData);
     if (sig && sig.score < CFG.minScore()) sig = null;
     if (!sig) {
+      // Look at EVERY timeframe and detector, then take the STRONGEST hit — not whichever
+      // happened to be checked first. Taking the first match meant a 15m wobble could outrank a
+      // clean daily signal, and made the bot fire on ~75% of coins (2026-08-12).
+      const TF_WEIGHT = { "1D": 3, "4H": 2.5, "1H": 2, "30m": 1, "15m": 0.5 };
+      const DET_WEIGHT = { divergence: 3, greendot: 2, rollover: 1 };
+      const hits = [];
       for (const tf of ["1D", "4H", "1H", "30m", "15m"]) {
         const c = bars[tf]; if (!c || c.length < 80) continue;
-        let m = null, label = "";
         for (const [nm, fn] of [["divergence", detectWTDivergence], ["rollover", detectMomentumRollover], ["greendot", detectGreenDotMFReversal]]) {
-          try { const r = fn(c); if (r && r.match) { m = r; label = nm; break; } } catch {}
+          let r = null; try { r = fn(c); } catch {}
+          if (!r || !r.match) continue;
+          const bonus = (r.stage === "extreme" || r.stage === "fresh") ? 1 : 0;
+          hits.push({ m: r, label: nm, tf, c, q: (TF_WEIGHT[tf] || 1) + (DET_WEIGHT[nm] || 1) + bonus });
         }
-        if (!m) continue;
-        sig = { bias: m.dir, score: CFG.minScore(), ev: [m.label || label, ...(m.ev || [])].slice(0, 4),
-                price: c[c.length - 1].c, planTf: tf, detector: label };
-        break;
+      }
+      // Ranking alone does NOT reduce how often we trade — a candidate still exists if ANY
+      // timeframe fires, and across 5 timeframes that is ~half of all coins. A minimum quality
+      // is what actually bites: a bare rollover on a low timeframe is not a trade. At 5.0 the
+      // bar is roughly "daily extreme-zone rollover, or a divergence on 4H+" (2026-08-12).
+      const MIN_QUALITY = num("MIN_QUALITY", 5);
+      if (hits.length) {
+        hits.sort((a, b) => b.q - a.q);
+        const best = hits[0];
+        if (best.q < MIN_QUALITY) {
+          await pushLog({ coin, dir: best.m.dir, skipped: `signal too weak — ${best.label} on ${best.tf} (quality ${best.q.toFixed(1)} < ${MIN_QUALITY})` });
+        } else {
+        sig = { bias: best.m.dir, score: CFG.minScore(),
+                ev: [best.m.label || best.label, ...(best.m.ev || [])].slice(0, 4),
+                price: best.c[best.c.length - 1].c, planTf: best.tf, detector: best.label,
+                alt: hits.length > 1 ? hits.length - 1 : 0 };
+        }
       }
     }
     if (!sig) continue;
@@ -633,7 +668,7 @@ export default async function cipherAgent() {
     fired[key] = Date.now();
     if (mode === "dry") {
       openedThisRun.push(sig.bias);
-      await pushLog({ ...t, qty: built.meta.qty, mode, result: "dry-run OK", thesis: sig.ev.join("; ") + " · plan from " + (sig.planTf || "1D") + (sig.detector ? " · " + sig.detector + " detector" : " · confluence") });
+      await pushLog({ ...t, qty: built.meta.qty, mode, result: "dry-run OK", thesis: sig.ev.join("; ") + " · plan from " + (sig.planTf || "1D") + (sig.detector ? " · " + sig.detector + " detector" + (sig.alt ? " (best of " + (sig.alt + 1) + " hits)" : "") : " · confluence") });
       placed++; placedToday++;
       continue;
     }
@@ -648,7 +683,7 @@ export default async function cipherAgent() {
     // or a blank response gets logged as a placed trade that doesn't exist.
     const ok = r.status === 200 && r.data && !r.data.error && !r.data.parseError && Object.keys(r.data).length > 0;
     const oid = (r.data?.phemex?.data?.data?.orderID) || "";
-    await pushLog({ ...t, qty: built.meta.qty, mode, orderID: oid, result: ok ? (r.data.dryRun ? "dry-run OK" : "PLACED") : "ERR " + (r.data.error || r.status), thesis: sig.ev.join("; ") + " · plan from " + (sig.planTf || "1D") + (sig.detector ? " · " + sig.detector + " detector" : " · confluence") });
+    await pushLog({ ...t, qty: built.meta.qty, mode, orderID: oid, result: ok ? (r.data.dryRun ? "dry-run OK" : "PLACED") : "ERR " + (r.data.error || r.status), thesis: sig.ev.join("; ") + " · plan from " + (sig.planTf || "1D") + (sig.detector ? " · " + sig.detector + " detector" + (sig.alt ? " (best of " + (sig.alt + 1) + " hits)" : "") : " · confluence") });
     if (ok) { placed++; placedToday++; openedThisRun.push(sig.bias); held.add(coin); }
   }
 
