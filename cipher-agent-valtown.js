@@ -485,11 +485,30 @@ function roundPx(p) {
   if (p >= 0.01) return +p.toFixed(6);
   return +p.toPrecision(6);          // sub-cent coins keep 6 significant figures
 }
+// The venue's notional cap, learned from the relay's /status. Null until the first successful
+// call; sizing then falls back to the unclamped figure, which is the old behaviour.
+let RELAY_CAP = null;
+
 function buildOrder(t) {
   const symbol = String(t.coin).toUpperCase() + "USDT";
   const entry = +t.entry, sl = +t.sl, tp1 = +t.tp1;
   const stopDist = Math.abs(entry - sl); if (!(stopDist > 0)) return { err: "zero stop distance" };
-  const qty = roundQty(CFG.risk() / stopDist); if (!(qty > 0)) return { err: "computed qty <= 0" };
+  let qty = roundQty(CFG.risk() / stopDist); if (!(qty > 0)) return { err: "computed qty <= 0" };
+
+  // ── SIZE TO THE VENUE CAP INSTEAD OF BEING REJECTED BY IT (2026-08-13) ──
+  // notional = qty × entry = risk / stopPercent. With risk 10 and a 2000 cap, ANY stop tighter
+  // than 0.5% breaches it — while planValid happily allows stops down to 0.3%. So every setup in
+  // the 0.3–0.5% band was built, approved, sent and refused, and those are the tightest, best
+  // R:R setups in the book (two in the Aug log at 2652 and 2609 USDT). A cap is a venue limit,
+  // not a signal about the trade: take it at the size that fits rather than throwing it away.
+  // The trade-off is explicit — such a trade risks LESS than RISK_GBP, and riskActual records it.
+  let clamped = false;
+  if (Number.isFinite(RELAY_CAP) && RELAY_CAP > 0) {
+    const maxQty = roundQty((RELAY_CAP * 0.98) / entry);   // 2% headroom absorbs qty rounding
+    if (maxQty > 0 && qty > maxQty) { qty = maxQty; clamped = true; }
+    if (!(qty > 0)) return { err: "notional cap leaves no tradeable size" };
+  }
+  const riskActual = +(qty * stopDist).toFixed(2);
   const isLong = (t.dir || "long") === "long";
   const cross = roundPx(isLong ? entry * 1.01 : entry * 0.99);
   // Exit at T2 (2.25R), not T1. T1 is 1R by construction, but every backtest and the discovery
@@ -505,7 +524,7 @@ function buildOrder(t) {
       takeProfitRp: exitPx,
       clOrdID: ("agent" + t.coin + Date.now()).replace(/[^a-zA-Z0-9]/g, "").slice(0, 30),
     },
-    meta: { symbol, qty, exitPx },
+    meta: { symbol, qty, exitPx, riskActual, clamped },
   };
 }
 
@@ -533,6 +552,9 @@ async function relayWhitelist() {
     const res = await fetch(url + "/status", { headers: { Authorization: "Bearer " + CFG.relayToken() } });
     const raw = await res.text();
     const j = JSON.parse(raw);
+    // Learn the venue's notional cap from the same call. Sizing has to respect it or the tightest
+    // stops are built, approved, sent and refused — see RELAY_CAP below.
+    if (j && Number.isFinite(+j.maxNotional) && +j.maxNotional > 0) RELAY_CAP = +j.maxNotional;
     const wl = j && j.whitelist;
     if (!Array.isArray(wl) || !wl.length) return null;
     if (wl.includes("*")) return null;                       // open relay — scan everything
@@ -616,7 +638,14 @@ export default async function cipherAgent() {
       // happened to be checked first. Taking the first match meant a 15m wobble could outrank a
       // clean daily signal, and made the bot fire on ~75% of coins (2026-08-12).
       const TF_WEIGHT = { "1D": 3, "4H": 2.5, "1H": 2, "30m": 1, "15m": 0.5 };
-      const DET_WEIGHT = { divergence: 3, greendot: 2, rollover: 1 };
+      // rollover raised 1 → 2 (2026-08-13). At 1 it was arithmetically IMPOSSIBLE for a 4H
+      // rollover to fire: 2.5 + 1 + 1 = 4.5 against a threshold of 5, so the timeframe John
+      // actually trades was silently excluded. That was a side effect of the weights, not a
+      // decision. At 2 the reachable set becomes: extreme-zone rollovers on 1D/4H/1H (5.5/5.0/
+      // 5.0) and mid-range only on the daily (5.0) — while every sub-1H rollover stays out
+      // (30m 4.0, 15m 3.5), which is what MIN_QUALITY was raised to 5 to achieve in the first
+      // place. Deliberately the smallest change that reopens 4H without reopening the noise.
+      const DET_WEIGHT = { divergence: 3, greendot: 2, rollover: 2 };
       const hits = [];
       for (const tf of ["1D", "4H", "1H", "30m", "15m"]) {
         const c = bars[tf]; if (!c || c.length < 80) continue;
@@ -668,7 +697,7 @@ export default async function cipherAgent() {
     fired[key] = Date.now();
     if (mode === "dry") {
       openedThisRun.push(sig.bias);
-      await pushLog({ ...t, qty: built.meta.qty, mode, result: "dry-run OK", thesis: sig.ev.join("; ") + " · plan from " + (sig.planTf || "1D") + (sig.detector ? " · " + sig.detector + " detector" + (sig.alt ? " (best of " + (sig.alt + 1) + " hits)" : "") : " · confluence") });
+      await pushLog({ ...t, qty: built.meta.qty, risk: built.meta.riskActual, clamped: built.meta.clamped || undefined, mode, result: "dry-run OK", thesis: sig.ev.join("; ") + " · plan from " + (sig.planTf || "1D") + (sig.detector ? " · " + sig.detector + " detector" + (sig.alt ? " (best of " + (sig.alt + 1) + " hits)" : "") : " · confluence") });
       placed++; placedToday++;
       continue;
     }
@@ -677,7 +706,7 @@ export default async function cipherAgent() {
     catch (e) {
       // A relay hiccup on one coin should cost that coin, not the rest of the sweep.
       delete fired[key];                               // transient — let the next run retry it
-      await pushLog({ ...t, qty: built.meta.qty, mode, result: "ERR relay unreachable — " + String(e && e.message || e).slice(0, 120) });
+      await pushLog({ ...t, qty: built.meta.qty, risk: built.meta.riskActual, clamped: built.meta.clamped || undefined, mode, result: "ERR relay unreachable — " + String(e && e.message || e).slice(0, 120) });
       continue;
     }
     // An empty 200 is NOT a fill — require the relay to have actually said something back,
@@ -688,7 +717,7 @@ export default async function cipherAgent() {
     // chars. A bare "ERR 502" is undiagnosable after the fact — it hid a relay crash for two
     // days (2026-08-13). The cause must be in the log entry itself, not in a val's console.
     const why = r.data.error || (r.data.parseError ? r.status + " unparseable — " + String(r.data.raw || "").slice(0, 200) : r.status);
-    await pushLog({ ...t, qty: built.meta.qty, mode, orderID: oid, result: ok ? (r.data.dryRun ? "dry-run OK" : "PLACED") : "ERR " + why, thesis: sig.ev.join("; ") + " · plan from " + (sig.planTf || "1D") + (sig.detector ? " · " + sig.detector + " detector" + (sig.alt ? " (best of " + (sig.alt + 1) + " hits)" : "") : " · confluence") });
+    await pushLog({ ...t, qty: built.meta.qty, risk: built.meta.riskActual, clamped: built.meta.clamped || undefined, mode, orderID: oid, result: ok ? (r.data.dryRun ? "dry-run OK" : "PLACED") : "ERR " + why, thesis: sig.ev.join("; ") + " · plan from " + (sig.planTf || "1D") + (sig.detector ? " · " + sig.detector + " detector" + (sig.alt ? " (best of " + (sig.alt + 1) + " hits)" : "") : " · confluence") });
     // fired[] was set BEFORE the attempt, so a failed order still burned the coin for the whole
     // day — 17 signals in Aug were lost twice over: no order placed AND no retry. A server-side
     // fault is not a decision, so undo the mark and let the next sweep have another go. A 4xx IS
