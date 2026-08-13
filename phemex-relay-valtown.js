@@ -30,6 +30,10 @@ const DEFAULTS = {
   MAX_NOTIONAL_USDT: "200",
   // Widened 2026-08-08 for the testnet data-gathering phase ("let it fly" — play money only).
   // Tighten this back down before BASE ever changes to live. "*" would allow any symbol.
+  //
+  // 2026-08-13: an open-to-everything edit sat in the local copy, undeployed, from 09 Aug — the
+  // live val never had it. Held back deliberately so the 502 fix ships alone and its effect is
+  // readable. Opening this up is a separate, one-line change.
   WHITELIST: "BTCUSDT,ETHUSDT,SOLUSDT,XRPUSDT,BNBUSDT,DOGEUSDT,ADAUSDT,LINKUSDT,AVAXUSDT,DOTUSDT,LTCUSDT,BCHUSDT,UNIUSDT,ATOMUSDT,NEARUSDT,APTUSDT,ARBUSDT,OPUSDT,SUIUSDT,TONUSDT,TRXUSDT,POLUSDT,FILUSDT,INJUSDT,AAVEUSDT",
 };
 const cfg = (k) => {
@@ -70,11 +74,17 @@ async function phemex(method, path, query, bodyObj) {
     },
     body: bodyStr || undefined,
   });
-  let data; try { data = await res.json(); } catch { data = { raw: await res.text() }; }
+  // Read the body ONCE as text, then parse. Calling res.json() and falling back to res.text()
+  // in the catch throws "Body is unusable" — res.json() consumes the stream before it throws,
+  // so the failure handler itself fails, the val crashes, and Val Town returns a BARE 502 with
+  // no JSON body. That is the source of every unexplained "ERR 502" in the agent log
+  // (17 of them 11–13 Aug 2026). Same bug, same fix as cipher-agent-valtown.js. (2026-08-13)
+  const raw = await res.text();
+  let data; try { data = raw ? JSON.parse(raw) : {}; } catch { data = { raw: raw.slice(0, 500), parseError: true }; }
   return { httpStatus: res.status, data };
 }
 
-export default async function (request) {
+async function handle(request) {
   if (request.method === "OPTIONS") return new Response(null, { headers: CORS });
 
   const auth = request.headers.get("Authorization") || "";
@@ -242,4 +252,17 @@ export default async function (request) {
   }
 
   return json({ error: "not found" }, 404);
+}
+
+// Nothing may escape as an uncaught throw. An uncaught error here becomes a platform 502 with a
+// non-JSON body, which the agent logs as a bare "ERR 502" with no cause — a silent failure that
+// looks identical to an exchange rejection. Always answer in JSON, always say what broke.
+export default async function (request) {
+  try {
+    return await handle(request);
+  } catch (e) {
+    const msg = String((e && e.stack) || (e && e.message) || e).slice(0, 600);
+    console.error("relay crashed:", msg);
+    return json({ error: "relay crashed: " + msg, crashed: true }, 500);
+  }
 }
