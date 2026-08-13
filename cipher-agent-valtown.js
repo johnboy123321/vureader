@@ -676,6 +676,7 @@ export default async function cipherAgent() {
     try { r = await relay("/order", built.order); }
     catch (e) {
       // A relay hiccup on one coin should cost that coin, not the rest of the sweep.
+      delete fired[key];                               // transient — let the next run retry it
       await pushLog({ ...t, qty: built.meta.qty, mode, result: "ERR relay unreachable — " + String(e && e.message || e).slice(0, 120) });
       continue;
     }
@@ -683,7 +684,16 @@ export default async function cipherAgent() {
     // or a blank response gets logged as a placed trade that doesn't exist.
     const ok = r.status === 200 && r.data && !r.data.error && !r.data.parseError && Object.keys(r.data).length > 0;
     const oid = (r.data?.phemex?.data?.data?.orderID) || "";
-    await pushLog({ ...t, qty: built.meta.qty, mode, orderID: oid, result: ok ? (r.data.dryRun ? "dry-run OK" : "PLACED") : "ERR " + (r.data.error || r.status), thesis: sig.ev.join("; ") + " · plan from " + (sig.planTf || "1D") + (sig.detector ? " · " + sig.detector + " detector" + (sig.alt ? " (best of " + (sig.alt + 1) + " hits)" : "") : " · confluence") });
+    // If the relay answered with something we could not parse, say so and keep the first 200
+    // chars. A bare "ERR 502" is undiagnosable after the fact — it hid a relay crash for two
+    // days (2026-08-13). The cause must be in the log entry itself, not in a val's console.
+    const why = r.data.error || (r.data.parseError ? r.status + " unparseable — " + String(r.data.raw || "").slice(0, 200) : r.status);
+    await pushLog({ ...t, qty: built.meta.qty, mode, orderID: oid, result: ok ? (r.data.dryRun ? "dry-run OK" : "PLACED") : "ERR " + why, thesis: sig.ev.join("; ") + " · plan from " + (sig.planTf || "1D") + (sig.detector ? " · " + sig.detector + " detector" + (sig.alt ? " (best of " + (sig.alt + 1) + " hits)" : "") : " · confluence") });
+    // fired[] was set BEFORE the attempt, so a failed order still burned the coin for the whole
+    // day — 17 signals in Aug were lost twice over: no order placed AND no retry. A server-side
+    // fault is not a decision, so undo the mark and let the next sweep have another go. A 4xx IS
+    // a decision (cap breached, bad symbol) and would just repeat, so that one stays burned.
+    if (!ok && r.status >= 500) delete fired[key];
     if (ok) { placed++; placedToday++; openedThisRun.push(sig.bias); held.add(coin); }
   }
 
