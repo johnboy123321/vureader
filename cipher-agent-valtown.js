@@ -529,13 +529,21 @@ function buildOrder(t) {
 }
 
 // ═══════════════════════ RELAY ═══════════════════════
+// A hung call must not eat the run's 45s budget and starve every coin after it.
+const RELAY_TIMEOUT_MS = 20000;
 async function relay(path, body) {
   const url = CFG.relayUrl(); if (!url) throw new Error("RELAY_URL not set");
-  const res = await fetch(url + path, {
-    method: body ? "POST" : "GET",
-    headers: { "Content-Type": "application/json", Authorization: "Bearer " + CFG.relayToken() },
-    body: body ? JSON.stringify(body) : undefined,
-  });
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(), RELAY_TIMEOUT_MS);
+  let res;
+  try {
+    res = await fetch(url + path, {
+      method: body ? "POST" : "GET",
+      headers: { "Content-Type": "application/json", Authorization: "Bearer " + CFG.relayToken() },
+      body: body ? JSON.stringify(body) : undefined,
+      signal: ac.signal,
+    });
+  } finally { clearTimeout(timer); }
   // Read the body ONCE as text, then try to parse. Calling res.json() and falling back to
   // res.text() in the catch throws "Body is unusable" — the failure handler itself failed, and
   // that killed every scheduled run overnight (2026-08-12). Never re-read a consumed body.
@@ -565,6 +573,33 @@ async function relayWhitelist() {
 async function openPositions() {
   try { const r = await relay("/positions"); return ((r.data && r.data.data && r.data.data.positions) || []).filter(p => Number(p.size) > 0); }
   catch { return []; }
+}
+
+// ── Did that order actually land? ─────────────────────────────────────────────────────────────
+// The relay sits behind Cloudflare and returns a bare HTML 502 on roughly 45% of order POSTs
+// (measured 12–14 Aug 2026 across 47 attempts). It is not the coin, the direction, the size, the
+// stop width or the position in the run — all of those were checked and none correlate. It is
+// simply an unreliable hop, so the answer is not another diagnosis, it is resilience.
+//
+// NEVER retry an order blind: a 502 does not mean the order failed, only that we did not hear
+// back. The request may well have reached Phemex. So we ask the exchange what happened before
+// deciding — a resting order carrying our clOrdID, or a position that appeared on a coin we were
+// not holding at the start of the run, both mean it landed and must NOT be sent twice.
+async function confirmPlaced(symbol, clOrdID, coin) {
+  try {
+    const r = await relay("/orders?symbol=" + encodeURIComponent(symbol));
+    const orders = (r.data && r.data.orders) || [];
+    const hit = orders.find(o => o && o.clOrdID === clOrdID);
+    if (hit) return { landed: true, how: "resting order", orderID: hit.orderID || "" };
+  } catch { /* fall through to the position check */ }
+  try {
+    // We only ever place when the coin is NOT already held, so any position here is ours.
+    const pos = await openPositions();
+    if (pos.some(p => String(p.symbol || "").replace(/USDT$/, "").toUpperCase() === coin)) {
+      return { landed: true, how: "filled into a position", orderID: "" };
+    }
+  } catch { /* unknown */ }
+  return { landed: false };
 }
 
 async function pushLog(entry) {
@@ -711,13 +746,34 @@ export default async function cipherAgent() {
     }
     // An empty 200 is NOT a fill — require the relay to have actually said something back,
     // or a blank response gets logged as a placed trade that doesn't exist.
-    const ok = r.status === 200 && r.data && !r.data.error && !r.data.parseError && Object.keys(r.data).length > 0;
+    const isOK = (x) => x.status === 200 && x.data && !x.data.error && !x.data.parseError && Object.keys(x.data).length > 0;
+    let ok = isOK(r), recovered = "";
+
+    // ── VERIFY, THEN RETRY ONCE, ON A 5xx (2026-08-14) ──
+    // ~45% of order POSTs come back as a Cloudflare HTML 502 with no correlation to anything
+    // about the trade. Ask the exchange whether it landed before doing anything: if it did, the
+    // trade is real and we record it rather than firing a duplicate. Only if it genuinely is not
+    // there do we send again — one retry, not a loop, so a systemic outage can't machine-gun.
+    if (!ok && r.status >= 500) {
+      await new Promise(res => setTimeout(res, 1500));   // let the exchange settle before asking
+      const chk = await confirmPlaced(built.meta.symbol, built.order.clOrdID, coin);
+      if (chk.landed) {
+        ok = true; recovered = " (recovered — 502 on the way back, but it " + chk.how + ")";
+        if (chk.orderID) r = { status: 200, data: { phemex: { data: { data: { orderID: chk.orderID } } } } };
+      } else {
+        try {
+          const r2 = await relay("/order", built.order);
+          if (isOK(r2)) { r = r2; ok = true; recovered = " (retried after a 502)"; }
+          else r = r2;
+        } catch { /* keep the original failure */ }
+      }
+    }
     const oid = (r.data?.phemex?.data?.data?.orderID) || "";
     // If the relay answered with something we could not parse, say so and keep the first 200
     // chars. A bare "ERR 502" is undiagnosable after the fact — it hid a relay crash for two
     // days (2026-08-13). The cause must be in the log entry itself, not in a val's console.
     const why = r.data.error || (r.data.parseError ? r.status + " unparseable — " + String(r.data.raw || "").slice(0, 200) : r.status);
-    await pushLog({ ...t, qty: built.meta.qty, risk: built.meta.riskActual, clamped: built.meta.clamped || undefined, mode, orderID: oid, result: ok ? (r.data.dryRun ? "dry-run OK" : "PLACED") : "ERR " + why, thesis: sig.ev.join("; ") + " · plan from " + (sig.planTf || "1D") + (sig.detector ? " · " + sig.detector + " detector" + (sig.alt ? " (best of " + (sig.alt + 1) + " hits)" : "") : " · confluence") });
+    await pushLog({ ...t, qty: built.meta.qty, risk: built.meta.riskActual, clamped: built.meta.clamped || undefined, mode, orderID: oid, recovered: recovered ? recovered.trim() : undefined, result: ok ? (r.data.dryRun ? "dry-run OK" : "PLACED" + recovered) : "ERR " + why, thesis: sig.ev.join("; ") + " · plan from " + (sig.planTf || "1D") + (sig.detector ? " · " + sig.detector + " detector" + (sig.alt ? " (best of " + (sig.alt + 1) + " hits)" : "") : " · confluence") });
     // fired[] was set BEFORE the attempt, so a failed order still burned the coin for the whole
     // day — 17 signals in Aug were lost twice over: no order placed AND no retry. A server-side
     // fault is not a decision, so undo the mark and let the next sweep have another go. A 4xx IS
