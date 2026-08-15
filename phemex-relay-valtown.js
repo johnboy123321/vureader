@@ -126,17 +126,45 @@ async function handle(request) {
   // ── Open orders for a symbol (so the app can SEE a resting protective stop) ──
   // A stop placed as a conditional order does NOT appear on the position object —
   // without this the app reports "no stop" for a position that is actually protected.
+  //
+  // ── THE "12 WITHOUT STOP" BUG, fixed 2026-08-15 ──────────────────────────────────────────
+  // A protective stop lives on Phemex as a CONDITIONAL order: it sits untriggered until price
+  // reaches it. `activeList` WITHOUT `untriggered=true` does not return untriggered conditionals
+  // at all — so every genuinely protected position came back with an empty order list and the
+  // app quite correctly concluded "NO STOP ON EXCHANGE". The stops were there the whole time;
+  // this endpoint simply never asked for them. Ask for BOTH views and merge by orderID.
+  // (Diagnosed 2026-08-10, but the fixed file was never uploaded — the live val was still
+  //  importing ?v=7 of the old one. Re-upload AND bump the ?v= or nothing changes.)
   if (request.method === "GET" && seg === "/orders") {
     const sym = (url.searchParams.get("symbol") || "").toUpperCase();
     if (!sym) return json({ error: "symbol required" }, 400);
-    const r = await phemex("GET", "/g-orders/activeList", `symbol=${sym}`, null);
-    const rows = (r.data && r.data.data && (r.data.data.rows || r.data.data)) || [];
-    const orders = (Array.isArray(rows) ? rows : []).map((o) => ({
-      orderID: o.orderID, clOrdID: o.clOrdID, symbol: o.symbol, side: o.side, posSide: o.posSide,
-      ordType: o.ordType, ordStatus: o.ordStatus, orderQtyRq: o.orderQtyRq,
-      stopPxRp: o.stopPxRp, priceRp: o.priceRp, closeOnTrigger: o.closeOnTrigger, reduceOnly: o.reduceOnly,
-    }));
-    return json({ symbol: sym, orders, phemexCode: r.data && r.data.code });
+
+    const seen = new Set();
+    const orders = [];
+    let phemexCode;
+    const errors = [];
+    for (const q of [`symbol=${sym}`, `symbol=${sym}&untriggered=true`]) {
+      try {
+        const r = await phemex("GET", "/g-orders/activeList", q, null);
+        if (phemexCode === undefined) phemexCode = r.data && r.data.code;
+        const rows = (r.data && r.data.data && (r.data.data.rows || r.data.data)) || [];
+        for (const o of (Array.isArray(rows) ? rows : [])) {
+          if (!o || seen.has(o.orderID)) continue;           // the two views overlap
+          seen.add(o.orderID);
+          orders.push({
+            orderID: o.orderID, clOrdID: o.clOrdID, symbol: o.symbol, side: o.side, posSide: o.posSide,
+            ordType: o.ordType, ordStatus: o.ordStatus, orderQtyRq: o.orderQtyRq,
+            stopPxRp: o.stopPxRp, priceRp: o.priceRp, closeOnTrigger: o.closeOnTrigger, reduceOnly: o.reduceOnly,
+            untriggered: q.includes("untriggered"),
+          });
+        }
+      } catch (e) {
+        // One view failing must not blind the other — reporting "no stop" because half the
+        // query broke is exactly the failure mode this fix exists to prevent. Say so instead.
+        errors.push(String((e && e.message) || e).slice(0, 200));
+      }
+    }
+    return json({ symbol: sym, orders, phemexCode, partial: errors.length ? errors : undefined });
   }
 
   // ── Attach a protective stop to an EXISTING position ──
