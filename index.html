@@ -1363,6 +1363,51 @@ body.layout-edit #layout-bar { display:flex; flex-wrap:wrap; justify-content:cen
     </div>
     <div id="bot-status" style="font-size:11px;color:var(--dim);margin-bottom:6px;font-family:ui-monospace,monospace;"></div>
     <div id="bot-heartbeat" style="font-size:11px;color:var(--dim);margin-bottom:10px;font-family:ui-monospace,monospace;"></div>
+
+    <!-- ══ SERVER BOT CONTROL (2026-08-15) ══
+         The 24/7 agent used to be steered by editing a YAML file on GitHub and committing.
+         These controls write to the relay; the agent reads them at the top of every run. A
+         setting lands on the next run (<=15 min). KILL is different — the relay itself refuses
+         orders the moment it is set, so it does not wait for the agent to notice. -->
+    <div style="border:1px solid var(--line);border-radius:8px;padding:12px;margin-bottom:16px;">
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px;">
+        <span style="font-size:11px;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:.8px;">Server bot</span>
+        <span id="srv-state" style="font-size:11px;color:var(--dim);font-family:ui-monospace,monospace;">reading…</span>
+      </div>
+
+      <div style="display:flex;gap:6px;margin-bottom:10px;">
+        <button class="srv-mode t-input" data-mode="off"   style="flex:1;padding:6px 0;font-size:12px;cursor:pointer;" onclick="CipherExec.setServerMode('off')">OFF</button>
+        <button class="srv-mode t-input" data-mode="dry"   style="flex:1;padding:6px 0;font-size:12px;cursor:pointer;" onclick="CipherExec.setServerMode('dry')">DRY</button>
+        <button class="srv-mode t-input" data-mode="armed" style="flex:1;padding:6px 0;font-size:12px;cursor:pointer;" onclick="CipherExec.setServerMode('armed')">ARMED</button>
+      </div>
+
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:10px;">
+        <label style="font-size:11px;color:var(--dim);">Risk per trade £
+          <input id="srv-risk" type="number" min="1" max="100" step="1" class="t-input" style="width:100%;padding:5px 8px;font-size:12px;margin-top:3px;">
+        </label>
+        <label style="font-size:11px;color:var(--dim);">Max same direction
+          <input id="srv-corr" type="number" min="1" max="12" step="1" class="t-input" style="width:100%;padding:5px 8px;font-size:12px;margin-top:3px;">
+        </label>
+        <label style="font-size:11px;color:var(--dim);">Trades per day
+          <input id="srv-daycap" type="number" min="1" max="50" step="1" class="t-input" style="width:100%;padding:5px 8px;font-size:12px;margin-top:3px;">
+        </label>
+        <label style="font-size:11px;color:var(--dim);">Max size USDT
+          <input id="srv-notional" type="number" min="100" max="5000" step="100" class="t-input" style="width:100%;padding:5px 8px;font-size:12px;margin-top:3px;">
+        </label>
+      </div>
+
+      <div style="display:flex;gap:8px;align-items:center;">
+        <button class="t-input" style="padding:6px 14px;font-size:12px;cursor:pointer;" onclick="CipherExec.saveServerConfig()">Save settings</button>
+        <button id="srv-kill" class="t-input" style="padding:6px 14px;font-size:12px;cursor:pointer;" onclick="CipherExec.toggleServerKill()">Kill switch</button>
+        <span id="srv-msg" style="font-size:11px;color:var(--dim);flex:1;"></span>
+      </div>
+      <div style="font-size:10px;color:var(--dim);margin-top:8px;line-height:1.5;">
+        Settings take effect on the agent's next run. The kill switch is enforced by the relay itself and bites immediately.
+      </div>
+    </div>
+
+    <div style="font-size:11px;font-weight:700;color:var(--muted);margin-bottom:6px;">SERVER DECISIONS (24/7 AGENT)</div>
+    <div id="srv-log" style="margin-bottom:16px;"><div style="font-size:11px;color:var(--dim);">Loading…</div></div>
     <div style="display:flex;align-items:center;gap:8px;margin-bottom:10px;">
       <span style="font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.8px;">Fires at score</span>
       <select id="bot-minscore" class="t-input" style="width:auto;flex:0 0 auto;padding:4px 8px;font-size:12px;" onchange="CipherExec.setMinScore(this.value);CipherExec.renderBot();">
@@ -5153,9 +5198,18 @@ function detectMomentumRollover(c) {
       if (bear ? (d1 >= 0 && d0 < 0) : (d1 <= 0 && d0 > 0)) { xi = k; break; }
     }
     if (xi < 0) continue;
-    // it must be rolling over from the right side of zero — not a cross deep in the opposite zone
-    const zoneOK = bear ? wt2[xi] > 10 : wt2[xi] < -10;
-    if (!zoneOK) continue;
+    // Tightened 2026-08-12: |wt2| > 10 fired on almost every coin (15 candidates from 20) — it
+    // described the market rather than finding anything. A mid-range cross now has to agree with
+    // the 50 EMA trend; only a genuine extreme-zone cross may go against it.
+    const w = wt2[xi];
+    const extremeZone = bear ? w >= VMC.obLevel : w <= VMC.osLevel;
+    const midRange = bear ? w >= 25 : w <= -25;
+    if (!extremeZone && !midRange) continue;
+    if (!extremeZone) {
+      const closes = c.map(x => x.c), e50 = emaArr(closes, 50);
+      const trendAgrees = bear ? closes[i] < e50[i] : closes[i] > e50[i];
+      if (!trendAgrees) continue;                 // counter-trend mid-range fade = noise
+    }
     // VWAP wave (the early-warning wave) must agree, and be falling/rising into the cross
     const vwOK = bear ? (vw[i] < vw[Math.max(0, i - 2)] && vw[i] < 0) : (vw[i] > vw[Math.max(0, i - 2)] && vw[i] > 0);
     if (!vwOK) continue;
@@ -5903,6 +5957,9 @@ function buildTradePlan(candles, dir, entry) {
   let stop;
   if (dir === 'short') { stop = Math.max(...last10.map(k => k.h)) + 0.25 * a; if (stop - entry < 0.6 * a) stop = entry + 1.5 * a; }
   else { stop = Math.min(...last10.map(k => k.l)) - 0.25 * a; if (entry - stop < 0.6 * a) stop = entry - 1.5 * a; }
+  // Cap at 3 ATR — a structure stop wider than that turns a momentum signal into a months-long
+  // trade (ADA: 14.4% stop, 32% target). Refuse rather than stretch. Mirrors the agent.
+  if (Math.abs(entry - stop) > 3 * a) return null;
   const risk = Math.abs(entry - stop); if (!(risk > 0)) return null;
   const sgn = dir === 'short' ? -1 : 1;
   return { entry, stop, risk, targets: [1, 2.25, 4].map(m => ({ px: entry + sgn * risk * m, rr: m })) };
@@ -8623,6 +8680,7 @@ document.addEventListener('click', function(e){
   function renderBot(){
     const logEl=document.getElementById('bot-log'), stEl=document.getElementById('bot-status'), posEl=document.getElementById('bot-positions');
     if(!logEl) return;
+    refreshServerPanel();          // the server bot's controls and its decision log, side by side
     gradeBrain();
     try{ const ms=document.getElementById('bot-minscore'); if(ms) ms.value=String(num(LS.min,8)); }catch(e){}
     // ── Shadow brain scoreboard: its record vs the numeric path, on the same trades ──
@@ -8814,7 +8872,143 @@ document.addEventListener('click', function(e){
   document.addEventListener('visibilitychange',()=>{ if(!document.hidden) sweepPositions(); });
   window.toggleBot=function(){ const p=document.getElementById('bot-panel'); if(!p) return; p.classList.toggle('show'); if(p.classList.contains('show')) renderBot(); };
   window.closeBot=function(e){ if(e.target===document.getElementById('bot-panel')) window.toggleBot(); };
-  window.CipherExec={ onTrade, panic, status, renderPill, renderBot, buildOrder, testFire, logDecision:pushLog, shadowVerdict, gradeBrain, brainScore, getBrainLog:brainLog, gateLive, setBrainGate:g=>set('mc_brain_gate',g), symOK, rejudgeOpen, symbols:()=>String(get('mc_exec_symbols','BTC,ETH,SOL')).split(',').map(s=>s.trim().toUpperCase()), setUrl:u=>set(LS.url,u), setToken:t=>set(LS.token,t), setMode:m=>{set(LS.mode,m);renderPill();}, setMinScore:s=>set(LS.min,String(s)), setRisk:r=>set(LS.risk,String(r)), getLog:()=>{ try{ return JSON.parse(get(LS.log,'[]')); }catch{ return []; } } };
+  // ═══════════ SERVER BOT CONTROL (2026-08-15) ═══════════
+  // The 24/7 agent on GitHub Actions used to read every setting from its workflow file, so
+  // changing the risk or stopping it meant editing YAML and committing. Settings now live on the
+  // relay: this panel POSTs them, the agent GETs them at the top of each run.
+  //
+  // The browser holds the relay token only — never a GitHub token. A page cannot keep a secret,
+  // and a leaked GitHub token would be write access to the trading code itself.
+  const SRV_STATE_URL = 'https://raw.githubusercontent.com/johnboy123321/vureader/main/agent-state.json';
+  let SRV_CFG = null;
+
+  async function srvFetch(pathname, body){
+    const url = get(LS.url,'').replace(/\/+$/,''); const token = get(LS.token,'');
+    if(!url) throw new Error('relay URL not set');
+    const res = await fetch(url + pathname, {
+      method: body ? 'POST' : 'GET',
+      headers: { 'Content-Type':'application/json', 'Authorization':'Bearer ' + token },
+      body: body ? JSON.stringify(body) : undefined,
+    });
+    const raw = await res.text();                       // once, then parse. Never re-read a body.
+    let data; try{ data = raw ? JSON.parse(raw) : {}; }catch{ data = { raw: raw.slice(0,300), parseError:true }; }
+    return { status: res.status, data };
+  }
+
+  function srvMsg(text, bad){
+    const el = document.getElementById('srv-msg'); if(!el) return;
+    el.textContent = text || '';
+    el.style.color = bad ? '#e88' : 'var(--dim)';
+  }
+
+  // Render from what the relay ACTUALLY holds, never from what we just asked for. If a save is
+  // rejected the panel must show the old value, not the value the user typed — a control panel
+  // that lies about the bot's state is worse than no panel.
+  function paintServerConfig(c){
+    SRV_CFG = c || null;
+    const st = document.getElementById('srv-state');
+    if(!c){ if(st){ st.textContent = 'relay unreachable'; st.style.color = '#e88'; } return; }
+    const mode = String(c.mode||'dry').toLowerCase();
+    if(st){
+      st.style.color = c.kill ? '#e88' : (mode==='armed' ? '#9c9' : 'var(--dim)');
+      st.textContent = c.kill ? 'KILL ON — no orders' : mode.toUpperCase();
+    }
+    document.querySelectorAll('.srv-mode').forEach(b => {
+      const on = b.getAttribute('data-mode') === mode;
+      b.style.borderColor = on ? 'var(--fg)' : 'var(--line)';
+      b.style.color = on ? 'var(--fg)' : 'var(--dim)';
+      b.style.fontWeight = on ? '700' : '400';
+    });
+    const kb = document.getElementById('srv-kill');
+    if(kb){ kb.textContent = c.kill ? 'Kill switch: ON' : 'Kill switch'; kb.style.color = c.kill ? '#e88' : 'var(--dim)'; kb.style.borderColor = c.kill ? '#e88' : 'var(--line)'; }
+    const put = (id,v) => { const el = document.getElementById(id); if(el && document.activeElement !== el) el.value = (v==null?'':v); };
+    put('srv-risk', c.riskGbp); put('srv-corr', c.corrMax); put('srv-daycap', c.dayCap); put('srv-notional', c.maxNotional);
+  }
+
+  async function loadServerConfig(){
+    try{
+      const r = await srvFetch('/config');
+      if(r.status !== 200 || !r.data || !r.data.config){ paintServerConfig(null); srvMsg('could not read settings (' + r.status + ')', true); return; }
+      paintServerConfig(r.data.config); srvMsg('');
+    }catch(e){ paintServerConfig(null); srvMsg(String(e && e.message || e), true); }
+  }
+
+  async function pushServerConfig(patch, label){
+    srvMsg('saving…');
+    try{
+      const r = await srvFetch('/config', patch);
+      if(r.status !== 200 || !r.data || !r.data.config){
+        const why = (r.data && r.data.error) || ('save failed (' + r.status + ')');
+        await loadServerConfig();                       // show what is really set, not what failed
+        srvMsg(why, true);                              // AFTER the reload — it clears the message,
+        return false;                                   // and a value snapping back with no reason
+      }                                                 // is the most confusing thing a panel can do
+      paintServerConfig(r.data.config);
+      srvMsg((label || 'saved') + ' · takes effect next run');
+      return true;
+    }catch(e){ srvMsg(String(e && e.message || e), true); return false; }
+  }
+
+  // Arming is a deliberate act, so it asks. Turning it off or killing it never asks — you should
+  // never have to get past a dialogue to stop a bot.
+  async function setServerMode(mode){
+    if(mode === 'armed' && !confirm('Arm the server bot?\n\nIt will place real orders on Phemex testnet on its own, every run, without asking again.')) return;
+    await pushServerConfig({ mode }, 'mode ' + mode);
+  }
+  async function toggleServerKill(){
+    const on = !(SRV_CFG && SRV_CFG.kill);
+    if(on && !confirm('Turn the kill switch ON?\n\nThe relay will refuse every order immediately. Open positions are NOT closed — do that on the exchange.')) return;
+    await pushServerConfig({ kill: on }, on ? 'kill ON' : 'kill off');
+  }
+  async function saveServerConfig(){
+    const n = id => { const el = document.getElementById(id); const v = el && el.value !== '' ? Number(el.value) : undefined; return Number.isFinite(v) ? v : undefined; };
+    const patch = { riskGbp:n('srv-risk'), corrMax:n('srv-corr'), dayCap:n('srv-daycap'), maxNotional:n('srv-notional') };
+    Object.keys(patch).forEach(k => patch[k] === undefined && delete patch[k]);
+    if(!Object.keys(patch).length){ srvMsg('nothing to save'); return; }
+    await pushServerConfig(patch, 'settings saved');
+  }
+
+  // ── What the server bot has actually been doing ──
+  // The agent commits its state file to the repo each run, and the repo is public, so this is a
+  // plain read with no auth. Cache-busted because raw.githubusercontent caches hard.
+  async function loadServerLog(){
+    const el = document.getElementById('srv-log'); if(!el) return;
+    try{
+      const res = await fetch(SRV_STATE_URL + '?t=' + Date.now(), { cache:'no-store' });
+      if(!res.ok){ el.innerHTML = '<div style="font-size:11px;color:var(--dim);">could not read the server log (' + res.status + ')</div>'; return; }
+      const st = JSON.parse(await res.text());
+      const hb = st.cipher_heartbeat, log = Array.isArray(st.cipher_log) ? st.cipher_log : [];
+      let h = '';
+      if(hb){
+        const age = Math.round((Date.now() - new Date(hb.at).getTime())/60000);
+        h += '<div style="font-size:11px;color:var(--dim);font-family:ui-monospace,monospace;margin-bottom:8px;">last run ' + (age<1?'just now':age + ' min ago') +
+             ' · scanned ' + esc(hb.scanned) + ' · ' + esc(hb.candidates) + ' candidates · ' + esc(hb.placed) + ' placed · ' + esc(hb.mode||'') +
+             (hb.via ? ' · via ' + esc(hb.via) : '') + '</div>';
+      }
+      if(!log.length){ el.innerHTML = h + '<div style="font-size:11px;color:var(--dim);">no decisions logged yet</div>'; return; }
+      h += log.slice(0,25).map(e => {
+        const when = new Date(e.at).toLocaleString(undefined,{month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'});
+        const took = e.result && String(e.result).startsWith('PLACED');
+        const err  = e.result && String(e.result).startsWith('ERR');
+        const col  = took ? '#8bd' : err ? '#e88' : '#999';
+        const what = e.skipped ? 'PASSED' : (err ? 'REJECTED' : String(e.result||'').split(' ')[0] || '—');
+        let line = '<div style="border-bottom:1px solid var(--line);padding:7px 0;font-size:12px;">' +
+          '<div style="display:flex;justify-content:space-between;gap:8px;">' +
+            '<span><span style="color:' + col + ';font-weight:700;">' + esc(what) + '</span> ' + esc(e.coin||'') + ' ' + esc(String(e.dir||'').toUpperCase()) + '</span>' +
+            '<span style="color:var(--dim);font-size:11px;white-space:nowrap;">' + esc(when) + '</span>' +
+          '</div>';
+        const why = e.skipped || (err ? e.result : '') || e.thesis || '';
+        if(why) line += '<div style="color:var(--dim);font-size:11px;margin-top:2px;line-height:1.45;">' + esc(String(why).slice(0,220)) + '</div>';
+        if(e.diag && (e.diag.ms || e.diag.status)) line += '<div style="color:var(--dim);font-size:10px;margin-top:2px;font-family:ui-monospace,monospace;">' + esc((e.diag.status||'') + ' after ' + (e.diag.ms||'?') + 'ms' + (e.diag.cfRay?' · cf '+e.diag.cfRay:'')) + '</div>';
+        return line + '</div>';
+      }).join('');
+      el.innerHTML = h;
+    }catch(e){ el.innerHTML = '<div style="font-size:11px;color:var(--dim);">server log unavailable: ' + esc(String(e && e.message || e)) + '</div>'; }
+  }
+
+  function refreshServerPanel(){ loadServerConfig(); loadServerLog(); }
+
+  window.CipherExec={ setServerMode, toggleServerKill, saveServerConfig, refreshServerPanel, loadServerConfig, loadServerLog, onTrade, panic, status, renderPill, renderBot, buildOrder, testFire, logDecision:pushLog, shadowVerdict, gradeBrain, brainScore, getBrainLog:brainLog, gateLive, setBrainGate:g=>set('mc_brain_gate',g), symOK, rejudgeOpen, symbols:()=>String(get('mc_exec_symbols','BTC,ETH,SOL')).split(',').map(s=>s.trim().toUpperCase()), setUrl:u=>set(LS.url,u), setToken:t=>set(LS.token,t), setMode:m=>{set(LS.mode,m);renderPill();}, setMinScore:s=>set(LS.min,String(s)), setRisk:r=>set(LS.risk,String(r)), getLog:()=>{ try{ return JSON.parse(get(LS.log,'[]')); }catch{ return []; } } };
   if(document.readyState==='loading') document.addEventListener('DOMContentLoaded',renderPill); else renderPill();
 })();
 </script>

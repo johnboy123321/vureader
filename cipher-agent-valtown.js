@@ -832,11 +832,70 @@ async function pushLog(entry) {
   await setJSON(KEY.log, log.slice(0, 300));
 }
 
+// ── LIVE CONFIG from the relay (the app's control panel) ──────────────────────────────────────
+// Settings used to live only in the GitHub workflow, so changing the risk or stopping the bot
+// meant editing YAML and committing. Now the app writes them to the relay and we read them here.
+//
+// The rule that keeps this safe: a FAILED read changes nothing. We fall back to the workflow env,
+// which is the behaviour that existed before this feature. Silence is not an instruction — an
+// unreachable relay must not be able to arm the bot, and must not be able to disarm it either
+// (that is what KILL is for, and KILL is enforced on the relay's own order path).
+let LIVE = null;
+async function loadLiveConfig() {
+  const url = CFG.relayUrl(); if (!url) return null;
+  try {
+    const ac = new AbortController();
+    const timer = setTimeout(() => ac.abort(), 8000);
+    let res;
+    try {
+      res = await fetch(url + "/config", { headers: { Authorization: "Bearer " + CFG.relayToken() }, signal: ac.signal });
+    } finally { clearTimeout(timer); }
+    if (res.status !== 200) { console.log(`live config: HTTP ${res.status} — using workflow settings`); return null; }
+    const j = JSON.parse(await res.text());
+    const c = j && j.config;
+    if (!c || typeof c !== "object") return null;
+    return c;
+  } catch (e) { console.log("live config: unreachable (" + String(e && e.message || e).slice(0, 80) + ") — using workflow settings"); return null; }
+}
+// Applied through the same CFG accessors everything else already uses, so there is exactly one
+// place each setting is read from and no chance of half the code seeing the panel's value and
+// half seeing the workflow's.
+function applyLiveConfig(c) {
+  if (!c) return [];
+  const applied = [];
+  // Bounds are re-checked HERE as well as in the relay. The agent does not trust the relay to
+  // have validated — `+null` is 0, and a CORR_MAX of 0 would quietly block every trade while
+  // looking like a setting rather than a bug. Absent, null, empty and out-of-range all mean
+  // "leave the workflow value alone".
+  const setNum = (key, raw, lo, hi) => {
+    if (raw === undefined || raw === null || raw === "") return;
+    const v = Number(raw);
+    if (!Number.isFinite(v) || v < lo || v > hi) { console.log(`live config: ignoring ${key}=${raw} (out of range ${lo}–${hi})`); return; }
+    CFG[key] = () => v; applied.push(`${key}=${v}`);
+  };
+  if (["off", "dry", "armed"].includes(String(c.mode).toLowerCase())) {
+    const m = String(c.mode).toLowerCase(); CFG.mode = () => m; applied.push("mode=" + m);
+  } else if (c.mode !== undefined && c.mode !== null) {
+    console.log(`live config: ignoring mode=${c.mode}`);
+  }
+  setNum("risk", c.riskGbp, 1, 100);
+  setNum("corrMax", c.corrMax, 1, 12);
+  setNum("dayCap", c.dayCap, 1, 50);
+  setNum("maxNotional", c.maxNotional, 100, 5000);
+  // KILL from the panel stops the agent placing at all. The relay enforces it independently on
+  // the order path, so this is the polite half of the switch, not the whole of it.
+  if (c.kill === true) { CFG.mode = () => "off"; applied.push("KILL=on"); }
+  return applied;
+}
+
 // ═══════════════════════ THE LOOP ═══════════════════════
 export default async function cipherAgent() {
   const started = Date.now();
+  LIVE = await loadLiveConfig();
+  const applied = applyLiveConfig(LIVE);
+  if (applied.length) console.log("live config from the app: " + applied.join(", "));
   const mode = CFG.mode();
-  if (mode === "off") { console.log("MODE=off — agent idle"); return; }
+  if (mode === "off") { console.log(`MODE=off — agent idle${LIVE && LIVE.kill ? " (KILL is ON from the app)" : ""}`); return; }
 
   // Rotate through the universe a batch at a time so every run finishes well inside 60s.
   let uni = await topUniverse(CFG.universe());

@@ -84,6 +84,55 @@ async function phemex(method, path, query, bodyObj) {
   return { httpStatus: res.status, data };
 }
 
+// ═══════════════════ LIVE CONFIG — the app's control panel talks to this ═══════════════════
+// The agent used to read every setting from the GitHub workflow file, so changing the risk or
+// stopping the bot meant editing YAML and committing. That is scaffolding, not a control panel.
+// Settings now live here: the app POSTs them, the agent GETs them at the top of every run.
+//
+// Why here and not in the repo: the app already holds this relay's token, and it must NEVER hold
+// a GitHub token — a browser cannot keep a secret. This endpoint reuses the auth that exists.
+//
+// Two properties that matter:
+//  · The agent falls back to its workflow env if this read fails, so a flaky moment can neither
+//    arm nor disarm anything by accident. Absence of config is not a command.
+//  · KILL is enforced HERE, on the order path, not only in the agent. A kill switch that depends
+//    on the thing it is killing having read it is not a kill switch.
+const CONFIG_KEY = "cipher_bot_config";
+let _blob = null;
+async function blobStore() {
+  if (!_blob) ({ blob: _blob } = await import("https://esm.town/v/std/blob"));
+  return _blob;
+}
+const CONFIG_DEFAULTS = { mode: "dry", riskGbp: 10, corrMax: 6, dayCap: 25, maxNotional: 2000, kill: false };
+async function readConfig() {
+  try {
+    const v = await (await blobStore()).getJSON(CONFIG_KEY);
+    return v && typeof v === "object" ? { ...CONFIG_DEFAULTS, ...v } : { ...CONFIG_DEFAULTS };
+  } catch { return { ...CONFIG_DEFAULTS }; }
+}
+// Every field is bounds-checked. The panel is a convenience, not a licence to set risk to 10000 —
+// a fat finger in a text box should not be able to do something the code would refuse elsewhere.
+function validateConfig(patch) {
+  const out = {}, errs = [];
+  const num = (k, lo, hi) => {
+    if (patch[k] === undefined) return;
+    const v = Number(patch[k]);
+    if (!Number.isFinite(v) || v < lo || v > hi) errs.push(`${k} must be between ${lo} and ${hi}`);
+    else out[k] = v;
+  };
+  if (patch.mode !== undefined) {
+    const m = String(patch.mode).toLowerCase();
+    if (!["off", "dry", "armed"].includes(m)) errs.push("mode must be off, dry or armed");
+    else out.mode = m;
+  }
+  if (patch.kill !== undefined) out.kill = !!patch.kill;
+  num("riskGbp", 1, 100);
+  num("corrMax", 1, 12);
+  num("dayCap", 1, 50);
+  num("maxNotional", 100, 5000);
+  return { out, errs };
+}
+
 async function handle(request) {
   if (request.method === "OPTIONS") return new Response(null, { headers: CORS });
 
@@ -92,7 +141,10 @@ async function handle(request) {
 
   const url = new URL(request.url);
   const path = url.pathname.replace(/\/+$/, "");
-  const KILL = String(cfg("KILL") || "0") === "1";
+  const live = await readConfig();
+  // Either brake stops an order: the env var (set on the val) or the live config (set from the
+  // app). Neither can be overridden by the other — both have to be clear.
+  const KILL = String(cfg("KILL") || "0") === "1" || live.kill === true;
   const DRY  = String(cfg("DRY_RUN") || "0") === "1";
 
   // Val Town serves vals under a path; match on the trailing segment.
@@ -102,10 +154,28 @@ async function handle(request) {
   if (request.method === "GET" && (seg === "/" || seg === "/status" || path === "")) {
     return json({
       ok: true, base: BASE, live: BASE.indexOf("testnet") === -1,
-      kill: KILL, dryRun: DRY,
+      kill: KILL, dryRun: DRY, killSource: live.kill ? "app" : (String(cfg("KILL") || "0") === "1" ? "env" : null),
       maxNotional: Number(cfg("MAX_NOTIONAL_USDT")),
       whitelist: String(cfg("WHITELIST")).split(",").map((s) => s.trim()),
+      config: live,
     });
+  }
+
+  // ── The control panel: read what the bot is set to ──
+  if (request.method === "GET" && seg === "/config") return json({ config: live });
+
+  // ── The control panel: change what the bot is set to ──
+  // Returns the FULL config it saved, so the panel renders what actually took effect rather than
+  // what it hoped for. Rejected fields come back named, so a bad value is visible, not swallowed.
+  if (request.method === "POST" && seg === "/config") {
+    let patch = {}; try { patch = await request.json(); } catch { return json({ error: "bad json" }, 400); }
+    const { out, errs } = validateConfig(patch);
+    if (errs.length) return json({ error: errs.join("; ") }, 400);
+    if (!Object.keys(out).length) return json({ error: "nothing to change" }, 400);
+    const next = { ...live, ...out, updatedAt: new Date().toISOString(), updatedBy: "app" };
+    try { await (await blobStore()).setJSON(CONFIG_KEY, next); }
+    catch (e) { return json({ error: "could not save config: " + String(e && e.message || e).slice(0, 200) }, 500); }
+    return json({ config: next, changed: Object.keys(out) });
   }
 
   // ── Read open positions (read-only) ──
@@ -248,7 +318,10 @@ async function handle(request) {
     }
 
     const notional = qty * refPx;
-    const maxNotional = Number(cfg("MAX_NOTIONAL_USDT"));
+    // The panel's cap binds if it is TIGHTER than the val's. A control panel may reduce risk
+    // freely; raising the hard limit set on the val itself stays a deliberate act on the val.
+    const envCap = Number(cfg("MAX_NOTIONAL_USDT"));
+    const maxNotional = Math.min(envCap, Number(live.maxNotional) || envCap);
     if (notional > maxNotional)
       return json({ error: `notional ${notional.toFixed(2)} USDT exceeds cap ${maxNotional}` }, 403);
 
