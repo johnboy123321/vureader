@@ -8528,9 +8528,34 @@ document.addEventListener('click', function(e){
   // 'mc_brain_gate'='off' is the manual override to force numeric-only (console: CipherExec.setBrainGate('off')).
   function gateLive(){ if(get('mc_brain_gate','auto')==='off') return false; const s=brainScore(); return s.graded>=BRAIN_PROMOTE_N && s.brain>s.bot; }
   function raceVerdict(t,ms){ return Promise.race([shadowVerdict(t), new Promise(r=>setTimeout(()=>r(null),ms||25000))]).catch(()=>null); }
+  // ── INTERLOCK: never two bots on the same signal (2026-08-15) ────────────────────────────────
+  // The server bot and this one would both act on the same setup and double the position — and
+  // they no longer build identical plans (the server has structure stops and the corrected
+  // sizing), so the pair would also blend two strategies into one graded record.
+  //
+  // Fails CLOSED on purpose: if the server's mode cannot be read, this bot does NOT fire. Not
+  // knowing whether something else is trading is not a reason to trade.
+  let SRV_SEEN = { at:0, armed:null };
+  async function serverIsArmed(){
+    if(Date.now() - SRV_SEEN.at < 60000) return SRV_SEEN.armed;      // 60s is plenty; signals are slower
+    try{
+      const r = await srvFetch('/config');
+      const c = r.status===200 && r.data && r.data.config;
+      SRV_SEEN = { at:Date.now(), armed: c ? (String(c.mode).toLowerCase()==='armed' && !c.kill) : null };
+    }catch{ SRV_SEEN = { at:Date.now(), armed:null }; }
+    return SRV_SEEN.armed;
+  }
   async function onTrade(t){
     try{
       const mode=get(LS.mode,'off'); if(mode==='off') return;
+      const srv = await serverIsArmed();
+      if(srv !== false){
+        pushLog({ coin:t&&t.coin, dir:t&&t.dir, skipped: srv === true
+          ? 'INTERLOCK — the server bot is armed and owns this signal; app exec stood down to avoid a double position'
+          : 'INTERLOCK — could not read the server bot\'s mode, so not firing blind' });
+        renderPill();
+        return;
+      }
       if(!t||!t.coin) return; const score=Number(t.score||0);
       const plan={ entry:t.entry, sl:t.sl, tp1:t.tp1, tp2:t.tp2, tp3:t.tp3, thesis:t.thesis||'', source:t.source||'' };
       const vetOK=(t.source==='auto-scan'&&t.vetGrade&&t.vetGrade!=='negative'); // demo phase: only a negative vet disqualifies
@@ -8936,7 +8961,7 @@ document.addEventListener('click', function(e){
     const mode = String(c.mode||'dry').toLowerCase();
     if(st){
       st.style.color = c.kill ? '#e88' : (mode==='armed' ? '#9c9' : 'var(--dim)');
-      st.textContent = c.kill ? 'KILL ON — no orders' : mode.toUpperCase();
+      st.textContent = (c.kill ? 'STOPPED — no orders' : mode.toUpperCase()) + (mode==='armed' && !c.kill ? ' · app exec stood down' : '');
     }
     document.querySelectorAll('.srv-mode').forEach(b => {
       const on = b.getAttribute('data-mode') === mode;
