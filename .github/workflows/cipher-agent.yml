@@ -1,31 +1,65 @@
+# ═══════════════════════════════════════════════════════════════════════════════
+#  CIPHER AGENT — the 24/7 bot, running on GitHub's machines
+#
+#  Upload this file to your repo at:  .github/workflows/cipher-agent.yml
+#  (the folders matter — GitHub only looks in .github/workflows/)
+#
+#  It runs cipher-agent-valtown.js every 15 minutes, then commits the updated
+#  agent-state.json back so the next run remembers the rotation cursor, what it
+#  has already fired today, and the decision log.
+#
+#  SECRETS — set these in the repo: Settings → Secrets and variables → Actions
+#    RELAY_URL      your Phemex relay val URL
+#    RELAY_TOKEN    the same exec token the app uses
+#    PHEMEX_KEY     testnet API key   ← only needed for EXEC_DIRECT
+#    PHEMEX_SECRET  testnet API secret ← only needed for EXEC_DIRECT
+#  Secrets are encrypted and are NOT visible to anyone browsing the repo.
+#
+#  EXEC_DIRECT=1 makes the agent sign its own orders and talk to Phemex directly,
+#  cutting out the Val Town relay — the hop that was answering ~83% of order POSTs
+#  with a Cloudflare HTML 502. The relay stays exactly as it is for the browser app.
+#  Set it to 0 to go back to the old route; with no key/secret set it falls back
+#  to the relay on its own.
+#
+#  SETTINGS below (env:) are safe to edit in the open — no secrets there.
+# ═══════════════════════════════════════════════════════════════════════════════
+
 name: Cipher Agent
 
 on:
   schedule:
+    # Every 15 minutes. GitHub runs these on a best-effort basis, so expect the
+    # occasional late run under load — harmless for 4H/Daily setups.
     - cron: "*/15 * * * *"
-  workflow_dispatch: {}
+  workflow_dispatch: {}      # gives you a "Run workflow" button for testing
 
+# Stop two runs from overlapping and both firing the same signal.
 concurrency:
   group: cipher-agent
   cancel-in-progress: false
 
 permissions:
-  contents: write
+  contents: write            # needed to commit the state file back
 
 jobs:
   scan:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     env:
-      MODE: armed
+      MODE: dry              # ← dry = logs what it would do. Change to: armed
       RISK_GBP: "10"
       MIN_SCORE: "6"
       DAY_CAP: "25"
       CORR_MAX: "6"
-      BATCH: "20"
+      BATCH: "20"            # coins per run; the cursor rotates through the top 100
       UNIVERSE: "100"
+      MAX_ATTEMPTS: "3"      # failed sends per coin+direction per day, then it rests
+      EXEC_DIRECT: "1"       # 1 = sign here and call Phemex direct · 0 = go via the relay
+      MAX_NOTIONAL_USDT: "2000"   # the relay's cap, re-enforced here now the relay is bypassed
       RELAY_URL: ${{ secrets.RELAY_URL }}
       RELAY_TOKEN: ${{ secrets.RELAY_TOKEN }}
+      PHEMEX_KEY: ${{ secrets.PHEMEX_KEY }}
+      PHEMEX_SECRET: ${{ secrets.PHEMEX_SECRET }}
 
     steps:
       - uses: actions/checkout@v4
@@ -33,6 +67,19 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "20"
+
+      # Binance geo-blocks GitHub's US runners, which cost us a day of confusion in August.
+      # Check the same question about Phemex BEFORE the run rather than reading it backwards
+      # out of a log of failures. Public endpoint, no key, never fails the build.
+      - name: Phemex reachability preflight
+        run: |
+          code=$(curl -s -o /tmp/phemex.json -w '%{http_code}' --max-time 15 \
+            "https://testnet-api.phemex.com/md/v2/orderbook?symbol=BTCUSDT" || echo 000)
+          echo "phemex testnet public md → HTTP $code"
+          head -c 300 /tmp/phemex.json || true; echo
+          if [ "$code" != "200" ]; then
+            echo "::warning::Phemex testnet unreachable from this runner (HTTP $code) — direct exec will fail here; set EXEC_DIRECT=0 to fall back to the relay"
+          fi
 
       - name: Run the agent
         run: node cipher-agent-valtown.js
@@ -44,6 +91,7 @@ jobs:
             git config user.email "cipher-agent@users.noreply.github.com"
             git add agent-state.json
             git commit -m "agent state $(date -u '+%Y-%m-%d %H:%M UTC')"
+            # Another run may have pushed while we worked — rebase rather than fail.
             git pull --rebase --autostash origin "${GITHUB_REF_NAME}" || true
             git push
           else
