@@ -731,13 +731,17 @@ function findPositions(o, depth = 0) {
   return null;
 }
 
+// null = "I could not read the book". [] = "the book is genuinely empty". Never conflate them:
+// a non-200, or a 200 whose body contains no positions array at all, is a FAILED read, and the
+// caller must be able to tell. Returning [] on a 502 is what let opposing legs stack up.
 async function execPositions() {
-  if (CFG.direct()) {
-    const r = await phemexCall("GET", "/g-accounts/accountPositions", "currency=USDT", null);
-    return findPositions(r.data) || [];
-  }
-  const r = await relay("/positions");
-  return findPositions(r.data) || [];
+  const r = CFG.direct()
+    ? await phemexCall("GET", "/g-accounts/accountPositions", "currency=USDT", null)
+    : await relay("/positions");
+  if (r.status !== 200) { console.error("positions read: HTTP " + r.status); return null; }
+  const pos = findPositions(r.data);
+  if (!Array.isArray(pos)) { console.error("positions read: no positions array in the response"); return null; }
+  return pos;
 }
 
 async function execOrdersFor(symbol) {
@@ -786,9 +790,14 @@ async function relayWhitelist() {
   } catch { return null; }                                    // unreachable → don't block the run
 }
 
+// Returns null — NOT [] — when the read fails. "I could not see the book" and "the book is empty"
+// are completely different facts, and collapsing them into [] is what let the bot open a second,
+// opposing leg on five different coins. A caller that cannot tell them apart cannot be safe.
 async function openPositions() {
-  try { return (await execPositions()).filter(p => Number(p.size) > 0); }
-  catch (e) { console.error("positions read failed:", e && e.message); return []; }
+  try {
+    const pos = await execPositions();
+    return Array.isArray(pos) ? pos.filter(p => Number(p.size) > 0) : null;
+  } catch (e) { console.error("positions read failed:", e && e.message); return null; }
 }
 
 // ── Did that order actually land? ─────────────────────────────────────────────────────────────
@@ -861,8 +870,45 @@ export default async function cipherAgent() {
   let attempts = await getJSON("cipher_attempts", {});
   for (const k of Object.keys(attempts)) if (!k.endsWith(day)) delete attempts[k];
 
-  const positions = await openPositions();
+  // A failed position read is not an empty book. If we cannot see what we are holding we cannot
+  // honour the no-hedge rule, the correlation guard or "already holding" — so we scan and log,
+  // but place nothing. Missing a setup costs one setup; placing blind cost ten tangled positions.
+  const positionsRead = await openPositions();
+  const canSeeBook = positionsRead !== null;
+  const positions = positionsRead || [];
+  if (!canSeeBook) console.log("WARNING: could not read open positions — scanning only, no orders will be placed this run");
   const held = new Set(positions.map(p => String(p.symbol || "").replace(/USDT$/, "").toUpperCase()));
+
+  // ── NO OPPOSING LEG ON THE SAME COIN (2026-08-15) ────────────────────────────────────────────
+  // Found LINK, XRP, ETH, UNI and BTC each holding a long AND a short at once. The bot never chose
+  // to hedge — openPositions() was silently returning [] (see findPositions), so "already holding
+  // this coin" was checking an empty list and always said no. That accessor is fixed, but a bug
+  // being fixed is a weaker promise than code that refuses, so this is the explicit rule:
+  //
+  //   the bot has no hedging thesis, so it may never hold both sides of one coin.
+  //
+  // A real hedge needs a reason, a level and a stop on BOTH legs. This engine produces
+  // one-directional setups; two opposing legs is not a position, it is two positions paying
+  // funding against each other. Refuse, and say why in the log so it is visible rather than quiet.
+  const heldDir = new Map();                      // COIN → Set("long"|"short")
+  for (const p of positions) {
+    const coin = String(p.symbol || "").replace(/USDT$/, "").toUpperCase();
+    // Phemex reports posSide Long/Short in hedge mode; fall back to side, then to a signed size.
+    let d = String(p.posSide || p.side || "").toLowerCase();
+    if (d !== "long" && d !== "short") d = Number(p.size) < 0 ? "short" : "long";
+    if (!heldDir.has(coin)) heldDir.set(coin, new Set());
+    heldDir.get(coin).add(d);
+  }
+  const opposes = (coin, dir) => {
+    const other = dir === "long" ? "short" : "long";
+    return heldDir.has(coin) && heldDir.get(coin).has(other);
+  };
+  const noteOpened = (coin, dir) => {
+    if (!heldDir.has(coin)) heldDir.set(coin, new Set());
+    heldDir.get(coin).add(dir);
+  };
+  const dupes = [...heldDir].filter(([, s]) => s.size > 1).map(([c]) => c);
+  if (dupes.length) console.log(`WARNING: ${dupes.length} coin(s) already hold BOTH sides — ${dupes.join(", ")}. Not adding to them.`);
   // Positions are read ONCE per run, so trades opened during this run must be counted too —
   // otherwise a single pass can stack far past CORR_MAX before the next run notices. Found when
   // the ported detectors made one run place 10 orders (2026-08-11).
@@ -938,6 +984,8 @@ export default async function cipherAgent() {
     const key = `${coin}|${sig.bias}|${day}`;
     if (fired[key]) continue;
     if ((attempts[key] || 0) >= CFG.maxAttempts()) { await pushLog({ coin, dir: sig.bias, score: sig.score, skipped: `attempt cap — ${attempts[key]} failed sends today, resting until tomorrow` }); continue; }
+    if (!canSeeBook) { await pushLog({ coin, dir: sig.bias, score: sig.score, skipped: "REFUSED — cannot read open positions, so cannot check for an opposing leg" }); continue; }
+    if (opposes(coin, sig.bias)) { await pushLog({ coin, dir: sig.bias, score: sig.score, skipped: `REFUSED — would open a ${sig.bias} against an existing ${sig.bias === "long" ? "short" : "long"} on ${coin}. This bot does not hedge.` }); continue; }
     if (held.has(coin)) { await pushLog({ coin, dir: sig.bias, score: sig.score, skipped: "already holding this coin" }); continue; }
     if (sameDir(sig.bias) >= CFG.corrMax()) { await pushLog({ coin, dir: sig.bias, score: sig.score, skipped: `correlation guard — already ${sameDir(sig.bias)} ${sig.bias} positions` }); continue; }
     if (placedToday >= CFG.dayCap()) { await pushLog({ coin, dir: sig.bias, score: sig.score, skipped: `daily cap reached (${CFG.dayCap()})` }); break; }
@@ -956,6 +1004,8 @@ export default async function cipherAgent() {
     fired[key] = Date.now();
     if (mode === "dry") {
       openedThisRun.push(sig.bias);
+      noteOpened(coin, sig.bias);          // a dry run must model the same book the armed one would
+      held.add(coin);
       await pushLog({ ...t, qty: built.meta.qty, risk: built.meta.riskActual, clamped: built.meta.clamped || undefined, mode, result: "dry-run OK", thesis: sig.ev.join("; ") + " · plan from " + (sig.planTf || "1D") + (sig.detector ? " · " + sig.detector + " detector" + (sig.alt ? " (best of " + (sig.alt + 1) + " hits)" : "") : " · confluence") });
       placed++; placedToday++;
       continue;
@@ -1005,7 +1055,7 @@ export default async function cipherAgent() {
     // fault is not a decision, so undo the mark and let the next sweep have another go. A 4xx IS
     // a decision (cap breached, bad symbol) and would just repeat, so that one stays burned.
     if (!ok && r.status >= 500) delete fired[key];
-    if (ok) { placed++; placedToday++; openedThisRun.push(sig.bias); held.add(coin); }
+    if (ok) { placed++; placedToday++; openedThisRun.push(sig.bias); held.add(coin); noteOpened(coin, sig.bias); }
   }
 
   await setJSON(KEY.fired, fired);
