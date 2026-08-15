@@ -52,7 +52,18 @@ const CFG = {
   corrMax: () => num("CORR_MAX", 6),
   batch: () => num("BATCH", 20),
   universe: () => num("UNIVERSE", 100),
+  // ── Direct execution (2026-08-15). See the EXEC section below for why. ──
+  direct: () => String(env("EXEC_DIRECT", "0")) === "1" && !!env("PHEMEX_KEY", "") && !!env("PHEMEX_SECRET", ""),
+  phemexKey: () => env("PHEMEX_KEY", ""),
+  phemexSecret: () => env("PHEMEX_SECRET", ""),
+  maxNotional: () => num("MAX_NOTIONAL_USDT", 2000),
+  whitelist: () => String(env("WHITELIST", DEFAULT_WHITELIST)),
+  kill: () => String(env("KILL", "0")) === "1",
+  maxAttempts: () => num("MAX_ATTEMPTS", 3),
 };
+// The relay's own default list, duplicated here so direct mode enforces the SAME gate. If these
+// two ever need to differ, that must be a deliberate decision, not drift.
+const DEFAULT_WHITELIST = "BTCUSDT,ETHUSDT,SOLUSDT,XRPUSDT,BNBUSDT,DOGEUSDT,ADAUSDT,LINKUSDT,AVAXUSDT,DOTUSDT,LTCUSDT,BCHUSDT,UNIUSDT,ATOMUSDT,NEARUSDT,APTUSDT,ARBUSDT,OPUSDT,SUIUSDT,TONUSDT,TRXUSDT,POLUSDT,FILUSDT,INJUSDT,AAVEUSDT";
 
 // ── State: must survive between runs (the rotation cursor and the fired-set ARE the memory).
 // Val Town → its blob store. GitHub Actions → a JSON file the workflow commits back to the repo.
@@ -531,10 +542,31 @@ function buildOrder(t) {
 // ═══════════════════════ RELAY ═══════════════════════
 // A hung call must not eat the run's 45s budget and starve every coin after it.
 const RELAY_TIMEOUT_MS = 20000;
+
+// ── FAILURE FORENSICS (2026-08-15) ────────────────────────────────────────────────────────────
+// "ERR 502" tells you nothing. These four facts tell you almost everything:
+//   ms        — under ~1s means the request never reached the val (edge rejected it). A constant
+//               10–60s means the val ran and was killed. That single number separates every
+//               competing theory about this bug.
+//   cf-ray    — proves Cloudflare answered; its absence means the response came from elsewhere.
+//   server / cf-mitigated / cf-cache-status — names the edge behaviour (bot challenge, block).
+//   snippet   — Cloudflare's HTML names its OWN error number (502 vs 504 vs 524 origin-timeout
+//               vs 1015 rate-limited vs 1020 access-denied). We were throwing that away.
+function diagOf(res, ms, raw) {
+  const h = (k) => { try { return res.headers.get(k) || undefined; } catch { return undefined; } };
+  const d = { ms, status: res.status, cfRay: h("cf-ray"), server: h("server"),
+              mitigated: h("cf-mitigated"), cache: h("cf-cache-status"), via: h("via"),
+              valtown: h("x-valtown-request-id") || h("x-val-town-request-id") };
+  if (res.status >= 400 || (raw && raw[0] !== "{" && raw[0] !== "[")) d.snippet = String(raw || "").replace(/\s+/g, " ").slice(0, 300);
+  for (const k of Object.keys(d)) if (d[k] === undefined) delete d[k];
+  return d;
+}
+
 async function relay(path, body) {
   const url = CFG.relayUrl(); if (!url) throw new Error("RELAY_URL not set");
   const ac = new AbortController();
   const timer = setTimeout(() => ac.abort(), RELAY_TIMEOUT_MS);
+  const t0 = Date.now();
   let res;
   try {
     res = await fetch(url + path, {
@@ -543,19 +575,203 @@ async function relay(path, body) {
       body: body ? JSON.stringify(body) : undefined,
       signal: ac.signal,
     });
+  } catch (e) {
+    // Even a thrown request must carry its timing — an abort at exactly RELAY_TIMEOUT_MS is a
+    // different animal from a DNS failure at 20ms, and the log has to be able to tell them apart.
+    e.ms = Date.now() - t0;
+    e.message = String(e.message || e) + ` [after ${e.ms}ms]`;
+    throw e;
   } finally { clearTimeout(timer); }
   // Read the body ONCE as text, then try to parse. Calling res.json() and falling back to
   // res.text() in the catch throws "Body is unusable" — the failure handler itself failed, and
   // that killed every scheduled run overnight (2026-08-12). Never re-read a consumed body.
   const raw = await res.text();
+  const ms = Date.now() - t0;
   let data; try { data = raw ? JSON.parse(raw) : {}; } catch { data = { raw: raw.slice(0, 500), parseError: true }; }
-  return { status: res.status, data };
+  return { status: res.status, data, diag: diagOf(res, ms, raw) };
 }
+
+// ═══════════════════ DIRECT PHEMEX EXECUTION — no relay, no Cloudflare ═══════════════════
+// WHY (2026-08-15): ~83% of order POSTs were dying as Cloudflare HTML 502s in front of the
+// Val Town relay. The relay exists because a BROWSER cannot be trusted with an API key. This
+// agent is not a browser — it is a server-side runner that already holds secrets. So for the
+// bot's own orders the middleman is pure downside: one more hop, one more cold start, one more
+// free-tier edge that can answer with an HTML page instead of JSON.
+//
+// The relay stays exactly as it is for the app. This path is opt-in via EXEC_DIRECT=1, and if
+// the key/secret are missing the agent silently keeps using the relay — so a mis-set secret
+// degrades to yesterday's behaviour rather than to no trading at all.
+//
+// EVERY guard the relay enforced is re-implemented here. That is the price of removing it: the
+// relay was not just a signer, it was the safety net, and dropping the net without replacing it
+// would be the worst possible trade.
+const PHEMEX_BASE = "https://testnet-api.phemex.com";   // HARD LOCK. Going live = editing this line.
+const PHEMEX_TIMEOUT_MS = 15000;
+
+async function hmacHex(secret, msg) {
+  const enc = new TextEncoder();
+  const key = await globalThis.crypto.subtle.importKey("raw", enc.encode(secret), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+  const sig = await globalThis.crypto.subtle.sign("HMAC", key, enc.encode(msg));
+  return [...new Uint8Array(sig)].map(b => b.toString(16).padStart(2, "0")).join("");
+}
+
+// Byte-identical signing to phemex-relay-valtown.js: path + query + expiry + rawBody.
+async function phemexCall(method, path, query, bodyObj) {
+  const expiry = Math.floor(Date.now() / 1000) + 60;
+  const bodyStr = bodyObj ? JSON.stringify(bodyObj) : "";
+  const signature = await hmacHex(CFG.phemexSecret(), path + (query || "") + expiry + bodyStr);
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(), PHEMEX_TIMEOUT_MS);
+  const t0 = Date.now();
+  let res;
+  try {
+    res = await fetch(PHEMEX_BASE + path + (query ? "?" + query : ""), {
+      method,
+      headers: {
+        "Content-Type": "application/json",
+        "x-phemex-access-token": CFG.phemexKey(),
+        "x-phemex-request-expiry": String(expiry),
+        "x-phemex-request-signature": signature,
+      },
+      body: bodyStr || undefined,
+      signal: ac.signal,
+    });
+  } catch (e) {
+    e.ms = Date.now() - t0;
+    e.message = String(e.message || e) + ` [phemex, after ${e.ms}ms]`;
+    throw e;
+  } finally { clearTimeout(timer); }
+  const raw = await res.text();                    // once. never twice.
+  const ms = Date.now() - t0;
+  let data; try { data = raw ? JSON.parse(raw) : {}; } catch { data = { raw: raw.slice(0, 500), parseError: true }; }
+  return { status: res.status, data, diag: { ...diagOf(res, ms, raw), venue: "phemex" } };
+}
+
+// The relay's refusals, restated. Returns an error string, or null if the order may go.
+function directGuards(o) {
+  if (CFG.kill()) return "KILL switch is ON — no orders placed.";
+  const symbol = String(o.symbol || "").toUpperCase();
+  const wl = CFG.whitelist().split(",").map(s => s.trim().toUpperCase());
+  if (!wl.includes("*") && !wl.includes(symbol)) return `symbol ${symbol} not in whitelist`;
+  const qty = Number(o.orderQtyRq), refPx = Number(o.refPx || o.priceRp), sl = Number(o.stopLossRp);
+  if (!(qty > 0)) return "orderQtyRq must be > 0";
+  if (o.side !== "Buy" && o.side !== "Sell") return "side must be Buy or Sell";
+  if (!(refPx > 0)) return "refPx required to size-check the order";
+  if (!(sl > 0)) return "refusing order with no stop loss";
+  const isLong = o.side === "Buy";
+  if (isLong && sl >= refPx) return `refusing order: LONG stop ${sl} must be BELOW entry ${refPx}`;
+  if (!isLong && sl <= refPx) return `refusing order: SHORT stop ${sl} must be ABOVE entry ${refPx}`;
+  const slDist = Math.abs(refPx - sl) / refPx;
+  if (slDist < 0.003) return `refusing order: stop is ${(slDist * 100).toFixed(2)}% from entry — too tight (min 0.3%)`;
+  if (o.takeProfitRp != null) {
+    const tp = Number(o.takeProfitRp);
+    if (!(tp > 0) || (isLong && tp <= refPx) || (!isLong && tp >= refPx)) return `refusing order: target ${tp} is on the wrong side of entry ${refPx}`;
+  }
+  const notional = qty * refPx, cap = CFG.maxNotional();
+  if (notional > cap) return `notional ${notional.toFixed(2)} USDT exceeds cap ${cap}`;
+  return null;
+}
+
+// Answers in the SAME shape as relay() so the loop above does not care which path ran.
+//   200 = placed · 4xx = a decision (will repeat, stays burned) · 5xx = a fault (worth retrying)
+async function directOrder(o) {
+  const bad = directGuards(o);
+  if (bad) return { status: 400, data: { error: bad }, diag: { venue: "direct", refused: true } };
+
+  const refPx = Number(o.refPx || o.priceRp);
+  const dp = (String(refPx).split(".")[1] || "").length || 2;
+  const px = (v) => String(Number(Number(v).toFixed(dp)));
+  const order = {
+    clOrdID: String(o.clOrdID || "cipher-" + Date.now()).slice(0, 40),
+    symbol: String(o.symbol).toUpperCase(), side: o.side, posSide: o.posSide || "Merged",
+    ordType: o.ordType || "Market", orderQtyRq: String(o.orderQtyRq),
+    timeInForce: o.timeInForce || "ImmediateOrCancel",
+    stopLossRp: px(o.stopLossRp), slTrigger: o.slTrigger || "ByMarkPrice",
+    reduceOnly: false, text: "cipher-auto",
+  };
+  if (order.ordType === "Limit") order.priceRp = px(o.priceRp);
+  if (o.takeProfitRp != null) { order.takeProfitRp = px(o.takeProfitRp); order.tpTrigger = o.tpTrigger || "ByLastPrice"; }
+
+  // Two independent brakes, because the relay's server-side DRY_RUN is no longer in the path:
+  // MODE must be armed AND DRY_RUN must not be set. Either one alone stops a real order.
+  if (CFG.mode() !== "armed" || String(env("DRY_RUN", "0")) === "1")
+    return { status: 200, data: { dryRun: true, wouldSend: order }, diag: { venue: "direct", dry: true } };
+
+  const r = await phemexCall("POST", "/g-orders", "", order);
+  const code = r.data && r.data.code;
+  if (r.status !== 200) return { status: r.status, data: { error: `phemex http ${r.status}`, sent: order, phemex: r.data }, diag: r.diag };
+  if (code !== 0 && code !== undefined) {
+    // A rejection is a DECISION, not a fault — 4xx so the coin stays burned instead of being
+    // re-sent every run. The relay returned 502 here, which is what taught the agent to retry
+    // orders the exchange had already refused on purpose.
+    return { status: 422, data: { error: `phemex ${code}: ${(r.data && r.data.msg) || "rejected"}`, sent: order, phemex: r.data }, diag: r.diag };
+  }
+  // Wrapped { httpStatus, data } exactly as the relay wrapped it, so the loop's orderID lookup
+  // (r.data.phemex.data.data.orderID) reads the same shape whichever route ran.
+  return { status: 200, data: { sent: order, phemex: { httpStatus: r.status, data: r.data } }, diag: r.diag };
+}
+
+// ── EXEC WRAPPERS: one switch, so nothing below has to know which route is live ──
+const EXEC = () => (CFG.direct() ? "direct" : "relay");
+
+async function execOrder(order) {
+  if (CFG.direct()) return await directOrder(order);
+  return await relay("/order", order);
+}
+
+// Phemex nests this two levels deep: { code, msg, data: { account, positions } }. The relay
+// wraps it again as { httpStatus, data: <that> } — so through the relay the positions live at
+// r.data.data.data.positions, and the old accessor stopped one level short and always returned
+// an empty list. That silently disabled "already holding this coin" AND the position half of
+// confirmPlaced. Found 2026-08-15. Dig for the array instead of trusting a fixed path.
+function findPositions(o, depth = 0) {
+  if (!o || typeof o !== "object" || depth > 5) return null;
+  if (Array.isArray(o.positions)) return o.positions;
+  for (const k of Object.keys(o)) { const hit = findPositions(o[k], depth + 1); if (hit) return hit; }
+  return null;
+}
+
+async function execPositions() {
+  if (CFG.direct()) {
+    const r = await phemexCall("GET", "/g-accounts/accountPositions", "currency=USDT", null);
+    return findPositions(r.data) || [];
+  }
+  const r = await relay("/positions");
+  return findPositions(r.data) || [];
+}
+
+async function execOrdersFor(symbol) {
+  if (CFG.direct()) {
+    // activeList alone misses UNTRIGGERED conditionals — the same omission that produced the
+    // false "no stop on exchange" alarm in the relay. Ask for both and merge.
+    const out = [];
+    for (const q of [`symbol=${symbol}`, `symbol=${symbol}&untriggered=true`]) {
+      try {
+        const r = await phemexCall("GET", "/g-orders/activeList", q, null);
+        const rows = (r.data && r.data.data && (r.data.data.rows || r.data.data)) || [];
+        if (Array.isArray(rows)) out.push(...rows);
+      } catch { /* one view failing must not blind the other */ }
+    }
+    const seen = new Set();
+    return out.filter(o => o && o.orderID && !seen.has(o.orderID) && seen.add(o.orderID));
+  }
+  const r = await relay("/orders?symbol=" + encodeURIComponent(symbol));
+  return (r.data && r.data.orders) || [];
+}
+
 // Ask the relay what it will actually accept, and scan only those coins. The relay's whitelist
 // is the real gate — trading outside it just generates rejected orders and noise in the log.
 // Making it the single source of truth means the two can never disagree (2026-08-12).
 async function relayWhitelist() {
   try {
+    // Direct mode: the relay is not in the path, so it cannot be the source of truth. Our own
+    // WHITELIST/MAX_NOTIONAL_USDT are — and they default to the relay's own values.
+    if (CFG.direct()) {
+      RELAY_CAP = CFG.maxNotional();
+      const wl = CFG.whitelist().split(",").map(s => s.trim()).filter(Boolean);
+      if (!wl.length || wl.includes("*")) return null;
+      return new Set(wl.map(x => x.toUpperCase().replace(/USDT$/, "")));
+    }
     const url = CFG.relayUrl(); if (!url) return null;
     const res = await fetch(url + "/status", { headers: { Authorization: "Bearer " + CFG.relayToken() } });
     const raw = await res.text();
@@ -571,8 +787,8 @@ async function relayWhitelist() {
 }
 
 async function openPositions() {
-  try { const r = await relay("/positions"); return ((r.data && r.data.data && r.data.data.positions) || []).filter(p => Number(p.size) > 0); }
-  catch { return []; }
+  try { return (await execPositions()).filter(p => Number(p.size) > 0); }
+  catch (e) { console.error("positions read failed:", e && e.message); return []; }
 }
 
 // ── Did that order actually land? ─────────────────────────────────────────────────────────────
@@ -587,8 +803,7 @@ async function openPositions() {
 // not holding at the start of the run, both mean it landed and must NOT be sent twice.
 async function confirmPlaced(symbol, clOrdID, coin) {
   try {
-    const r = await relay("/orders?symbol=" + encodeURIComponent(symbol));
-    const orders = (r.data && r.data.orders) || [];
+    const orders = await execOrdersFor(symbol);
     const hit = orders.find(o => o && o.clOrdID === clOrdID);
     if (hit) return { landed: true, how: "resting order", orderID: hit.orderID || "" };
   } catch { /* fall through to the position check */ }
@@ -637,6 +852,14 @@ export default async function cipherAgent() {
   const day = new Date().toISOString().slice(0, 10);
   let fired = await getJSON(KEY.fired, {});
   for (const k of Object.keys(fired)) if (!k.endsWith(day)) delete fired[k];
+
+  // ── ATTEMPT CAP (2026-08-15) ──────────────────────────────────────────────────────────────
+  // Un-burning a coin on a 5xx was right — a server fault is not a decision. But with nothing
+  // counting, one broken hop turned into BCH long attempted 15 times in a day, SUI 14, SOL 14.
+  // That is not resilience, it is a feedback loop that manufactures its own traffic and buries
+  // the real signal in noise. Three goes, then the coin rests until tomorrow.
+  let attempts = await getJSON("cipher_attempts", {});
+  for (const k of Object.keys(attempts)) if (!k.endsWith(day)) delete attempts[k];
 
   const positions = await openPositions();
   const held = new Set(positions.map(p => String(p.symbol || "").replace(/USDT$/, "").toUpperCase()));
@@ -714,6 +937,7 @@ export default async function cipherAgent() {
 
     const key = `${coin}|${sig.bias}|${day}`;
     if (fired[key]) continue;
+    if ((attempts[key] || 0) >= CFG.maxAttempts()) { await pushLog({ coin, dir: sig.bias, score: sig.score, skipped: `attempt cap — ${attempts[key]} failed sends today, resting until tomorrow` }); continue; }
     if (held.has(coin)) { await pushLog({ coin, dir: sig.bias, score: sig.score, skipped: "already holding this coin" }); continue; }
     if (sameDir(sig.bias) >= CFG.corrMax()) { await pushLog({ coin, dir: sig.bias, score: sig.score, skipped: `correlation guard — already ${sameDir(sig.bias)} ${sig.bias} positions` }); continue; }
     if (placedToday >= CFG.dayCap()) { await pushLog({ coin, dir: sig.bias, score: sig.score, skipped: `daily cap reached (${CFG.dayCap()})` }); break; }
@@ -737,11 +961,12 @@ export default async function cipherAgent() {
       continue;
     }
     let r;
-    try { r = await relay("/order", built.order); }
+    attempts[key] = (attempts[key] || 0) + 1;          // count the send, not the outcome
+    try { r = await execOrder(built.order); }
     catch (e) {
-      // A relay hiccup on one coin should cost that coin, not the rest of the sweep.
+      // A hiccup on one coin should cost that coin, not the rest of the sweep.
       delete fired[key];                               // transient — let the next run retry it
-      await pushLog({ ...t, qty: built.meta.qty, risk: built.meta.riskActual, clamped: built.meta.clamped || undefined, mode, result: "ERR relay unreachable — " + String(e && e.message || e).slice(0, 120) });
+      await pushLog({ ...t, qty: built.meta.qty, risk: built.meta.riskActual, clamped: built.meta.clamped || undefined, mode, via: EXEC(), attempt: attempts[key], result: "ERR unreachable — " + String(e && e.message || e).slice(0, 160), diag: { ms: e && e.ms, error: String(e && e.name || "") } });
       continue;
     }
     // An empty 200 is NOT a fill — require the relay to have actually said something back,
@@ -760,10 +985,11 @@ export default async function cipherAgent() {
       if (chk.landed) {
         ok = true; recovered = " (recovered — 502 on the way back, but it " + chk.how + ")";
         if (chk.orderID) r = { status: 200, data: { phemex: { data: { data: { orderID: chk.orderID } } } } };
-      } else {
+      } else if ((attempts[key] || 0) < CFG.maxAttempts()) {
         try {
-          const r2 = await relay("/order", built.order);
-          if (isOK(r2)) { r = r2; ok = true; recovered = " (retried after a 502)"; }
+          attempts[key] = (attempts[key] || 0) + 1;
+          const r2 = await execOrder(built.order);
+          if (isOK(r2)) { r = r2; ok = true; recovered = " (retried after a " + r.status + ")"; }
           else r = r2;
         } catch { /* keep the original failure */ }
       }
@@ -773,7 +999,7 @@ export default async function cipherAgent() {
     // chars. A bare "ERR 502" is undiagnosable after the fact — it hid a relay crash for two
     // days (2026-08-13). The cause must be in the log entry itself, not in a val's console.
     const why = r.data.error || (r.data.parseError ? r.status + " unparseable — " + String(r.data.raw || "").slice(0, 200) : r.status);
-    await pushLog({ ...t, qty: built.meta.qty, risk: built.meta.riskActual, clamped: built.meta.clamped || undefined, mode, orderID: oid, recovered: recovered ? recovered.trim() : undefined, result: ok ? (r.data.dryRun ? "dry-run OK" : "PLACED" + recovered) : "ERR " + why, thesis: sig.ev.join("; ") + " · plan from " + (sig.planTf || "1D") + (sig.detector ? " · " + sig.detector + " detector" + (sig.alt ? " (best of " + (sig.alt + 1) + " hits)" : "") : " · confluence") });
+    await pushLog({ ...t, qty: built.meta.qty, risk: built.meta.riskActual, clamped: built.meta.clamped || undefined, mode, orderID: oid, recovered: recovered ? recovered.trim() : undefined, via: EXEC(), attempt: attempts[key], diag: ok ? undefined : r.diag, result: ok ? (r.data.dryRun ? "dry-run OK" : "PLACED" + recovered) : "ERR " + why, thesis: sig.ev.join("; ") + " · plan from " + (sig.planTf || "1D") + (sig.detector ? " · " + sig.detector + " detector" + (sig.alt ? " (best of " + (sig.alt + 1) + " hits)" : "") : " · confluence") });
     // fired[] was set BEFORE the attempt, so a failed order still burned the coin for the whole
     // day — 17 signals in Aug were lost twice over: no order placed AND no retry. A server-side
     // fault is not a decision, so undo the mark and let the next sweep have another go. A 4xx IS
@@ -783,8 +1009,9 @@ export default async function cipherAgent() {
   }
 
   await setJSON(KEY.fired, fired);
-  await setJSON("cipher_heartbeat", { at: new Date().toISOString(), scanned, candidates, placed, mode, ms: Date.now() - started });
-  console.log(`cipher-agent: scanned ${scanned}, ${candidates} candidates, ${placed} placed (${mode}) in ${Date.now() - started}ms`);
+  await setJSON("cipher_attempts", attempts);
+  await setJSON("cipher_heartbeat", { at: new Date().toISOString(), scanned, candidates, placed, mode, via: EXEC(), ms: Date.now() - started });
+  console.log(`cipher-agent: scanned ${scanned}, ${candidates} candidates, ${placed} placed (${mode}, via ${EXEC()}) in ${Date.now() - started}ms`);
 }
 
 // ── HTTP view: the app reads these so the Bot Trades panel can show server decisions ──
