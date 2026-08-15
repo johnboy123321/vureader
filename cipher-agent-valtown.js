@@ -60,6 +60,10 @@ const CFG = {
   whitelist: () => String(env("WHITELIST", DEFAULT_WHITELIST)),
   kill: () => String(env("KILL", "0")) === "1",
   maxAttempts: () => num("MAX_ATTEMPTS", 3),
+  // immediate = enter where price is when the signal fires (how it has always worked)
+  // structure = rest a limit at the zone the move came from and let price come back
+  entryMode: () => String(env("ENTRY_MODE", "immediate")).toLowerCase(),
+  entryExpiryH: () => num("ENTRY_EXPIRY_H", 8),
 };
 // The relay's own default list, duplicated here so direct mode enforces the SAME gate. If these
 // two ever need to differ, that must be a deliberate decision, not drift.
@@ -252,6 +256,118 @@ function wtPivots(wt, kind, left = 2, right = 2) {
     if (ok) out.push(i);
   }
   return out;
+}
+
+// ═══════════════════ MARKET STRUCTURE — where, not whether (2026-08-15) ═══════════════════
+// John's diagnosis, and it is the right one: "VuManChu is great at direction, not entries."
+// Every detector here is momentum — WaveTrend crosses, MFI flips, divergences. They answer
+// "is something turning?" and say nothing about WHERE. So entry has been "wherever price is when
+// the oscillator fires", which on a cross is often well after the move started, and the stop has
+// been ten bars back plus a quarter ATR — defensible, but arbitrary.
+//
+// These functions answer the other half. They are NOT new firing triggers; adding a twelfth
+// trigger to a system with eleven would mostly add noise. They are LOCATIONS: the level a move
+// came from, and the level that invalidates the idea if price trades back through it.
+//
+// Definitions are deliberately explicit, because "order block" means slightly different things to
+// different people and any published claim about them is therefore unfalsifiable. These are ours,
+// they are testable, and the lab can search their parameters like anything else.
+
+// Swing pivots on PRICE (wtPivots above does the same job on the oscillator).
+function pricePivots(c, left = 2, right = 2) {
+  const highs = [], lows = [];
+  for (let i = left; i < c.length - right; i++) {
+    let isH = true, isL = true;
+    for (let k = i - left; k <= i + right; k++) {
+      if (k === i) continue;
+      if (c[k].h >= c[i].h) isH = false;
+      if (c[k].l <= c[i].l) isL = false;
+    }
+    if (isH) highs.push(i);
+    if (isL) lows.push(i);
+  }
+  return { highs, lows };
+}
+
+// Break of structure / change of character.
+//   BOS   = price takes out the last swing high while already trending up (continuation)
+//   CHoCH = price takes out the last swing LOW while trending up (the trend's character changed)
+// Trend is defined by the swings themselves — higher highs AND higher lows — not by an average,
+// so it agrees with what you would call it looking at the chart.
+function marketStructure(c) {
+  const { highs, lows } = pricePivots(c);
+  if (highs.length < 2 || lows.length < 2) return { trend: "none", lastBOS: null, lastCHoCH: null, swingHigh: null, swingLow: null };
+  const hv = highs.slice(-3).map(i => c[i].h), lv = lows.slice(-3).map(i => c[i].l);
+  const up = hv.length >= 2 && hv.at(-1) > hv.at(-2) && lv.at(-1) > lv.at(-2);
+  const dn = hv.length >= 2 && hv.at(-1) < hv.at(-2) && lv.at(-1) < lv.at(-2);
+  const trend = up ? "up" : dn ? "down" : "none";
+  const lastHigh = c[highs.at(-1)].h, lastLow = c[lows.at(-1)].l;
+  const px = c.at(-1).c;
+  let lastBOS = null, lastCHoCH = null;
+  if (px > lastHigh) (trend === "down" ? (lastCHoCH = "bullish") : (lastBOS = "bullish"));
+  if (px < lastLow)  (trend === "up"   ? (lastCHoCH = "bearish") : (lastBOS = "bearish"));
+  return { trend, lastBOS, lastCHoCH, swingHigh: lastHigh, swingLow: lastLow, highIdx: highs.at(-1), lowIdx: lows.at(-1) };
+}
+
+// FAIR VALUE GAP: three candles where price moved so fast it left a hole in the traded range.
+// Bullish gap = candle i's LOW is above candle i-2's HIGH — nothing traded in between.
+// A gap only counts while it is UNFILLED: once price trades back through it the imbalance is gone,
+// which is the whole idea. Returns newest first.
+function findFVGs(c, lookback = 60) {
+  const out = [];
+  const start = Math.max(2, c.length - lookback);
+  for (let i = start; i < c.length; i++) {
+    const a = c[i - 2], z = c[i];
+    if (z.l > a.h) out.push({ kind: "bullish", top: z.l, bottom: a.h, at: i });
+    if (z.h < a.l) out.push({ kind: "bearish", top: a.l, bottom: z.h, at: i });
+  }
+  // Drop any the market has since traded back through.
+  return out.filter(g => {
+    for (let j = g.at + 1; j < c.length; j++) {
+      if (g.kind === "bullish" && c[j].l <= g.bottom) return false;
+      if (g.kind === "bearish" && c[j].h >= g.top) return false;
+    }
+    return true;
+  }).reverse();
+}
+
+// ORDER BLOCK: the last opposing candle before an impulsive move that broke structure.
+// The reasoning is not mystical — it is the last price at which the other side was in control
+// before they lost it, so it is a level with unfinished business. Ours requires the move to be
+// genuinely impulsive (>= 1.2 ATR over 3 candles) so that any old red candle does not qualify.
+function findOrderBlocks(c, lookback = 60) {
+  const atr = atrArr(c, 14);
+  const out = [];
+  const start = Math.max(4, c.length - lookback);
+  for (let i = start; i < c.length - 3; i++) {
+    const a = atr[i]; if (!Number.isFinite(a) || a <= 0) continue;
+    const move3 = c[i + 3].c - c[i].c;
+    if (Math.abs(move3) < 1.2 * a) continue;                 // not impulsive enough to count
+    if (move3 > 0 && c[i].c < c[i].o) out.push({ kind: "bullish", top: Math.max(c[i].o, c[i].c), bottom: c[i].l, at: i, impulse: +(move3 / a).toFixed(2) });
+    if (move3 < 0 && c[i].c > c[i].o) out.push({ kind: "bearish", top: c[i].h, bottom: Math.min(c[i].o, c[i].c), at: i, impulse: +(Math.abs(move3) / a).toFixed(2) });
+  }
+  return out.filter(b => {                                    // still untouched?
+    for (let j = b.at + 4; j < c.length; j++) {
+      if (b.kind === "bullish" && c[j].l <= b.bottom) return false;
+      if (b.kind === "bearish" && c[j].h >= b.top) return false;
+    }
+    return true;
+  }).reverse();
+}
+
+// The nearest unfilled zone that price would have to come BACK to — the pullback entry.
+// For a long: a bullish zone below current price. Rejects zones so far away the trade would be a
+// different idea by the time it filled (>8% is not a pullback, it is a crash).
+function nearestZone(c, dir, maxAwayPct = 8) {
+  const px = c.at(-1).c;
+  const want = dir === "short" ? "bearish" : "bullish";
+  const zones = [...findOrderBlocks(c).map(z => ({ ...z, src: "OB" })), ...findFVGs(c).map(z => ({ ...z, src: "FVG" }))]
+    .filter(z => z.kind === want)
+    .filter(z => (dir === "short" ? z.bottom > px : z.top < px))        // must be a RETURN, not chasing
+    .map(z => ({ ...z, away: Math.abs((dir === "short" ? z.bottom : z.top) - px) / px * 100 }))
+    .filter(z => z.away <= maxAwayPct)
+    .sort((a, b) => a.away - b.away);
+  return zones[0] || null;
 }
 
 function vmcVwapWave(c) {
@@ -457,6 +573,24 @@ function buildTradePlan(candles, dir, entry) {
   let stop;
   if (dir === "short") { stop = Math.max(...last10.map(k => k.h)) + 0.25 * a; if (stop - entry < 0.6 * a) stop = entry + 1.5 * a; }
   else { stop = Math.min(...last10.map(k => k.l)) - 0.25 * a; if (entry - stop < 0.6 * a) stop = entry - 1.5 * a; }
+  let stopKind = "swing10";
+
+  // ── STRUCTURAL STOP (2026-08-15) ─────────────────────────────────────────────────────────────
+  // "Ten bars back plus a quarter ATR" is defensible but arbitrary — it is a lookback, not a
+  // reason. The far side of the zone the move came from IS a reason: if price trades back through
+  // the level that caused the impulse, the idea is wrong, and that is what a stop is for.
+  //
+  // Only ever moves the stop CLOSER, never further out — a structural level beyond the swing stop
+  // would be widening risk to suit a story, which is how a plan becomes a hope. Since size is
+  // risk / stopDistance, a tighter honest stop also means a larger position on the same £ risk.
+  const st = marketStructure(candles);
+  const zone = nearestZone(candles, dir);
+  if (zone) {
+    const cand = dir === "short" ? zone.top + 0.15 * a : zone.bottom - 0.15 * a;   // just beyond it
+    const tighter = dir === "short" ? (cand < stop && cand > entry) : (cand > stop && cand < entry);
+    if (tighter && Math.abs(entry - cand) >= 0.4 * a) { stop = cand; stopKind = zone.src; }
+  }
+
   // A structure stop can be enormous on a volatile coin — ADA came out 14.4% away, giving a
   // 32% target from a momentum cross that has no edge over a move that size. If structure
   // demands more than 3 ATR, the setup is not tradeable on this timeframe: refuse it rather
@@ -464,7 +598,13 @@ function buildTradePlan(candles, dir, entry) {
   if (Math.abs(entry - stop) > 3 * a) return null;
   const risk = Math.abs(entry - stop); if (!(risk > 0)) return null;
   const sgn = dir === "short" ? -1 : 1;
-  return { entry, stop, risk, targets: [1, 2.25, 4].map(m => entry + sgn * risk * m) };
+  return {
+    entry, stop, risk, targets: [1, 2.25, 4].map(m => entry + sgn * risk * m),
+    stopKind, trend: st.trend,
+    // The pullback level, carried but NOT acted on unless ENTRY_MODE=structure. Recorded either
+    // way so the two entry styles can be compared on real trades rather than argued about.
+    zone: zone ? { src: zone.src, top: zone.top, bottom: zone.bottom, awayPct: +zone.away.toFixed(2) } : null,
+  };
 }
 
 // ═══════════════════════ GUARDS (same rules as the app's exec) ═══════════════════════
@@ -503,7 +643,32 @@ let RELAY_CAP = null;
 function buildOrder(t) {
   const symbol = String(t.coin).toUpperCase() + "USDT";
   const entry = +t.entry, sl = +t.sl, tp1 = +t.tp1;
-  const stopDist = Math.abs(entry - sl); if (!(stopDist > 0)) return { err: "zero stop distance" };
+  if (!(Math.abs(entry - sl) > 0)) return { err: "zero stop distance" };
+  const isLong = (t.dir || "long") === "long";
+
+  // ── ENTRY: chase, or wait at the level? (2026-08-15) ─────────────────────────────────────────
+  // immediate  — cross 1% through to guarantee a fill. Takes whatever price the oscillator hands
+  //              you, which after a WaveTrend cross is often well into the move.
+  // structure  — rest a limit at the edge of the zone the move came from and let price return.
+  //              Better price, tighter stop, bigger size for the same risk — but it only trades
+  //              if price actually comes back, and the trades that never pull back are often the
+  //              best ones. That cost is real and is why this stays opt-in until measured.
+  let cross = roundPx(isLong ? entry * 1.01 : entry * 0.99);
+  let entryKind = "immediate";
+  if (CFG.entryMode() === "structure" && t.zone) {
+    const lvl = isLong ? t.zone.top : t.zone.bottom;
+    const stillValid = isLong ? (lvl < entry && lvl > sl) : (lvl > entry && lvl < sl);
+    if (stillValid) { cross = roundPx(lvl); entryKind = "zone:" + t.zone.src; }
+  }
+
+  // ── SIZE OFF THE PRICE WE WILL ACTUALLY GET, NOT THE ONE WE PLANNED (2026-08-15) ─────────────
+  // This used to divide the risk by |plannedEntry − stop|, but the order does not fill at the
+  // planned entry: immediate mode crosses 1% through it, structure mode rests below it. Sizing
+  // off a price we never trade at makes the £ risk wrong in both modes — and in structure mode it
+  // was wrong by the entire point of the feature, cancelling out the bigger position the better
+  // entry had earned. Found by a test asserting the size should grow. It had not.
+  const stopDist = Math.abs(cross - sl);
+  if (!(stopDist > 0)) return { err: "zero stop distance at the order price" };
   let qty = roundQty(CFG.risk() / stopDist); if (!(qty > 0)) return { err: "computed qty <= 0" };
 
   // ── SIZE TO THE VENUE CAP INSTEAD OF BEING REJECTED BY IT (2026-08-13) ──
@@ -515,16 +680,11 @@ function buildOrder(t) {
   // The trade-off is explicit — such a trade risks LESS than RISK_GBP, and riskActual records it.
   let clamped = false;
   if (Number.isFinite(RELAY_CAP) && RELAY_CAP > 0) {
-    const maxQty = roundQty((RELAY_CAP * 0.98) / entry);   // 2% headroom absorbs qty rounding
+    const maxQty = roundQty((RELAY_CAP * 0.98) / cross);   // 2% headroom absorbs qty rounding
     if (maxQty > 0 && qty > maxQty) { qty = maxQty; clamped = true; }
     if (!(qty > 0)) return { err: "notional cap leaves no tradeable size" };
   }
   const riskActual = +(qty * stopDist).toFixed(2);
-  const isLong = (t.dir || "long") === "long";
-  const cross = roundPx(isLong ? entry * 1.01 : entry * 0.99);
-  // Exit at T2 (2.25R), not T1. T1 is 1R by construction, but every backtest and the discovery
-  // lab validate a ~2R exit — at a 35% win rate that is the difference between −0.30R and +0.14R
-  // per trade. Mirrors the app's fix (2026-08-09).
   const tp2 = Number(t.tp2);
   const exitPx = Number.isFinite(tp2) && tp2 > 0 ? tp2 : (Number.isFinite(tp1) ? tp1 : undefined);
   return {
@@ -535,7 +695,7 @@ function buildOrder(t) {
       takeProfitRp: exitPx,
       clOrdID: ("agent" + t.coin + Date.now()).replace(/[^a-zA-Z0-9]/g, "").slice(0, 30),
     },
-    meta: { symbol, qty, exitPx, riskActual, clamped },
+    meta: { symbol, qty, exitPx, riskActual, clamped, entryKind, stopKind: t.stopKind, zone: t.zone || undefined },
   };
 }
 
@@ -1053,7 +1213,8 @@ export default async function cipherAgent() {
     const plan = planBars ? buildTradePlan(planBars, sig.bias, sig.price) : null;
     if (!plan) { await pushLog({ coin, dir: sig.bias, score: sig.score, skipped: "could not build a trade plan" }); continue; }
 
-    const t = { coin, dir: sig.bias, entry: plan.entry, sl: plan.stop, tp1: plan.targets[0], tp2: plan.targets[1], score: sig.score };
+    const t = { coin, dir: sig.bias, entry: plan.entry, sl: plan.stop, tp1: plan.targets[0], tp2: plan.targets[1], score: sig.score,
+                stopKind: plan.stopKind, trend: plan.trend, zone: plan.zone };
     const bad = planValid(t);
     if (bad) { await pushLog({ ...t, skipped: "REFUSED — " + bad }); continue; }
 
@@ -1108,7 +1269,7 @@ export default async function cipherAgent() {
     // chars. A bare "ERR 502" is undiagnosable after the fact — it hid a relay crash for two
     // days (2026-08-13). The cause must be in the log entry itself, not in a val's console.
     const why = r.data.error || (r.data.parseError ? r.status + " unparseable — " + String(r.data.raw || "").slice(0, 200) : r.status);
-    await pushLog({ ...t, qty: built.meta.qty, risk: built.meta.riskActual, clamped: built.meta.clamped || undefined, mode, orderID: oid, recovered: recovered ? recovered.trim() : undefined, via: EXEC(), attempt: attempts[key], diag: ok ? undefined : r.diag, result: ok ? (r.data.dryRun ? "dry-run OK" : "PLACED" + recovered) : "ERR " + why, thesis: sig.ev.join("; ") + " · plan from " + (sig.planTf || "1D") + (sig.detector ? " · " + sig.detector + " detector" + (sig.alt ? " (best of " + (sig.alt + 1) + " hits)" : "") : " · confluence") });
+    await pushLog({ ...t, qty: built.meta.qty, risk: built.meta.riskActual, clamped: built.meta.clamped || undefined, mode, orderID: oid, entryKind: built.meta.entryKind, stopKind: built.meta.stopKind, recovered: recovered ? recovered.trim() : undefined, via: EXEC(), attempt: attempts[key], diag: ok ? undefined : r.diag, result: ok ? (r.data.dryRun ? "dry-run OK" : "PLACED" + recovered) : "ERR " + why, thesis: sig.ev.join("; ") + " · plan from " + (sig.planTf || "1D") + (sig.detector ? " · " + sig.detector + " detector" + (sig.alt ? " (best of " + (sig.alt + 1) + " hits)" : "") : " · confluence") });
     // fired[] was set BEFORE the attempt, so a failed order still burned the coin for the whole
     // day — 17 signals in Aug were lost twice over: no order placed AND no retry. A server-side
     // fault is not a decision, so undo the mark and let the next sweep have another go. A 4xx IS
