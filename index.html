@@ -1398,11 +1398,11 @@ body.layout-edit #layout-bar { display:flex; flex-wrap:wrap; justify-content:cen
 
       <div style="display:flex;gap:8px;align-items:center;">
         <button class="t-input" style="padding:6px 14px;font-size:12px;cursor:pointer;" onclick="CipherExec.saveServerConfig()">Save settings</button>
-        <button id="srv-kill" class="t-input" style="padding:6px 14px;font-size:12px;cursor:pointer;" onclick="CipherExec.toggleServerKill()">Kill switch</button>
+        <button id="srv-kill" class="t-input" style="padding:6px 14px;font-size:12px;cursor:pointer;" onclick="CipherExec.toggleServerKill()">Stop everything</button>
         <span id="srv-msg" style="font-size:11px;color:var(--dim);flex:1;"></span>
       </div>
       <div style="font-size:10px;color:var(--dim);margin-top:8px;line-height:1.5;">
-        Settings take effect on the agent's next run. The kill switch is enforced by the relay itself and bites immediately.
+        Settings take effect on the agent's next run. Stop everything halts the app instantly and cancels resting orders; the 24/7 bot stops at its next run, within 15 minutes. Open positions are never closed automatically.
       </div>
     </div>
 
@@ -8626,11 +8626,14 @@ document.addEventListener('click', function(e){
     el.innerHTML='<span id="cipherExecOpen" style="letter-spacing:.05em;cursor:pointer" title="Open Bot Trades">EXEC '+dot+' '+mode.toUpperCase()+' <span style="color:#666">v3.4</span></span>'+
       '<button id="cipherExecTest" style="background:none;border:1px solid #444;color:#8bd;border-radius:5px;padding:1px 6px;cursor:pointer">test</button>'+
       '<button id="cipherExecCycle" style="background:none;border:1px solid #444;color:#bbb;border-radius:5px;padding:1px 6px;cursor:pointer">mode</button>'+
-      '<button id="cipherExecKill" style="background:none;border:1px solid #722;color:#e88;border-radius:5px;padding:1px 6px;cursor:pointer">KILL</button>';
+      '';   // the pill's old KILL is gone (2026-08-15) — it stopped only the app's own exec and
+            // cancelled resting orders on three hardcoded coins, while the 24/7 agent carried on
+            // placing. Two buttons that both said KILL and meant different things was the problem.
+            // One honest stop now lives in Bot Trades → Server bot.
     el.querySelector('#cipherExecOpen').onclick=()=>window.toggleBot&&window.toggleBot();
     el.querySelector('#cipherExecTest').onclick=testFire;
     el.querySelector('#cipherExecCycle').onclick=()=>{ const order=['off','dry','armed']; const cur=order.indexOf(get(LS.mode,'off')); const next=order[(cur+1)%order.length]; if(next==='armed' && !confirm('Arm live testnet execution? Orders will be placed automatically.')) return; set(LS.mode,next); renderPill(); };
-    el.querySelector('#cipherExecKill').onclick=()=>{ if(confirm('KILL: turn off exec and cancel resting orders?')) panic(); };
+
   }
   // ── Bot Trades panel ──
   const esc=s=>String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
@@ -8920,7 +8923,7 @@ document.addEventListener('click', function(e){
       b.style.fontWeight = on ? '700' : '400';
     });
     const kb = document.getElementById('srv-kill');
-    if(kb){ kb.textContent = c.kill ? 'Kill switch: ON' : 'Kill switch'; kb.style.color = c.kill ? '#e88' : 'var(--dim)'; kb.style.borderColor = c.kill ? '#e88' : 'var(--line)'; }
+    if(kb){ kb.textContent = c.kill ? 'STOPPED — tap to resume' : 'Stop everything'; kb.style.color = c.kill ? '#e88' : 'var(--dim)'; kb.style.borderColor = c.kill ? '#e88' : 'var(--line)'; }
     const put = (id,v) => { const el = document.getElementById(id); if(el && document.activeElement !== el) el.value = (v==null?'':v); };
     put('srv-risk', c.riskGbp); put('srv-corr', c.corrMax); put('srv-daycap', c.dayCap); put('srv-notional', c.maxNotional);
   }
@@ -8955,10 +8958,44 @@ document.addEventListener('click', function(e){
     if(mode === 'armed' && !confirm('Arm the server bot?\n\nIt will place real orders on Phemex testnet on its own, every run, without asking again.')) return;
     await pushServerConfig({ mode }, 'mode ' + mode);
   }
+  // ── STOP EVERYTHING ──────────────────────────────────────────────────────────────────────────
+  // Three things place orders: the relay (for the app), the app's own exec loop, and the 24/7
+  // agent — which since 2026-08-15 signs its own orders and does NOT pass the relay. So a flag on
+  // the relay alone is not a kill switch any more. This does all three:
+  //   1. sets kill on the relay — refuses anything still routed through it, instantly
+  //   2. turns the app's own exec off — instantly
+  //   3. cancels resting orders on every coin we might have one on
+  // The agent stops when it reads config at the start of its next run: up to ~15 minutes. That is
+  // stated plainly in the prompt rather than glossed, because believing a stop is instant when it
+  // is not is worse than knowing it takes a quarter of an hour.
+  //
+  // NOTHING here closes an open position. Only the exchange does that, by hand. Said in the
+  // confirm, said in the result.
+  async function cancelRestingEverywhere(){
+    const coins = new Set();
+    try{ const snap = JSON.parse(get('mc_exec_possnap','{}'))||{}; Object.keys(snap).forEach(k => coins.add(String(k).replace(/USDT$/,'').toUpperCase())); }catch{}
+    try{ (JSON.parse(get(LS.log,'[]'))||[]).slice(0,60).forEach(e => { if(e && e.coin) coins.add(String(e.coin).toUpperCase()); }); }catch{}
+    ['BTC','ETH','SOL'].forEach(c => coins.add(c));
+    let done = 0, failed = 0;
+    for(const c of coins){
+      try{ const r = await srvFetch('/panic', { symbol: c + 'USDT' }); (r.status === 200 ? done++ : failed++); }
+      catch{ failed++; }
+    }
+    return { done, failed, tried: coins.size };
+  }
   async function toggleServerKill(){
     const on = !(SRV_CFG && SRV_CFG.kill);
-    if(on && !confirm('Turn the kill switch ON?\n\nThe relay will refuse every order immediately. Open positions are NOT closed — do that on the exchange.')) return;
-    await pushServerConfig({ kill: on }, on ? 'kill ON' : 'kill off');
+    if(on && !confirm('STOP EVERYTHING?\n\n· the app stops placing, now\n· resting orders are cancelled\n· the 24/7 bot stops at its next run (up to 15 min)\n\nOpen positions are NOT closed — do that on the exchange yourself.')) return;
+    if(!on){ await pushServerConfig({ kill:false }, 'kill off'); return; }
+
+    set(LS.mode, 'off'); renderPill();                 // the app's own exec: off immediately
+    const ok = await pushServerConfig({ kill:true, mode:'off' }, 'stopping');
+    srvMsg('cancelling resting orders…');
+    const r = await cancelRestingEverywhere();
+    pushLog({ kill:true });
+    srvMsg((ok ? 'STOPPED' : 'relay did not confirm — check it') +
+           ' · app off · ' + r.done + '/' + r.tried + ' coins cleared' + (r.failed ? ' (' + r.failed + ' failed)' : '') +
+           ' · bot stops next run · positions still open', !ok || !!r.failed);
   }
   async function saveServerConfig(){
     const n = id => { const el = document.getElementById(id); const v = el && el.value !== '' ? Number(el.value) : undefined; return Number.isFinite(v) ? v : undefined; };
