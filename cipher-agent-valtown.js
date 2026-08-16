@@ -1048,6 +1048,83 @@ function applyLiveConfig(c) {
   return applied;
 }
 
+// ═══════════ TARGET HIT → LOOK THE OTHER WAY (2026-08-16) ═══════════
+// John: "when the brain and bot see the TP long hit, surely we could rescan that coin for the
+// short and ping it — get in and out better both ways."
+//
+// The bot already knows enough to do this and never used it. It records every plan it placed
+// (entry, stop, target, book) and it reads open positions every run. A position that WAS there
+// and is now gone has resolved — and comparing the last price to the plan says which way.
+//
+// A target hit is the most informative moment a setup ever produces: the thesis paid in full and
+// the move is, by construction, extended. That is precisely when the reverse setup is worth a
+// look — so the coin jumps the rotation queue instead of waiting for the cursor to come round,
+// which on a 100-coin rotation can be hours.
+//
+// It does NOT auto-enter the reverse. It queues the coin to be scanned FIRST next run, and the
+// normal signal, plan and guards decide from there. Jumping the queue is a scheduling decision;
+// taking the trade is still a trading decision, and those should not be the same thing.
+const OPEN_KEY = "cipher_open", PRIORITY_KEY = "cipher_priority";
+
+// Snapshot what we are holding, with the plan that opened it, so the next run can tell what
+// happened to it. Keyed the same way as the book map.
+function snapshotOpen(positions, bookMap, prev) {
+  const out = {};
+  for (const p of positions) {
+    const coin = String(p.symbol || "").replace(/USDT$/, "").toUpperCase();
+    let d = String(p.posSide || p.side || "").toLowerCase();
+    if (d !== "long" && d !== "short") d = Number(p.size) < 0 ? "short" : "long";
+    const k = posKey(coin, d);
+    out[k] = { coin, dir: d, size: Math.abs(Number(p.size) || 0), book: bookMap[k] || null,
+               plan: (prev && prev[k] && prev[k].plan) || null, since: (prev && prev[k] && prev[k].since) || Date.now() };
+  }
+  return out;
+}
+
+// Anything in the previous snapshot that is no longer open has resolved. Classify it by where
+// price ended up relative to the plan — target side, stop side, or neither.
+function resolvedSince(prev, now, priceOf) {
+  const out = [];
+  for (const k of Object.keys(prev || {})) {
+    if (now[k]) continue;                                   // still open
+    const was = prev[k], px = priceOf(was.coin);
+    let how = "closed";
+    if (was.plan && Number.isFinite(px)) {
+      const { entry, stop, target } = was.plan;
+      const isLong = was.dir !== "short";
+      if (Number.isFinite(target) && (isLong ? px >= target : px <= target)) how = "target";
+      else if (Number.isFinite(stop) && (isLong ? px <= stop : px >= stop)) how = "stop";
+      else if (Number.isFinite(entry)) how = (isLong ? px > entry : px < entry) ? "closed in profit" : "closed at a loss";
+    }
+    out.push({ ...was, how, exit: px });
+  }
+  return out;
+}
+
+// ═══════════════ TWO BOOKS: fast and swing (2026-08-16) ═══════════════
+// John: "quick turnover, long to TP, flip short on the signal, meanwhile a bigger swing trade on
+// BTC." That is two different businesses sharing one account, and the bot could only run one:
+// a single risk setting, one target rule, one correlation pool, one day cap.
+//
+// Worse, the no-hedge rule written last night would have BLOCKED exactly what he wants — a 4H
+// short while a weekly BTC long runs is not a hedge, it is a different trade on a different
+// horizon. The rule was right; it just could not tell the two apart.
+//
+// So a trade belongs to a BOOK, decided by the timeframe its signal came from. Each book gets its
+// own slots and day cap, and — the important part — the no-hedge rule applies WITHIN a book, not
+// across them. Then "scalp both ways while BTC runs" is simply two books doing their jobs.
+const FAST_TFS = ["15m", "30m", "1H", "4H"];
+function bookFor(tf) { return FAST_TFS.includes(String(tf)) ? "fast" : "swing"; }
+const BOOK_CFG = {
+  fast:  { corrMax: () => num("FAST_CORR_MAX", 4),  dayCap: () => num("FAST_DAY_CAP", 20) },
+  swing: { corrMax: () => num("SWING_CORR_MAX", 3), dayCap: () => num("SWING_DAY_CAP", 6) },
+};
+// Which book opened which position? The exchange does not know, so we remember. Positions opened
+// before books existed have no entry here — and those are treated as belonging to BOTH books, so
+// the no-hedge protection never quietly lapses while this rolls out.
+const BOOKMAP_KEY = "cipher_books";
+const posKey = (coin, dir) => String(coin).toUpperCase() + "|" + dir;
+
 // ═══════════════ TIME STOP — make trades RESOLVE (2026-08-16) ═══════════════
 // John: "I don't believe we've hit a single TP or stop loss yet."
 //
@@ -1247,7 +1324,17 @@ export default async function cipherAgent() {
   const batch = Math.max(5, CFG.batch());
   const slice = [];
   const seenThisRun = new Set();
-  for (let i = 0; i < batch && seenThisRun.size < uni.length; i++) {
+  // Coins whose trade resolved last run jump the queue — see "TARGET HIT → LOOK THE OTHER WAY".
+  // On a 100-coin rotation the cursor can take hours to come back round, by which time the
+  // reverse setup is history.
+  const priority = await getJSON(PRIORITY_KEY, []);
+  for (const sym of priority) {
+    if (slice.length >= batch) break;
+    if (!seenThisRun.has(sym) && uni.includes(sym)) { seenThisRun.add(sym); slice.push(sym); }
+  }
+  if (priority.length) console.log(`priority scan: ${priority.join(", ")} (resolved last run)`);
+  await setJSON(PRIORITY_KEY, []);
+  for (let i = 0; i < batch && seenThisRun.size < uni.length && slice.length < batch; i++) {
     const sym = uni[(cursor + i) % uni.length];
     if (!seenThisRun.has(sym)) { seenThisRun.add(sym); slice.push(sym); }
   }
@@ -1273,8 +1360,6 @@ export default async function cipherAgent() {
   const canSeeBook = positionsRead !== null;
   const positions = positionsRead || [];
   if (!canSeeBook) console.log("WARNING: could not read open positions — scanning only, no orders will be placed this run");
-  const held = new Set(positions.map(p => String(p.symbol || "").replace(/USDT$/, "").toUpperCase()));
-
   // ── NO OPPOSING LEG ON THE SAME COIN (2026-08-15) ────────────────────────────────────────────
   // Found LINK, XRP, ETH, UNI and BTC each holding a long AND a short at once. The bot never chose
   // to hedge — openPositions() was silently returning [] (see findPositions), so "already holding
@@ -1286,31 +1371,51 @@ export default async function cipherAgent() {
   // A real hedge needs a reason, a level and a stop on BOTH legs. This engine produces
   // one-directional setups; two opposing legs is not a position, it is two positions paying
   // funding against each other. Refuse, and say why in the log so it is visible rather than quiet.
-  const heldDir = new Map();                      // COIN → Set("long"|"short")
+  const bookMap = await getJSON(BOOKMAP_KEY, {});
+  // ── What resolved since last run, and what that suggests looking at ──
+  const prevOpen = await getJSON(OPEN_KEY, {});
+  const lastPrice = {};                       // filled as the scan fetches candles anyway
+  const priceOf = c => lastPrice[c];
+  const heldDir = new Map();                      // "book|COIN" → Set("long"|"short")
+  const addHeld = (book, coin, d) => { const k = book + "|" + coin; if (!heldDir.has(k)) heldDir.set(k, new Set()); heldDir.get(k).add(d); };
   for (const p of positions) {
     const coin = String(p.symbol || "").replace(/USDT$/, "").toUpperCase();
     // Phemex reports posSide Long/Short in hedge mode; fall back to side, then to a signed size.
     let d = String(p.posSide || p.side || "").toLowerCase();
     if (d !== "long" && d !== "short") d = Number(p.size) < 0 ? "short" : "long";
-    if (!heldDir.has(coin)) heldDir.set(coin, new Set());
-    heldDir.get(coin).add(d);
+    const known = bookMap[posKey(coin, d)];
+    if (known) addHeld(known, coin, d);
+    else { addHeld("fast", coin, d); addHeld("swing", coin, d); }   // unknown → protected in both
   }
-  const opposes = (coin, dir) => {
+  // "book|COIN" — a coin can be held in one book and still be free in the other, which is the
+  // whole point: a weekly BTC long must not block a 4H BTC trade in the fast book.
+  const held = new Set();
+  for (const [k, set] of heldDir) if (set.size) held.add(k);
+
+  const opposes = (book, coin, dir) => {
     const other = dir === "long" ? "short" : "long";
-    return heldDir.has(coin) && heldDir.get(coin).has(other);
+    const k = book + "|" + coin;
+    return heldDir.has(k) && heldDir.get(k).has(other);
   };
-  const noteOpened = (coin, dir) => {
-    if (!heldDir.has(coin)) heldDir.set(coin, new Set());
-    heldDir.get(coin).add(dir);
-  };
-  const dupes = [...heldDir].filter(([, s]) => s.size > 1).map(([c]) => c);
+  const noteOpened = (book, coin, dir) => { addHeld(book, coin, dir); bookMap[posKey(coin, dir)] = book; };
+  const dupes = [...heldDir].filter(([, set]) => set.size > 1).map(([k]) => k);
   if (dupes.length) console.log(`WARNING: ${dupes.length} coin(s) already hold BOTH sides — ${dupes.join(", ")}. Not adding to them.`);
   // Positions are read ONCE per run, so trades opened during this run must be counted too —
   // otherwise a single pass can stack far past CORR_MAX before the next run notices. Found when
   // the ported detectors made one run place 10 orders (2026-08-11).
-  const openedThisRun = [];
-  const sameDir = dir => positions.filter(p => String(p.posSide || p.side || "").toLowerCase() === dir).length
-                       + openedThisRun.filter(d => d === dir).length;
+  const openedThisRun = [];   // { book, dir }
+  const sameDir = (book, dir) => {
+    const fromExchange = positions.filter(p => {
+      const coin = String(p.symbol || "").replace(/USDT$/, "").toUpperCase();
+      let d = String(p.posSide || p.side || "").toLowerCase();
+      if (d !== "long" && d !== "short") d = Number(p.size) < 0 ? "short" : "long";
+      if (d !== dir) return false;
+      const known = bookMap[posKey(coin, d)];
+      return known ? known === book : true;      // unknown positions count against BOTH books
+    }).length;
+    return fromExchange + openedThisRun.filter(x => x.book === book && x.dir === dir).length;
+  };
+  const placedInBook = { fast: 0, swing: 0 };
 
   const log24 = (await getJSON(KEY.log, [])).filter(e => e.result === "PLACED" || e.result === "dry-run OK");
   const dayAgo = Date.now() - 864e5;
@@ -1390,11 +1495,15 @@ export default async function cipherAgent() {
     const key = `${coin}|${sig.bias}|${day}`;
     if (fired[key]) continue;
     if ((attempts[key] || 0) >= CFG.maxAttempts()) { await pushLog({ coin, dir: sig.bias, score: sig.score, skipped: `attempt cap — ${attempts[key]} failed sends today, resting until tomorrow` }); continue; }
-    if (!canSeeBook) { await pushLog({ coin, dir: sig.bias, score: sig.score, skipped: "REFUSED — cannot read open positions, so cannot check for an opposing leg" }); continue; }
-    if (opposes(coin, sig.bias)) { await pushLog({ coin, dir: sig.bias, score: sig.score, skipped: `REFUSED — would open a ${sig.bias} against an existing ${sig.bias === "long" ? "short" : "long"} on ${coin}. This bot does not hedge.` }); continue; }
-    if (held.has(coin)) { await pushLog({ coin, dir: sig.bias, score: sig.score, skipped: "already holding this coin" }); continue; }
-    if (sameDir(sig.bias) >= CFG.corrMax()) { await pushLog({ coin, dir: sig.bias, score: sig.score, skipped: `correlation guard — already ${sameDir(sig.bias)} ${sig.bias} positions` }); continue; }
-    if (placedToday >= CFG.dayCap()) { await pushLog({ coin, dir: sig.bias, score: sig.score, skipped: `daily cap reached (${CFG.dayCap()})` }); break; }
+    const book = bookFor(sig.planTf || "1D");
+    const bcfg = BOOK_CFG[book];
+    if (!canSeeBook) { await pushLog({ coin, dir: sig.bias, book, score: sig.score, skipped: "REFUSED — cannot read open positions, so cannot check for an opposing leg" }); continue; }
+    // The no-hedge rule lives INSIDE a book. A 4H short while a weekly long runs is not a hedge,
+    // it is a different trade on a different horizon — which is the whole point of splitting them.
+    if (opposes(book, coin, sig.bias)) { await pushLog({ coin, dir: sig.bias, book, score: sig.score, skipped: `REFUSED — would open a ${sig.bias} against an existing ${sig.bias === "long" ? "short" : "long"} on ${coin} in the ${book} book. This bot does not hedge within a book.` }); continue; }
+    if (held.has(book + "|" + coin)) { await pushLog({ coin, dir: sig.bias, book, score: sig.score, skipped: `already holding ${coin} in the ${book} book` }); continue; }
+    if (sameDir(book, sig.bias) >= bcfg.corrMax()) { await pushLog({ coin, dir: sig.bias, book, score: sig.score, skipped: `correlation guard — already ${sameDir(book, sig.bias)} ${sig.bias} positions in the ${book} book (max ${bcfg.corrMax()})` }); continue; }
+    if (placedInBook[book] + placedToday >= CFG.dayCap() || placedInBook[book] >= bcfg.dayCap()) { await pushLog({ coin, dir: sig.bias, book, score: sig.score, skipped: `daily cap reached for the ${book} book (${bcfg.dayCap()})` }); continue; }
 
     const planBars = bars[sig.planTf] || await fetchCandles(coin, sig.planTf || "1D", 260);
     const plan = planBars ? buildTradePlan(planBars, sig.bias, sig.price) : null;
@@ -1402,6 +1511,7 @@ export default async function cipherAgent() {
 
     const t = { coin, dir: sig.bias, entry: plan.entry, sl: plan.stop, tp1: plan.targets[0], tp2: plan.targets[1], score: sig.score,
                 stopKind: plan.stopKind, trend: plan.trend, zone: plan.zone };
+    lastPrice[coin] = sig.price;
     const bad = planValid(t);
     if (bad) { await pushLog({ ...t, skipped: "REFUSED — " + bad }); continue; }
 
@@ -1410,9 +1520,9 @@ export default async function cipherAgent() {
 
     fired[key] = Date.now();
     if (mode === "dry") {
-      openedThisRun.push(sig.bias);
-      noteOpened(coin, sig.bias);          // a dry run must model the same book the armed one would
-      held.add(coin);
+      openedThisRun.push({ book, dir: sig.bias, coin, plan: { entry: t.entry, stop: t.sl, target: t.tp2 ?? t.tp1 } });
+      noteOpened(book, coin, sig.bias);    // a dry run must model the same book the armed one would
+      held.add(book + "|" + coin); placedInBook[book]++;
       await pushLog({ ...t, qty: built.meta.qty, risk: built.meta.riskActual, clamped: built.meta.clamped || undefined, mode, result: "dry-run OK", thesis: sig.ev.join("; ") + " · plan from " + (sig.planTf || "1D") + (sig.detector ? " · " + sig.detector + " detector" + (sig.alt ? " (best of " + (sig.alt + 1) + " hits)" : "") : " · confluence") });
       placed++; placedToday++;
       continue;
@@ -1456,13 +1566,15 @@ export default async function cipherAgent() {
     // chars. A bare "ERR 502" is undiagnosable after the fact — it hid a relay crash for two
     // days (2026-08-13). The cause must be in the log entry itself, not in a val's console.
     const why = r.data.error || (r.data.parseError ? r.status + " unparseable — " + String(r.data.raw || "").slice(0, 200) : r.status);
-    await pushLog({ ...t, qty: built.meta.qty, risk: built.meta.riskActual, clamped: built.meta.clamped || undefined, mode, orderID: oid, entryKind: built.meta.entryKind, stopKind: built.meta.stopKind, recovered: recovered ? recovered.trim() : undefined, via: EXEC(), attempt: attempts[key], diag: ok ? undefined : r.diag, result: ok ? (r.data.dryRun ? "dry-run OK" : "PLACED" + recovered) : "ERR " + why, thesis: sig.ev.join("; ") + " · plan from " + (sig.planTf || "1D") + (sig.detector ? " · " + sig.detector + " detector" + (sig.alt ? " (best of " + (sig.alt + 1) + " hits)" : "") : " · confluence") });
+    await pushLog({ ...t, qty: built.meta.qty, risk: built.meta.riskActual, clamped: built.meta.clamped || undefined, mode, orderID: oid, entryKind: built.meta.entryKind, stopKind: built.meta.stopKind, book, recovered: recovered ? recovered.trim() : undefined, via: EXEC(), attempt: attempts[key], diag: ok ? undefined : r.diag, result: ok ? (r.data.dryRun ? "dry-run OK" : "PLACED" + recovered) : "ERR " + why, thesis: sig.ev.join("; ") + " · plan from " + (sig.planTf || "1D") + (sig.detector ? " · " + sig.detector + " detector" + (sig.alt ? " (best of " + (sig.alt + 1) + " hits)" : "") : " · confluence") });
     // fired[] was set BEFORE the attempt, so a failed order still burned the coin for the whole
     // day — 17 signals in Aug were lost twice over: no order placed AND no retry. A server-side
     // fault is not a decision, so undo the mark and let the next sweep have another go. A 4xx IS
     // a decision (cap breached, bad symbol) and would just repeat, so that one stays burned.
     if (!ok && r.status >= 500) delete fired[key];
-    if (ok) { placed++; placedToday++; openedThisRun.push(sig.bias); held.add(coin); noteOpened(coin, sig.bias); }
+    if (ok) { placed++; placedToday++; placedInBook[book]++;
+      openedThisRun.push({ book, dir: sig.bias, coin, plan: { entry: t.entry, stop: t.sl, target: t.tp2 ?? t.tp1 } });
+      held.add(book + "|" + coin); noteOpened(book, coin, sig.bias); }
   }
 
   // ── SHADOW: record this run's decisions, grade older ones, let the evidence decide ──────────
@@ -1532,6 +1644,32 @@ export default async function cipherAgent() {
       skipped: `ranking ${v.changed}: variant ${v.varr.meanR}R vs baseline ${v.base.meanR}R over ${v.varr.n}/${v.base.n} resolved trades` });
   } catch (e) { console.error("shadow pass failed (harmless, no orders involved):", e && e.message); }
 
+  // ── Resolutions → the reverse look ─────────────────────────────────────────────────────────
+  try {
+    const nowOpen = snapshotOpen(positions, bookMap, prevOpen);
+    // Attach the plan to anything opened this run, so the NEXT run can tell how it ended. Without
+    // this a resolution is just "gone" — with it we can say target, stop, or neither.
+    for (const o of openedThisRun) {
+      const k = posKey(o.coin, o.dir);
+      if (!nowOpen[k]) nowOpen[k] = { coin: o.coin, dir: o.dir, size: 0, book: o.book, since: Date.now() };
+      nowOpen[k].plan = o.plan || nowOpen[k].plan || null;
+      nowOpen[k].book = o.book;
+    }
+    const resolved = resolvedSince(prevOpen, nowOpen, priceOf);
+    const queue = [];
+    for (const r of resolved) {
+      const line = `${r.coin} ${r.dir} ${r.how}${Number.isFinite(r.exit) ? " at " + formatPrice(r.exit) : ""}`;
+      await pushLog({ coin: r.coin, dir: r.dir, book: r.book || undefined, result: "RESOLVED",
+        skipped: `${line} — ${r.how === "target" ? "target hit, queued for a reverse look" : "closed, freeing its slot"}` });
+      delete bookMap[posKey(r.coin, r.dir)];
+      if (r.how === "target") queue.push(r.coin);
+    }
+    if (queue.length) await setJSON(PRIORITY_KEY, queue);
+    await setJSON(OPEN_KEY, nowOpen);
+    if (resolved.length) console.log(`resolved: ${resolved.map(r => r.coin + " " + r.how).join(", ")}`);
+  } catch (e) { console.error("resolution pass failed (no orders involved):", e && e.message); }
+
+  await setJSON(BOOKMAP_KEY, bookMap);
   await setJSON(KEY.fired, fired);
   await setJSON("cipher_attempts", attempts);
   await setJSON("cipher_heartbeat", { at: new Date().toISOString(), scanned, candidates, placed, mode, via: EXEC(), ms: Date.now() - started });
