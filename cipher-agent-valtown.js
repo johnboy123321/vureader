@@ -1048,6 +1048,123 @@ function applyLiveConfig(c) {
   return applied;
 }
 
+// ═══════════════ THE SHADOW FRAMEWORK (2026-08-16) ═══════════════
+// John's brief: "build something different… nothing gets control until it has earned it."
+//
+// The shadow gate already worked once — the brain's verdicts ran advisory, were graded against
+// real outcomes, and only took control when they beat the numeric path. That mechanism is the
+// most valuable thing in this system, and it was being used for exactly one purpose.
+//
+// So it becomes the architecture. Every new component — a different way of choosing trades, a
+// sizing multiplier, a veto — registers as an EXPERIMENT. Each run it records what it WOULD have
+// done, alongside what actually happened. Those decisions are graded on real forward candles.
+// When the variant beats the baseline over enough resolved trades, it promotes itself. If its
+// record later slips, it hands control back.
+//
+// Two consequences worth being explicit about:
+//   · we can build aggressively, because nothing new can touch a real order until it has won
+//   · the system improves without John deciding it has improved — the evidence decides
+//
+// Nothing here places an order. A shadow record is a DECISION, never an instruction.
+const SHADOW_KEY = "cipher_shadow";
+const SHADOW_MIN_RESOLVED = 30;    // per arm, before a comparison means anything
+const SHADOW_MARGIN_R     = 0.05;  // variant must beat baseline by this much in mean R
+const SHADOW_MAX_RECORDS  = 600;   // keep the state file sane
+const SHADOW_GRADE_AFTER_H = 4;    // don't try to resolve a trade that has had no time to move
+const SHADOW_TIMEOUT_BARS = 40;    // same time cap the app's backtester uses
+
+async function loadShadow() { return (await getJSON(SHADOW_KEY, {})) || {}; }
+async function saveShadow(sh) { await setJSON(SHADOW_KEY, sh); }
+
+function shadowSlot(sh, id) {
+  if (!sh[id]) sh[id] = { records: [], promoted: false, history: [] };
+  return sh[id];
+}
+
+// A decision, with everything needed to grade it later. `arm` is "baseline" or "variant".
+function shadowRecord(sh, id, arm, t, meta) {
+  const slot = shadowSlot(sh, id);
+  slot.records.push({
+    at: Date.now(), arm, coin: t.coin, dir: t.dir, tf: t.planTf || t.tf || "1D",
+    entry: +t.entry, stop: +t.sl, target: +(t.tp2 ?? t.tp1),
+    quality: meta && meta.quality, note: meta && meta.note,
+    R: null,                                    // filled in by grading, later
+  });
+  if (slot.records.length > SHADOW_MAX_RECORDS) slot.records = slot.records.slice(-SHADOW_MAX_RECORDS);
+}
+
+// Walk real candles forward from the decision and score it in R. Stop is checked BEFORE target
+// within a candle — the pessimistic reading, same as the app's backtester. Anything still open
+// after the time cap is marked to market.
+function gradeOne(rec, candles) {
+  const risk = Math.abs(rec.entry - rec.stop);
+  if (!(risk > 0) || !candles || !candles.length) return null;
+  const isLong = rec.dir !== "short";
+  const start = candles.findIndex(c => c.t >= rec.at);
+  if (start < 0) return null;
+  for (let i = start; i < candles.length; i++) {
+    const c = candles[i];
+    const hitStop = isLong ? c.l <= rec.stop : c.h >= rec.stop;
+    const hitTgt  = isLong ? c.h >= rec.target : c.l <= rec.target;
+    if (hitStop) return -1;
+    if (hitTgt) return +Math.abs(rec.target - rec.entry) / risk;
+    if (i - start >= SHADOW_TIMEOUT_BARS) {
+      return (isLong ? c.c - rec.entry : rec.entry - c.c) / risk;   // marked to market
+    }
+  }
+  return null;                                  // not enough candles yet — leave it open
+}
+
+async function gradeShadow(sh) {
+  const cutoff = Date.now() - SHADOW_GRADE_AFTER_H * 3600e3;
+  const need = new Map();                        // coin|tf → the records waiting on it
+  for (const id of Object.keys(sh)) {
+    for (const rec of sh[id].records) {
+      if (rec.R !== null || rec.at > cutoff) continue;
+      const k = rec.coin + "|" + (rec.tf || "1D");
+      if (!need.has(k)) need.set(k, []);
+      need.get(k).push(rec);
+    }
+  }
+  let graded = 0;
+  for (const [k, recs] of need) {
+    const [coin, tf] = k.split("|");
+    let candles = null;
+    try { candles = await fetchCandles(coin, tf, 300); } catch {}
+    if (!candles) continue;
+    for (const rec of recs) {
+      const R = gradeOne(rec, candles);
+      if (R !== null) { rec.R = +R.toFixed(3); graded++; }
+    }
+  }
+  return graded;
+}
+
+function armStats(records, arm) {
+  const done = records.filter(r => r.arm === arm && r.R !== null);
+  if (!done.length) return { n: 0, meanR: 0, wins: 0 };
+  const sum = done.reduce((a, r) => a + r.R, 0);
+  return { n: done.length, meanR: +(sum / done.length).toFixed(3), wins: done.filter(r => r.R > 0).length };
+}
+
+// Promotion and demotion, on evidence only. Both arms need a real sample: a variant that beats a
+// baseline of four trades has proved nothing, and this is exactly where a system talks itself
+// into a change it likes the look of.
+function shadowJudge(sh, id) {
+  const slot = shadowSlot(sh, id);
+  const base = armStats(slot.records, "baseline"), varr = armStats(slot.records, "variant");
+  const ready = base.n >= SHADOW_MIN_RESOLVED && varr.n >= SHADOW_MIN_RESOLVED;
+  const edge = +(varr.meanR - base.meanR).toFixed(3);
+  let changed = null;
+  if (ready && !slot.promoted && edge >= SHADOW_MARGIN_R) {
+    slot.promoted = true; changed = "promoted";
+  } else if (ready && slot.promoted && edge < 0) {
+    slot.promoted = false; changed = "demoted";     // hands control straight back
+  }
+  if (changed) slot.history.push({ at: Date.now(), changed, base, varr, edge });
+  return { ready, base, varr, edge, promoted: slot.promoted, changed };
+}
+
 // ═══════════════════════ THE LOOP ═══════════════════════
 export default async function cipherAgent() {
   const started = Date.now();
@@ -1140,6 +1257,8 @@ export default async function cipherAgent() {
   let placedToday = log24.filter(e => new Date(e.at).getTime() > dayAgo).length;
 
   let scanned = 0, candidates = 0, placed = 0;
+  const rankPool = [];                       // every coin's best signal this run, threshold or not
+  const SHADOW = await loadShadow();
 
   for (const coin of slice) {
     if (Date.now() - started > 45000) { console.log("time budget reached — stopping early"); break; }
@@ -1187,6 +1306,14 @@ export default async function cipherAgent() {
       if (hits.length) {
         hits.sort((a, b) => b.q - a.q);
         const best = hits[0];
+        // ── RANKING EXPERIMENT (shadow) ───────────────────────────────────────────────────────
+        // The live rule fires whatever clears MIN_QUALITY, so a hot market gives twenty mediocre
+        // trades and a quiet one gives nothing — and a whole day can pass with "quality 4.0 < 5"
+        // on every line. The variant asks a different question: of everything the scanner saw
+        // this run, which are the BEST few? Threshold vs rank, same signals, graded on the same
+        // forward candles. Recorded here whether or not it clears the bar.
+        rankPool.push({ coin, dir: best.m.dir, quality: best.q, tf: best.tf, label: best.label,
+                        price: best.c[best.c.length - 1].c });
         if (best.q < MIN_QUALITY) {
           await pushLog({ coin, dir: best.m.dir, skipped: `signal too weak — ${best.label} on ${best.tf} (quality ${best.q.toFixed(1)} < ${MIN_QUALITY})` });
         } else {
@@ -1277,6 +1404,34 @@ export default async function cipherAgent() {
     if (!ok && r.status >= 500) delete fired[key];
     if (ok) { placed++; placedToday++; openedThisRun.push(sig.bias); held.add(coin); noteOpened(coin, sig.bias); }
   }
+
+  // ── SHADOW: record this run's decisions, grade older ones, let the evidence decide ──────────
+  try {
+    const RANK_TOP_N = num("RANK_TOP_N", 3);
+    const planFor = async (x) => {
+      const bars = await fetchCandles(x.coin, x.tf || "1D", 260);
+      const plan = bars ? buildTradePlan(bars, x.dir, x.price) : null;
+      if (!plan) return null;
+      const t = { coin: x.coin, dir: x.dir, entry: plan.entry, sl: plan.stop, tp1: plan.targets[0],
+                  tp2: plan.targets[1], planTf: x.tf };
+      return planValid(t) ? null : t;
+    };
+    const MINQ = num("MIN_QUALITY", 5);
+    const baselineSet = rankPool.filter(x => x.quality >= MINQ);
+    const variantSet  = [...rankPool].sort((a, b) => b.quality - a.quality).slice(0, RANK_TOP_N);
+    for (const [arm, set] of [["baseline", baselineSet], ["variant", variantSet]]) {
+      for (const x of set) {
+        const t = await planFor(x);
+        if (t) shadowRecord(SHADOW, "rank_vs_threshold", arm, t, { quality: +x.quality.toFixed(1), note: x.label });
+      }
+    }
+    const gradedN = await gradeShadow(SHADOW);
+    const v = shadowJudge(SHADOW, "rank_vs_threshold");
+    await saveShadow(SHADOW);
+    console.log(`shadow rank_vs_threshold: baseline ${v.base.n} trades @ ${v.base.meanR}R · variant ${v.varr.n} @ ${v.varr.meanR}R · edge ${v.edge >= 0 ? "+" : ""}${v.edge}R${v.ready ? "" : " (still gathering)"}${v.changed ? " — " + v.changed.toUpperCase() : ""}${gradedN ? ` · graded ${gradedN} this run` : ""}`);
+    if (v.changed) await pushLog({ shadow: "rank_vs_threshold", result: v.changed.toUpperCase(),
+      skipped: `ranking ${v.changed}: variant ${v.varr.meanR}R vs baseline ${v.base.meanR}R over ${v.varr.n}/${v.base.n} resolved trades` });
+  } catch (e) { console.error("shadow pass failed (harmless, no orders involved):", e && e.message); }
 
   await setJSON(KEY.fired, fired);
   await setJSON("cipher_attempts", attempts);
