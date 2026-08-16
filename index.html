@@ -4745,6 +4745,20 @@ async function send() {
   let entryNote = null;
   try { entryNote = await captureChatEntry(text, asset); } catch {}
 
+  // ── Strategy drop: "test this strategy: ..." goes to the lab, not to the brain's opinion ──
+  // Deliberately short-circuits the normal reply. An opinion on a strategy is worth nothing next
+  // to a backtest of it, and answering with both would let the opinion do the persuading.
+  if (looksLikeStrategyDrop(text)) {
+    addAIMsg('Translating that into a testable setup and running it on your coins — give me a minute.');
+    let out;
+    try { out = await testDroppedStrategy(text); }
+    catch (e) { out = 'That fell over while testing: ' + String(e && e.message || e); }
+    addAIMsg(out);
+    history.push({ role: 'user', content: text }, { role: 'assistant', content: out });
+    saveChat();
+    return;
+  }
+
   const hasImgs = pendingImages.length > 0;
   if (hasImgs) {
     const pieces = await prepareChartImages(pendingImages);
@@ -7010,6 +7024,91 @@ function seedGridCandidates() {
 }
 
 // Ask the smart model to PROPOSE candidate patterns — strictly from the vocabulary, as JSON.
+// ═══════════ DROP A STRATEGY INTO CHAT (2026-08-16) ═══════════
+// John: "make the brain have control so i can drop strategies in the chat and put it together,
+// log it." So: paste a strategy in plain English — from a video, a site, your own head — and it
+// gets translated into a real candidate, tested on YOUR coins, and logged.
+//
+// The important part is what it does NOT do: it does not take the idea's word for anything. A
+// dropped strategy faces exactly the same gates as one the lab invented — walk-forward split AND
+// cross-asset breadth. Nothing is promoted because it sounded good in a chat message.
+const CHAT_STRAT_RE = /\b(test|try|backtest|add|drop)\s+(this|that|a|an|the|my)?\s*(strategy|setup|system|idea)\b|\bstrategy:\s/i;
+function looksLikeStrategyDrop(text) {
+  if (!text || text.length < 25) return false;
+  if (!CHAT_STRAT_RE.test(text)) return false;
+  // needs at least some trading vocabulary, or "test this strategy" alone would trigger it
+  return /\b(buy|sell|long|short|cross(es)?|above|below|rsi|ma\b|moving average|ema|when|entry|stop|target)\b/i.test(text);
+}
+
+// Translate free text into the candidate schema the lab already understands.
+async function strategyFromText(apiKey, text) {
+  const vocab = Object.entries(DISCOVERY_VOCAB).map(([k, v]) => `  ${k} — ${v}`).join('\n');
+  const sys = `You translate a trader's plain-English strategy into a candidate for a backtester. You do NOT judge whether it works and you do NOT flatter it — a gate decides that afterwards.
+
+Use ONLY these condition tokens (the setup fires when ALL are true on a bar):
+${vocab}
+
+Return STRICT JSON only:
+{"name":"short label","dir":"long","tf":"1D","conditions":["trendUp","oversold"],"stopAtr":2,"targetR":2,"rationale":"one line","note":"anything in the description you could NOT express with these tokens"}
+Rules: 1-4 conditions, all from the list; dir is "long" or "short" (pick the one the description trades — if it trades both, return the long side and say so in note); tf one of "1H","4H","1D"; stopAtr 0.5-4; targetR 1-4. If the description names a stop or target, convert it as faithfully as you can. NEVER invent a condition that is not in the list — put what you had to drop in "note" instead. If the strategy cannot be expressed at all, return {"error":"why"}.`;
+  const res = await fetch('https://api.anthropic.com/v1/messages', {
+    method: 'POST',
+    headers: { 'x-api-key': apiKey, 'anthropic-version': '2023-06-01', 'content-type': 'application/json', 'anthropic-dangerous-direct-browser-access': 'true' },
+    body: JSON.stringify({ model: modelFor('smart'), max_tokens: 700, system: sys, messages: [{ role: 'user', content: text.slice(0, 2000) }] })
+  });
+  const data = await res.json();
+  let txt = extractText(data).trim(), obj = null;
+  try { obj = JSON.parse(txt); } catch {}
+  if (!obj) { const a = txt.indexOf('{'), b = txt.lastIndexOf('}'); if (a >= 0 && b > a) { try { obj = JSON.parse(txt.slice(a, b + 1)); } catch {} } }
+  return obj;
+}
+
+// Test it and record the verdict. Returns a line for the chat — plain English, no jargon, and
+// it always says which gate rejected it rather than just "no".
+async function testDroppedStrategy(text) {
+  const apiKey = localStorage.getItem('mc_key');
+  if (!apiKey) return 'I need your Claude API key in Settings before I can translate a strategy.';
+  const cand = await strategyFromText(apiKey, text);
+  if (!cand || cand.error) return `I could not turn that into a testable setup${cand && cand.error ? ' — ' + cand.error : ''}.`;
+  cand.stopAtr = +cand.stopAtr || 2; cand.targetR = +cand.targetR || 2;
+  const err = validateCandidate(cand);
+  if (err) return `That came out as an invalid candidate (${err}).`;
+
+  const coins = await discoveryUniverse();
+  const preps = [];
+  for (const coin of coins) {
+    try { const c = await fetchCryptoCandles(coin, cand.tf || '1D', 1000); if (c && c.length >= 300) { const pr = prepCoin(c); pr.coin = coin; preps.push(pr); } }
+    catch {}
+  }
+  if (preps.length < 3) return 'Not enough coin history loaded to test that right now — try again in a minute.';
+
+  const res = evaluateCandidate(preps, cand);
+  const keeps = candidateKeeps(res);
+  const b = res.breadth || { coins: 0, positive: 0, losers: [] };
+  cand.origin = 'chat';                                  // where it came from, kept for good
+  cand.sourceText = String(text).slice(0, 400);
+  cand.oos = res.oos.n ? { n: res.oos.n, winRate: +res.oos.winRate.toFixed(2), expectancy: +res.oos.expectancy.toFixed(2) } : null;
+  cand.is = res.is.n ? { n: res.is.n, expectancy: +res.is.expectancy.toFixed(2) } : null;
+  cand.breadth = b;
+  cand.discoveredAt = Date.now();
+
+  if (keeps) {
+    cand.status = 'live';
+    const all = getDiscovered(); all.push(cand); saveDiscovered(all);
+    refreshDiscoveredKB(); if (typeof renderLab === 'function') renderLab();
+    pushDiscLog({ t: Date.now(), proposed: 1, kept: 1, gridTested: 0, rejects: [], fromChat: cand.name });
+    return `Tested "${cand.name}" on ${preps.length} coins — it passed. Out-of-sample ${(res.oos.winRate*100).toFixed(0)}% win, ${res.oos.expectancy >= 0 ? '+' : ''}${res.oos.expectancy.toFixed(2)}R over ${res.oos.n} trades, profitable on ${b.positive}/${b.coins} coins${b.losers.length ? ` (lost on ${b.losers.join(', ')})` : ''}. It is now live in the Strategies list.` +
+      (cand.note ? ` One thing I could not express: ${cand.note}.` : '');
+  }
+  // Rejected — say why, and keep it out of the scanner. Logged either way so the same idea
+  // does not get re-tested every time it is mentioned.
+  pushDiscLog({ t: Date.now(), proposed: 1, kept: 0, gridTested: 0, rejects: [`${cand.name} (from chat) — ${keepFailReason(res)}`], fromChat: cand.name });
+  return `Tested "${cand.name}" on ${preps.length} coins — rejected: ${keepFailReason(res)}.` +
+    (res.oos && res.oos.n ? ` For the record: out-of-sample ${res.oos.expectancy >= 0 ? '+' : ''}${res.oos.expectancy.toFixed(2)}R over ${res.oos.n} trades${b.coins ? `, profitable on ${b.positive}/${b.coins} coins` : ''}.` : '') +
+    (cand.note ? ` Note: ${cand.note}.` : '') +
+    ' Not added to the scanner.';
+}
+
 async function proposeCandidates(apiKey, n) {
   const vocab = Object.entries(DISCOVERY_VOCAB).map(([k, v]) => `  ${k} — ${v}`).join('\n');
   const hr = feedHitRates().byDir, edges = backtestEdges();
