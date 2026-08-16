@@ -1606,6 +1606,215 @@ body.layout-edit #layout-bar { display:flex; flex-wrap:wrap; justify-content:cen
 <script>
 // ═══════════════════════════ KNOWLEDGE BASE ═══════════════════════════
 const BUILT_IN_KB = [
+  { id:'research_brief_2026_08', title:'Research brief — costs, sample size, exits, sizing, overfitting, decay', content:`# What actually matters now — a research brief for the Cipher system
+
+Written 2026-08-16, against your numbers, not general theory.
+
+---
+
+## 1. Costs — read this one first
+
+Your validated edge is +0.14R per trade (35% win rate exiting at 2.25R). That number came from
+a backtest. Backtests are free. Trading is not.
+
+The formula that matters:
+
+
+cost in R  ≈  (2 × fee%) ÷ stop%
+
+
+Because your position size is risk ÷ stop distance, a tighter stop means a *bigger* position, and
+fees are charged on position size. So the tighter your stop, the more of your R the fees eat.
+
+At Phemex taker fees (~0.06% each way) that works out as:
+
+| Stop distance | Round-trip fees | Cost in R | What's left of +0.14R |
+|---|---|---|---|
+| 0.5% | 0.12% | 0.24R | −0.10R — a losing system |
+| 1.0% | 0.12% | 0.12R | +0.02R — barely alive |
+| 2.0% | 0.12% | 0.06R | +0.08R |
+| 3.0% | 0.12% | 0.04R | +0.10R |
+
+Then funding on top. Perp funding runs roughly 0.01% per 8 hours in normal conditions. Hold a
+swing trade three days and that's another ~0.09% of position — on a 1% stop, another 0.09R.
+
+So on a 1% stop, holding three days, costs are around 0.2R against an edge of 0.14R.
+
+That is not a rounding error. That is the difference between a system that makes money and one
+that doesn't.
+
+### Three things that follow
+
+Your backtests almost certainly ignore this. Check. If they do, every expectancy number you
+have — including the +0.14R that justified moving to a 2R exit — is optimistic by roughly 0.1R.
+
+Tightening stops has a hidden cost. The structural stops we added on 15 Aug make stops tighter,
+which is good for R:R and bad for cost-per-R. Both are real. The net is probably still positive,
+but it should be measured rather than assumed.
+
+Maker vs taker is worth more than it sounds. Your entries currently cross 1% through the price
+to guarantee a fill — that's a taker order, top fee. Resting a limit at the zone (ENTRY_MODE=
+structure, already built and switched off) would be a *maker* order at roughly 0.01%, which is
+about a sixth of the cost. Better price and cheaper. That's now two independent arguments for the
+same change.
+
+---
+
+## 2. Expectancy and sample size — how long until you actually know
+
+Expectancy is the only number that matters:
+
+
+E  =  (win rate × average win)  −  (loss rate × average loss)
+
+
+Yours: (0.35 × 2.25) − (0.65 × 1) = +0.14R.
+
+This is why a 68% win rate can be a losing strategy and a 30% win rate can be a good one. Win rate
+alone tells you nothing.
+
+### The uncomfortable arithmetic
+
+Your per-trade outcomes are roughly +2.25R or −1R, which gives a standard deviation of about
+1.55R — eleven times the size of your edge. To be confident that a +0.14R edge is real and not
+luck, you need somewhere around:
+
+
+n  ≈  (1.96 × 1.55 ÷ 0.14)²  ≈  480 trades
+
+
+Roughly 500 trades. At your rate that's a long time.
+
+What that means practically:
+
+- 40–50 trades tells you if something is broken. Orders failing, stops missing, hedged pairs,
+  a strategy losing badly. That's worth having and it comes quickly.
+- It does not tell you the system works. A run of 50 trades at +0.3R average is entirely
+  consistent with a system whose true edge is zero.
+- Be equally sceptical of a bad early run. Fifty losing trades doesn't prove it's broken either.
+
+Don't let an early good stretch talk you into raising size. That's the exact moment the arithmetic
+is least on your side.
+
+---
+
+## 3. Exits — the biggest lever you haven't finished pulling
+
+You already proved this on your own data: same entries, exit at 1R and you make −0.30R per trade;
+exit at 2R and you make +0.14R. Nothing about the entries changed. The exit was worth 0.44R.
+
+Nothing else in the system has moved expectancy that much.
+
+Three families worth understanding:
+
+Fixed R. What you do now. Simple, testable, and it caps your winners. In a trending market
+that's expensive — the trades that would have run 6R get cut at 2.25.
+
+Trailing. Give back some of every winner in exchange for occasionally catching a very large
+one. Usually *lowers* win rate and *raises* expectancy. Worth testing against your fixed 2.25R on
+your own history — it's a straight comparison.
+
+Time stops. If a setup hasn't worked within N bars, the thesis has expired. Frees capital and
+cuts the slow bleed of positions that drift sideways paying funding. Cheap to test.
+
+The open question in your system: your target is currently arithmetic (2.25 × stop distance) while
+your stop is structural. One end of the trade looks at the chart and the other doesn't. Targets
+from structure — the next opposing zone or swing high — is the obvious next build.
+
+---
+
+## 4. Position sizing — how much, and why not more
+
+Kelly gives the mathematically optimal fraction of capital to risk:
+
+
+f  =  (p × (b+1) − 1) ÷ b
+
+
+At your numbers (p = 0.35, b = 2.25): f ≈ 6.1% of capital per trade.
+
+Nobody sane trades full Kelly. Reasons:
+
+- It assumes your edge estimate is exact. Yours is based on a sample far below the 500 above.
+- Overestimate your edge and full Kelly is *catastrophic*, not merely suboptimal.
+- Full-Kelly drawdowns of 50%+ are routine, not tail events. Almost nobody can hold through that.
+
+Standard practice is quarter Kelly — about 1.5% of capital here. On a £1,000 account that's
+£15 a trade. Your current £10 is slightly under that, which is the right side to be wrong on.
+
+Risk of ruin falls off a cliff as risk-per-trade rises. At 1% per trade with a positive edge
+it's negligible. At 6% it's a real possibility even with a genuine edge, purely from variance.
+
+When you get to your own money: the honest sequence is prove the edge, *then* size up. Not the
+reverse. Sizing multiplies whatever edge you have — including a negative one.
+
+---
+
+## 5. Overfitting — why your gates exist
+
+Your lab tests 520 variants. If none of them had any edge at all, and your gate passed a variant
+5% of the time by chance, you'd still expect around 26 "winners" — every one of them noise.
+
+This is the multiple-comparisons problem, and it's the single biggest reason retail systematic
+trading fails. It isn't that people can't find profitable backtests. It's that they can find them
+too easily.
+
+Your defences, and what each one buys:
+
+- Walk-forward split — proves it survives data it wasn't fitted on. Catches parameter fitting.
+- Cross-asset breadth (added 16 Aug) — proves it survives markets it wasn't *found* on.
+  Catches the pattern that only ever suited one coin.
+- Minimum sample and minimum expectancy — stops a hair-above-zero result on twelve trades.
+- Auto-retire on live record — the final judge, and the only one using data nobody fitted.
+
+What none of them fix: if you keep testing new families of ideas, you keep buying lottery tickets.
+The gates raise the price of a ticket, they don't make it free.
+
+The tell that you've overfit: the backtest is smooth and the live record isn't. Not "live is
+slightly worse" — that's normal and expected. A strategy that showed 0.5R in test and 0.0R live
+was probably never real.
+
+---
+
+## 6. Decay — how strategies die
+
+Edges are not permanent. They erode because other people find them, because the market's structure
+changes, or because the conditions that created them end.
+
+What decay looks like, in order of how early you can spot it:
+
+1. Same win rate, smaller R. Winners stop running as far. Usually the first sign, and the one
+   a win-rate-only dashboard completely misses.
+2. More time-stops, fewer clean resolutions. The setup fires and then nothing happens.
+3. Win rate falls. By this point it's obvious and you've paid for the lesson.
+
+Regime is the confounder. Most crypto strategies are secretly long-biased. A trend system that
+made money 2023–24 was in the strongest bull market in the asset's history — the strategy may have
+contributed nothing. That's exactly what the tradetest.ai example showed: +47.3% while Bitcoin did
++460%.
+
+Which means: test your strategies against buy-and-hold over the same period. If a long-only
+system underperforms simply holding, all your machinery is doing is generating fees. That check
+isn't in your lab yet, and it should be.
+
+The regime split we discussed in July — separating your record into trending and ranging periods —
+is what turns "it stopped working" into "it never worked in this regime".
+
+---
+
+## Where this leaves the roadmap
+
+In order of expected value:
+
+1. Model fees and funding in the backtests. Cheap, and it might change what you believe.
+2. Add buy-and-hold as a benchmark column. Equally cheap, and it's the honest test.
+3. Structural targets — finish what the structural stops started.
+4. Test trailing and time stops against your fixed 2.25R on your own history.
+5. Collect the sample. Nothing above needs the bot stopped; none of it changes live rules.
+
+And a general one: none of this is worth doing twice. Change one thing at a time, and keep the
+sample clean while you do it.
+` },
   { id:'tsla_playbook', title:'Tesla (TSLA) Event Playbook', content:`This user holds Tesla as a LARGE part of their portfolio. When reading TSLA charts or giving views, always factor in the event calendar and how the stock typically behaves around it.
 
 KEY SCHEDULED EVENTS (each can cause big gaps/volatility):
@@ -3579,7 +3788,7 @@ document.addEventListener('visibilitychange', () => { if (!document.hidden) clou
 // Keep paper-trade results fresh while the app is open (every 30 min) + once on load.
 
 // ═══════════════════════════ KNOWLEDGE BASE ═══════════════════════════
-const KB_VERSION = '7';
+const KB_VERSION = '8';   // 8 = research brief added 2026-08-16
 function mergeKB() {
   const storedVer = localStorage.getItem('mc_kb_ver');
   let kb = JSON.parse(localStorage.getItem('mc_kb2') || 'null') || [];
