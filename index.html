@@ -1348,6 +1348,14 @@ body.layout-edit #layout-bar { display:flex; flex-wrap:wrap; justify-content:cen
     </label>
     <button class="phone-btn" style="width:100%;margin-bottom:6px;" onclick="runDiscovery(true)">Run discovery now</button>
     <div id="lab-status" style="font-size:11px;color:var(--dim);margin-bottom:14px;min-height:14px;"></div>
+    <!-- ══ EVERY STRATEGY, ONE LIST (2026-08-16) ══
+         Built-in detectors and lab-discovered patterns were shown in different places, or not at
+         all, so there was no single answer to "what can this thing actually fire?" -->
+    <div style="display:flex;gap:6px;margin-bottom:10px;">
+      <button id="strat-tab-all"  class="phone-btn" style="flex:1;padding:5px 0;font-size:11px;" onclick="setStratTab('all')">ALL STRATEGIES</button>
+      <button id="strat-tab-lab"  class="phone-btn" style="flex:1;padding:5px 0;font-size:11px;" onclick="setStratTab('lab')">LAB ONLY</button>
+    </div>
+    <div id="strat-list" style="margin-bottom:16px;"></div>
     <div id="lab-list" style="margin-bottom:16px;"></div>
     <div style="font-size:11px;font-weight:700;color:var(--muted);margin-bottom:6px;">RECENT RUNS</div>
     <div id="lab-log"></div>
@@ -6877,9 +6885,38 @@ function evaluateCandidate(preps, cand) {
     const ti = runCandidateRange(p, cand, 60, split);
     const to = runCandidateRange(p, cand, split, p.n);
     isT = isT.concat(ti); oosT = oosT.concat(to);
-    per.push({ coin: p.coin || '?', n_is: ti.length, n_oos: to.length });
+    // Per-coin OOS expectancy, not just a trade count. Pooling hides the thing that matters:
+    // a pattern can clear the pooled gate on the strength of ONE coin it happens to suit.
+    const st = backtestStats(to);
+    per.push({ coin: p.coin || '?', n_is: ti.length, n_oos: to.length,
+               exp_oos: st.n ? +st.expectancy.toFixed(2) : null });
   }
-  return { ok: true, is: backtestStats(isT), oos: backtestStats(oosT), per };
+  return { ok: true, is: backtestStats(isT), oos: backtestStats(oosT), per, breadth: breadthOf(per) };
+}
+
+// ── CROSS-ASSET BREADTH (2026-08-16) ─────────────────────────────────────────────────────────
+// The walk-forward split proves a pattern survives on data it was not FITTED on. It does not
+// prove it survives on markets it was not FOUND on — and those are different claims. Pooling
+// every coin's trades into one number lets a pattern that works on exactly one coin pass, as
+// long as that coin fired often enough.
+//
+// So: count the coins where it actually traded enough to judge, and ask how many of them it made
+// money on. A real edge shows up in most of them. A curve-fit shows up in one.
+const BREADTH_MIN_TRADES = 5;   // per coin, out-of-sample, before that coin gets a vote
+const BREADTH_MIN_COINS  = 3;   // need at least this many coins with a vote
+const BREADTH_MIN_RATIO  = 0.6; // and this share of them must be profitable
+function breadthOf(per) {
+  const voting = per.filter(x => (x.n_oos || 0) >= BREADTH_MIN_TRADES && x.exp_oos !== null);
+  const winners = voting.filter(x => x.exp_oos > 0);
+  return {
+    coins: voting.length,
+    positive: winners.length,
+    ratio: voting.length ? +(winners.length / voting.length).toFixed(2) : 0,
+    // The honest columns: name the markets it LOST on, so a survivor is never mistaken for
+    // something that works everywhere.
+    losers: voting.filter(x => x.exp_oos <= 0).map(x => x.coin + ' ' + x.exp_oos.toFixed(2) + 'R'),
+    winnersList: winners.map(x => x.coin + ' +' + x.exp_oos.toFixed(2) + 'R'),
+  };
 }
 
 // A candidate is only a KEEPER if it holds up on data it wasn't built on.
@@ -6888,9 +6925,25 @@ function evaluateCandidate(preps, cand) {
 // expectancy edge — not a hair above zero — keep the survivors meaningful rather than numerous.
 const DISC_MIN_OOS = 25, DISC_MIN_EXP = 0.12;
 function candidateKeeps(res) {
-  return !!(res && res.ok && res.oos && res.is &&
-    res.oos.n >= DISC_MIN_OOS && res.oos.expectancy > DISC_MIN_EXP &&
-    res.is.n >= DISC_MIN_OOS && res.is.expectancy > 0);
+  if (!(res && res.ok && res.oos && res.is)) return false;
+  const timeOK = res.oos.n >= DISC_MIN_OOS && res.oos.expectancy > DISC_MIN_EXP &&
+                 res.is.n >= DISC_MIN_OOS && res.is.expectancy > 0;
+  if (!timeOK) return false;
+  // Must ALSO hold across markets, not just across time (2026-08-16).
+  const b = res.breadth || breadthOf(res.per || []);
+  return b.coins >= BREADTH_MIN_COINS && b.ratio >= BREADTH_MIN_RATIO;
+}
+// Why a candidate failed, in plain terms — so a near-miss on breadth reads differently from
+// a near-miss on expectancy.
+function keepFailReason(res) {
+  if (!(res && res.ok)) return 'could not be tested';
+  const b = res.breadth || breadthOf(res.per || []);
+  if (res.oos.n < DISC_MIN_OOS) return `only ${res.oos.n || 0} out-of-sample trades (need ${DISC_MIN_OOS})`;
+  if (!(res.oos.expectancy > DISC_MIN_EXP)) return `expectancy ${res.oos.expectancy.toFixed(2)}R (need > ${DISC_MIN_EXP})`;
+  if (!(res.is.expectancy > 0)) return 'lost money in-sample';
+  if (b.coins < BREADTH_MIN_COINS) return `only worked on ${b.coins} coin${b.coins===1?'':'s'} with enough trades to judge`;
+  if (b.ratio < BREADTH_MIN_RATIO) return `profitable on ${b.positive}/${b.coins} coins — lost on ${b.losers.join(', ')}`;
+  return 'passed';
 }
 
 // ════════════════ DISCOVERY — stage 2 (propose → judge → keep, automatic) ════════════════
@@ -7024,6 +7077,7 @@ async function runDiscovery(manual) {
     const keepCand = (cand, res) => {
       cand.oos = { n: res.oos.n, winRate: +res.oos.winRate.toFixed(2), expectancy: +res.oos.expectancy.toFixed(2) };
       cand.is = { n: res.is.n, expectancy: +res.is.expectancy.toFixed(2) };
+      cand.breadth = res.breadth;      // incl. the coins it LOST on — kept deliberately visible
       cand.discoveredAt = Date.now();
       cand.status = 'live';       // fully background: survivors go straight into the scanner; live failures bin themselves
       discovered.push(cand); haveKeys.add(discKey(cand)); kept++;
@@ -7049,7 +7103,7 @@ async function runDiscovery(manual) {
         keepCand(cand, res);
       } else if (res.ok) {
         const on = (res.oos && res.oos.n) || 0;
-        rejects.push(`${cand.name || discKey(cand)} [${cand.tf}] — OOS ${on} trades${on ? `, ${res.oos.expectancy >= 0 ? '+' : ''}${res.oos.expectancy.toFixed(2)}R` : ' (never fired)'}`);
+        rejects.push(`${cand.name || discKey(cand)} [${cand.tf}] — ${keepFailReason(res)}`);
       }
     }
     // ── mutation pass: the closest near-misses earn a free round of local variants (no API cost) ──
@@ -7168,8 +7222,77 @@ function labAutoRetire() {
   if (changed) { saveDiscovered(all); refreshDiscoveredKB(); }
 }
 
+// ═══════════════ STRATEGY REGISTER (2026-08-16) ═══════════════
+// One list of everything that can fire: the coded detectors and the lab's promoted patterns.
+// Deliberately shows expectancy in R next to win rate — a 68% win rate with a bad R is a losing
+// strategy, and a screen that shows only the percentage invites exactly that mistake.
+function stratTab() { return localStorage.getItem('mc_strat_tab') || 'all'; }
+function setStratTab(t) { localStorage.setItem('mc_strat_tab', t); renderStrategies(); }
+
+// Live record from graded auto-scan firings, matched on the detector's label.
+function liveRecordFor(label) {
+  const agg = patternStats();
+  const keys = Object.keys(agg).filter(k => k.toLowerCase().startsWith(String(label).toLowerCase()));
+  if (!keys.length) return null;
+  let w=0,l=0,c=0,sum=0,n=0;
+  keys.forEach(k => { const a=agg[k]; w+=a.w; l+=a.l; c+=a.c; sum+=a.sum; n+=a.n; });
+  const graded = w+l;
+  return { w, l, c, graded, hit: graded ? w/graded : null, avgPct: n ? sum/n : null };
+}
+
+function renderStrategies() {
+  const el = document.getElementById('strat-list'); if (!el) return;
+  const tab = stratTab();
+  ['all','lab'].forEach(t => { const b=document.getElementById('strat-tab-'+t);
+    if (b) { b.style.opacity = t===tab ? '1' : '.55'; b.style.fontWeight = t===tab ? '700' : '400'; } });
+
+  const row = (o) => {
+    const dirCol = o.dir==='short' ? 'var(--red)' : o.dir==='long' ? 'var(--green)' : 'var(--muted)';
+    let rec = '<span style="color:var(--dim);">no graded trades yet</span>';
+    if (o.record) rec = o.record;
+    return `<div style="border:1px solid var(--glass-b);border-radius:10px;padding:9px 10px;margin-bottom:7px;${o.paused?'opacity:.55;':''}">
+      <div style="display:flex;justify-content:space-between;gap:8px;align-items:baseline;">
+        <b style="font-size:12.5px;">${esc(o.name)}</b>
+        <span style="font-size:10.5px;color:${dirCol};font-weight:700;">${esc(String(o.dir||'any').toUpperCase())}</span>
+      </div>
+      <div style="font-size:10.5px;color:var(--muted);margin:3px 0;">${esc(o.meta)}</div>
+      <div style="font-size:11px;color:var(--dim);">${rec}</div>
+      ${o.losers ? `<div style="font-size:10.5px;color:var(--red);margin-top:3px;">lost on: ${esc(o.losers)}</div>` : ''}
+    </div>`;
+  };
+
+  // 1. the coded detectors — always available to the scanner
+  const built = Object.keys(PATTERN_DETECTORS).map(k => {
+    const d = PATTERN_DETECTORS[k]; const r = liveRecordFor(d.label);
+    return row({
+      name: d.label, dir: d.dir, meta: 'built-in detector · all timeframes scanned',
+      record: r && r.graded
+        ? `${r.w}W / ${r.l}L of ${r.graded} graded — ${(r.hit*100).toFixed(0)}% hit${r.avgPct!==null?`, avg ${r.avgPct>0?'+':''}${r.avgPct.toFixed(1)}% at 24–72h`:''}`
+        : null,
+    });
+  }).join('');
+
+  // 2. the lab's promoted patterns — with the columns they LOST on kept in view
+  const disc = getDiscovered().slice().reverse();
+  const lab = disc.map(p => {
+    const b = p.breadth;
+    return row({
+      name: p.name || discKey(p), dir: p.dir, paused: (p.status||'live')==='paused',
+      meta: `${esc(p.tf||'1D')} · stop ${p.stopAtr}×ATR · target ${p.targetR}R · ${p.mutatedFrom?'mutation':(p.origin==='grid'?'grid search':'brain idea')}${(p.status||'live')==='paused'?' · PAUSED':''}`,
+      record: p.oos ? `out-of-sample ${(p.oos.winRate*100).toFixed(0)}% win, ${p.oos.expectancy>=0?'+':''}${p.oos.expectancy}R over ${p.oos.n} trades${b?` · profitable on ${b.positive}/${b.coins} coins`:''}` : null,
+      losers: b && b.losers && b.losers.length ? b.losers.join(', ') : null,
+    });
+  }).join('');
+
+  const head = t => `<div style="font-size:11px;font-weight:700;color:var(--muted);margin:12px 0 6px;">${t}</div>`;
+  el.innerHTML = tab === 'lab'
+    ? (lab ? head('LAB-DISCOVERED') + lab : '<div style="font-size:12px;color:var(--dim);">Nothing promoted yet — the gate rejects most ideas, which is the point.</div>')
+    : head('BUILT-IN DETECTORS') + built + (lab ? head('LAB-DISCOVERED') + lab : '');
+}
+
 function renderLab() {
   const auto = document.getElementById('lab-auto'); if (auto) auto.checked = discoveryAuto();
+  try { renderStrategies(); } catch (e) { console.error('strategy list:', e); }
   const d = getDiscovered(), list = document.getElementById('lab-list');
   const sect = t => `<div style="font-size:11px;font-weight:700;color:var(--muted);margin:14px 0 6px;">${t}</div>`;
   const card = (p, live) => {
