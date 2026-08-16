@@ -1,0 +1,316 @@
+# ═══════════════════════════════════════════════════════════════════════════════
+#  CIPHER BACKTEST DATA — downloads the history the full-system backtest runs on
+#
+#  Upload this file to your repo at:  .github/workflows/cipher-backtest-data.yml
+#
+#  IT STARTS ITSELF. Committing this file triggers the run — there is no button to find
+#  and no form to fill in. That is deliberate: GitHub's "Run workflow" panel loads its
+#  input boxes over the network and was failing with "Uh oh! There was an error while
+#  loading", which left no way to start it. A push trigger needs none of that.
+#
+#  It takes about 10–20 minutes. When it finishes, the candle and funding history is
+#  committed to your repo under backtest-data/ and nothing else has changed.
+#
+#  To run it again later: Actions → Cipher Backtest Data → Run workflow. There are no
+#  inputs now, so that panel has almost nothing to load. To change the range or the coin
+#  list, edit the SETTINGS block below and commit — which also re-runs it.
+#
+#  Where the data comes from: Binance's own public archive, data.binance.vision. Not the
+#  live API — the archive, because it serves USDⓈ-M PERPETUAL futures candles (the actual
+#  instrument the bot trades, not spot) and the REALISED funding rate for every 8-hourly
+#  settlement, which no candle API gives you. It is also a plain file host, so GitHub's US
+#  runners are not geo-blocked from it the way they are from api.binance.com.
+#
+#  NOTHING HERE TOUCHES TRADING. No keys, no orders, no contact with Phemex. It downloads
+#  files and commits them. The trading agent is a different workflow and is unaffected.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+name: Cipher Backtest Data
+
+on:
+  # Committing this file starts it. No button, no form.
+  push:
+    paths:
+      - ".github/workflows/cipher-backtest-data.yml"
+  # And a plain manual re-run, with no inputs to load.
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+# ── SETTINGS ──────────────────────────────────────────────────────────────────
+#  FROM   first month of history. Earlier = longer warm-up AND more tested period.
+#  TO     leave empty for "the last complete month".
+#  TFS    add 30m to unlock 30m divergences; roughly doubles the download.
+#  COINS  the agent's own whitelist.
+env:
+  FROM: "2023-08"
+  TO: ""
+  TFS: "1d,4h,1h"
+  COINS: "BTC,ETH,SOL,XRP,BNB,DOGE,ADA,LINK,AVAX,DOT,LTC,BCH,UNI,ATOM,NEAR,APT,ARB,OP,SUI,TON,TRX,POL,FIL,INJ,AAVE"
+  OUT_DIR: backtest-data
+
+concurrency:
+  group: cipher-backtest-data
+  cancel-in-progress: false
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Write the fetcher
+        run: |
+          mkdir -p .cipher-tools
+          cat > .cipher-tools/fetch-history.mjs <<'CIPHER_SCRIPT_EOF'
+          #!/usr/bin/env node
+          // ═══════════════════════════════════════════════════════════════════════════════════════════════
+          //  FETCH HISTORY — pulls the candle and funding history the backtest runs on
+          //
+          //  Runs on a GitHub Actions runner, which has open internet. Source is Binance's own public
+          //  data archive (data.binance.vision) rather than the live REST API, because:
+          //
+          //    · it serves USDⓈ-M PERPETUAL futures candles — the actual instrument, not spot
+          //    · it serves the REALISED FUNDING RATE for every 8h settlement, which no candle API gives
+          //    · it is a static file host, so there is no rate limit to nurse and no geo-block on
+          //      GitHub's US runners (which is what stops api.binance.com working from Actions)
+          //
+          //  Output: one gzipped JSON per coin in backtest-data/, committed back to the repo.
+          //  Re-running extends or refreshes it; already-downloaded months are cached in the runner only,
+          //  so a re-run costs bandwidth but never correctness.
+          // ═══════════════════════════════════════════════════════════════════════════════════════════════
+          import fs from "node:fs";
+          import path from "node:path";
+          import zlib from "node:zlib";
+          import { execFileSync } from "node:child_process";
+
+          const BASE = "https://data.binance.vision/data/futures/um/monthly";
+          const OUT = process.env.OUT_DIR || "backtest-data";
+          const TMP = "/tmp/binance-zips";
+
+          const COINS = (process.env.COINS ||
+            "BTC,ETH,SOL,XRP,BNB,DOGE,ADA,LINK,AVAX,DOT,LTC,BCH,UNI,ATOM,NEAR,APT,ARB,OP,SUI,TON,TRX,POL,FIL,INJ,AAVE"
+          ).split(",").map(s => s.trim().toUpperCase()).filter(Boolean);
+
+          const TFS = (process.env.TFS || "1d,4h,1h,30m").split(",").map(s => s.trim());
+          const FROM = process.env.FROM || "2023-08";     // includes the warm-up period
+          const TO = process.env.TO || lastCompleteMonth();
+
+          // Our timeframe names vs Binance's.
+          const TF_OUT = { "1d": "1D", "4h": "4H", "1h": "1H", "30m": "30m", "15m": "15m" };
+
+          function lastCompleteMonth() {
+            const d = new Date();
+            d.setUTCDate(1); d.setUTCMonth(d.getUTCMonth() - 1);
+            return d.toISOString().slice(0, 7);
+          }
+          function months(from, to) {
+            const out = [];
+            let [y, m] = from.split("-").map(Number);
+            const [ty, tm] = to.split("-").map(Number);
+            while (y < ty || (y === ty && m <= tm)) {
+              out.push(`${y}-${String(m).padStart(2, "0")}`);
+              m++; if (m > 12) { m = 1; y++; }
+            }
+            return out;
+          }
+
+          // Binance switched some archives from millisecond to MICROSECOND timestamps during 2025.
+          // A silent 1000x error in the time axis would shuffle every bar into the wrong window, so this
+          // is normalised explicitly rather than assumed.
+          function toMs(v) {
+            const n = Number(v);
+            if (!Number.isFinite(n)) return NaN;
+            return n > 1e14 ? Math.round(n / 1000) : n;
+          }
+
+          async function getZip(url, dest) {
+            if (fs.existsSync(dest)) return true;
+            const r = await fetch(url);
+            if (r.status === 404) return false;
+            if (!r.ok) throw new Error(url + " → HTTP " + r.status);
+            const buf = Buffer.from(await r.arrayBuffer());
+            fs.writeFileSync(dest, buf);
+            return true;
+          }
+
+          function unzipToText(zipPath) {
+            return execFileSync("unzip", ["-p", zipPath], { maxBuffer: 1 << 28 }).toString("utf8");
+          }
+
+          function parseKlines(csv) {
+            const out = [];
+            for (const line of csv.split("\n")) {
+              if (!line) continue;
+              const f = line.split(",");
+              const t = toMs(f[0]);
+              if (!Number.isFinite(t)) continue;            // header row
+              const o = +f[1], h = +f[2], l = +f[3], c = +f[4], v = +f[5];
+              if (![o, h, l, c].every(Number.isFinite)) continue;
+              out.push({ t, o, h, l, c, v: Number.isFinite(v) ? v : 0 });
+            }
+            return out;
+          }
+
+          function parseFunding(csv) {
+            const out = [];
+            for (const line of csv.split("\n")) {
+              if (!line) continue;
+              const f = line.split(",");
+              const t = toMs(f[0]);
+              const rate = parseFloat(f[f.length - 1]);
+              if (!Number.isFinite(t) || !Number.isFinite(rate)) continue;
+              out.push({ t, rate });
+            }
+            return out;
+          }
+
+          // ── Sanity checks that must run BEFORE this data is allowed anywhere near a backtest ──────────
+          function auditSeries(coin, tf, bars, expectMs) {
+            const issues = [];
+            if (!bars.length) return { issues: ["empty"], gaps: 0, dupes: 0 };
+            let gaps = 0, dupes = 0, backwards = 0, badOHLC = 0;
+            for (let i = 1; i < bars.length; i++) {
+              const d = bars[i].t - bars[i - 1].t;
+              if (d === 0) dupes++;
+              else if (d < 0) backwards++;
+              else if (d !== expectMs) gaps++;
+            }
+            for (const b of bars) {
+              if (!(b.h >= b.l && b.h >= b.o && b.h >= b.c && b.l <= b.o && b.l <= b.c) || b.l <= 0) badOHLC++;
+            }
+            if (backwards) issues.push(backwards + " out-of-order bars");
+            if (dupes) issues.push(dupes + " duplicate timestamps");
+            if (badOHLC) issues.push(badOHLC + " impossible OHLC bars");
+            if (gaps > bars.length * 0.02) issues.push(gaps + " gaps (>2%)");
+            return { issues, gaps, dupes, backwards, badOHLC };
+          }
+
+          function dedupeSort(bars) {
+            bars.sort((a, b) => a.t - b.t);
+            const out = [];
+            for (const b of bars) if (!out.length || out[out.length - 1].t !== b.t) out.push(b);
+            return out;
+          }
+
+          const TF_MS = { "1D": 864e5, "4H": 144e5, "1H": 36e5, "30m": 1.8e6, "15m": 9e5 };
+
+          async function pool(jobs, size) {
+            let i = 0;
+            const workers = Array.from({ length: Math.min(size, jobs.length) }, async () => {
+              while (i < jobs.length) { const j = jobs[i++]; await j(); }
+            });
+            await Promise.all(workers);
+          }
+
+          async function main() {
+            fs.mkdirSync(OUT, { recursive: true });
+            fs.mkdirSync(TMP, { recursive: true });
+            const MONTHS = months(FROM, TO);
+            console.log(`fetching ${COINS.length} coins x ${TFS.length} timeframes x ${MONTHS.length} months (${FROM} → ${TO})`);
+
+            const manifest = { builtAt: new Date().toISOString(), source: BASE, from: FROM, to: TO,
+                               tfs: TFS.map(t => TF_OUT[t]), coins: {} };
+
+            for (const coin of COINS) {
+              const sym = coin + "USDT";
+              const rec = { coin, tfs: {}, funding: [] };
+              const cov = {};
+
+              for (const tf of TFS) {
+                const all = [];
+                let got = 0, missing = 0;
+                // 3,600 sequential downloads would take most of an hour of runner time. Eight at a time
+                // keeps it to a few minutes and is well inside what a static file host expects.
+                const jobs = MONTHS.map((mo) => async () => {
+                  const name = `${sym}-${tf}-${mo}.zip`;
+                  const dest = path.join(TMP, name);
+                  let have = false;
+                  try { have = await getZip(`${BASE}/klines/${sym}/${tf}/${name}`, dest); }
+                  catch (e) { console.warn("  " + name + ": " + e.message); }
+                  if (!have) { missing++; return; }
+                  got++;
+                  try { all.push(...parseKlines(unzipToText(dest))); } catch (e) { console.warn("  unzip " + name + ": " + e.message); }
+                });
+                await pool(jobs, 8);
+                const bars = dedupeSort(all);
+                const outTf = TF_OUT[tf];
+                const audit = auditSeries(coin, outTf, bars, TF_MS[outTf]);
+                rec.tfs[outTf] = bars.map(b => [b.t, b.o, b.h, b.l, b.c, b.v]);
+                cov[outTf] = { bars: bars.length, monthsPresent: got, monthsMissing: missing,
+                               first: bars.length ? new Date(bars[0].t).toISOString().slice(0, 10) : null,
+                               last: bars.length ? new Date(bars[bars.length - 1].t).toISOString().slice(0, 10) : null,
+                               ...audit };
+                console.log(`  ${coin} ${outTf}: ${bars.length} bars, ${got}/${MONTHS.length} months` +
+                            (audit.issues.length ? "  ⚠ " + audit.issues.join("; ") : ""));
+              }
+
+              // Realised funding — the number that decides whether a multi-day hold is viable.
+              const fund = [];
+              let fGot = 0;
+              await pool(MONTHS.map((mo) => async () => {
+                const name = `${sym}-fundingRate-${mo}.zip`;
+                const dest = path.join(TMP, name);
+                let have = false;
+                try { have = await getZip(`${BASE}/fundingRate/${sym}/${name}`, dest); } catch { }
+                if (!have) return;
+                fGot++;
+                try { fund.push(...parseFunding(unzipToText(dest))); } catch { }
+              }), 8);
+              fund.sort((a, b) => a.t - b.t);
+              rec.funding = fund.map(f => [f.t, f.rate]);
+              const rates = fund.map(f => f.rate);
+              cov.funding = { settlements: fund.length, monthsPresent: fGot,
+                              meanRate: rates.length ? +(rates.reduce((a, b) => a + b, 0) / rates.length).toFixed(8) : null,
+                              annualisedPct: rates.length ? +(rates.reduce((a, b) => a + b, 0) / rates.length * 3 * 365 * 100).toFixed(2) : null };
+              console.log(`  ${coin} funding: ${fund.length} settlements, mean ${cov.funding.meanRate} (${cov.funding.annualisedPct}%/yr annualised)`);
+
+              manifest.coins[coin] = cov;
+              const file = path.join(OUT, coin + ".json.gz");
+              fs.writeFileSync(file, zlib.gzipSync(Buffer.from(JSON.stringify(rec)), { level: 9 }));
+              console.log(`  → ${file} (${(fs.statSync(file).size / 1e6).toFixed(2)} MB)`);
+            }
+
+            fs.writeFileSync(path.join(OUT, "manifest.json"), JSON.stringify(manifest, null, 1));
+            console.log("\nwrote manifest.json");
+          }
+
+          // Exported so the parsing and auditing can be tested without a network. Binance's archive has
+          // changed column layout and timestamp units before now; a silent misparse would corrupt every
+          // number downstream, so these get their own tests.
+          export { toMs, parseKlines, parseFunding, auditSeries, dedupeSort, months, unzipToText };
+
+          const invokedDirectly = process.argv[1] && process.argv[1].endsWith("fetch-history.mjs");
+          if (invokedDirectly) main().catch(e => { console.error(e); process.exit(1); });
+
+          CIPHER_SCRIPT_EOF
+
+      - name: Download candles and funding
+        run: |
+          if [ -z "$TO" ]; then unset TO; fi
+          echo "range $FROM → ${TO:-last complete month}, timeframes $TFS"
+          node .cipher-tools/fetch-history.mjs
+
+      - name: Size report
+        run: |
+          du -sh backtest-data
+          ls -la backtest-data | head -40
+
+      - name: Commit the data
+        run: |
+          rm -rf .cipher-tools
+          git config user.name "cipher-backtest-data"
+          git config user.email "actions@github.com"
+          git add -A backtest-data
+          if git diff --cached --quiet; then
+            echo "no change"
+          else
+            git commit -m "backtest data: $(date -u +%Y-%m-%d) [skip ci]"
+            git push
+          fi
