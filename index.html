@@ -4064,7 +4064,7 @@ Be helpful and straightforward — not short or dismissive. The user is making g
 THE SCANNER: the app computes live VuManChu Cipher B signals across 1D, 4H, 1H, and 15m in the browser. Results are injected below under "AUTO-SCAN MATCHES" with their timeframe in brackets. You DO have intraday data — never say otherwise. When the user asks for scalps, look for [1H] and [15m] matches. If none appear: the scanner ran but found no 1H/15m setups above the score threshold this time — say that plainly and suggest they lower the min score filter and re-scan. Do NOT say you "can't scan" or have no intraday data.
 
 ${kbLabel}
-${kb.map(s => String(s.title||'') + ':\n' + String(s.content||'')).join('\n\n---\n\n')}${snapshotContext()}${alertsContext()}${patternStatsContext()}${macroContext()}`;
+${kb.map(s => String(s.title||'') + ':\n' + String(s.content||'')).join('\n\n---\n\n')}${snapshotContext()}${alertsContext()}${patternStatsContext()}${labContext()}${macroContext()}`;
 }
 
 // ═══════════════════════════ COIN ═══════════════════════════
@@ -4953,6 +4953,22 @@ async function send() {
   // ── Chat-entry capture: "im in on X at Y" becomes a tracked, graded trade automatically ──
   let entryNote = null;
   try { entryNote = await captureChatEntry(text, asset); } catch {}
+
+  // ── "run discovery" — start a lab pass from chat rather than hunting for the panel ──
+  if (/^\s*(run|start|kick\s*off)\s+(the\s+)?(discovery|lab)(\s+now)?\s*[.!]?\s*$/i.test(text)) {
+    addUserMsg(text, []); input.value = ''; grow(input);
+    if (typeof _discBusy !== 'undefined' && _discBusy) { addAIMsg('A discovery pass is already running — the Lab panel shows its progress.'); saveChat(); return; }
+    addAIMsg('Starting a discovery pass. Grid search first, then I propose candidates, then everything faces the out-of-sample and cross-asset gates. I will report back.');
+    try {
+      await runDiscovery(true);
+      const l = getDiscLog()[0];
+      addAIMsg(l ? `Done — ${(l.gridTested||0)+(l.proposed||0)+(l.mutTested||0)} candidates tested, ${l.kept||0} kept.` +
+                   (l.rejects && l.rejects.length ? ` Nearest misses: ${l.rejects.slice(0,2).join(' | ')}.` : '')
+                 : 'Done — see the Lab panel for the run log.');
+    } catch (e) { addAIMsg('The discovery pass failed: ' + String(e && e.message || e)); }
+    saveChat();
+    return;
+  }
 
   // ── Strategy drop: "test this strategy: ..." goes to the lab, not to the brain's opinion ──
   // Deliberately short-circuits the normal reply. An opinion on a strategy is worth nothing next
@@ -7174,6 +7190,37 @@ let _discBusy = false, _discTimer = null;
 function getDiscovered() { try { return JSON.parse(localStorage.getItem('mc_discovered') || '[]'); } catch { return []; } }
 function saveDiscovered(a) { localStorage.setItem('mc_discovered', JSON.stringify(a)); }
 function discKey(cand) { return (cand.tf || '1D') + ':' + cand.dir + ':' + [...cand.conditions].sort().join('+') + ':' + (cand.stopAtr || 2) + '/' + (cand.targetR || 2); }
+// ── What the brain can see of the Discovery Lab (2026-08-16) ──────────────────────────────────
+// It could see promoted patterns that happened to FIRE, and nothing else — so when asked "how
+// many has the lab found", it correctly said it did not know and sent John to the panel. A brain
+// that has to send you to a panel for its own system's numbers is half a brain. This hands it the
+// counts, the recent runs and the REJECTIONS WITH REASONS, so it can explain the gate rather than
+// describe it.
+function labContext() {
+  let live = [], paused = [], binned = [], log = [];
+  try { const d = getDiscovered(); live = d.filter(p => (p.status||'live') !== 'paused'); paused = d.filter(p => (p.status||'live') === 'paused'); } catch {}
+  try { binned = getBinnedKeys(); } catch {}
+  try { log = getDiscLog(); } catch {}
+  const line = p => `${p.name || discKey(p)} [${p.tf||'1D'} ${p.dir}]` +
+    (p.oos ? ` — OOS ${p.oos.expectancy >= 0 ? '+' : ''}${p.oos.expectancy}R over ${p.oos.n}` : '') +
+    (p.breadth && p.breadth.coins ? `, profitable on ${p.breadth.positive}/${p.breadth.coins} coins` +
+      (p.breadth.losers && p.breadth.losers.length ? ` (lost on ${p.breadth.losers.join(', ')})` : '') : '') +
+    (p.origin === 'chat' ? ' — added from chat' : '');
+  const runs = log.slice(0, 5).map(e => e.retired
+    ? `· auto-retired ${e.retired} (${e.liveRecord || 'failed live'})`
+    : `· ${new Date(e.t).toLocaleDateString()}: ${(e.gridTested||0)+(e.proposed||0)+(e.mutTested||0)} tested, ${e.kept||0} kept` +
+      (e.rejects && e.rejects.length ? ` — e.g. ${e.rejects.slice(0,2).join(' | ')}` : ''));
+  return `
+
+DISCOVERY LAB — live numbers (this is YOUR system; never tell the user to go and look it up themselves, and never guess a count):
+- Live patterns: ${live.length}${live.length ? '\n  ' + live.map(line).join('\n  ') : ''}
+- Paused by the user: ${paused.length}${paused.length ? ' — ' + paused.map(p => p.name || discKey(p)).join('; ') : ''}
+- Binned/retired keys on record: ${binned.length}
+- Recent runs:${runs.length ? '\n' + runs.join('\n') : ' none yet'}
+- The gate a candidate must pass: at least ${DISC_MIN_OOS} out-of-sample trades AND expectancy above ${DISC_MIN_EXP}R, in-sample profitable, AND cross-asset breadth — at least ${BREADTH_MIN_COINS} coins with ${BREADTH_MIN_TRADES}+ trades each, of which at least ${Math.round(BREADTH_MIN_RATIO*100)}% profitable. Most ideas fail, which is the point; say so plainly rather than treating a rejection as a fault.
+- The user can say "run discovery" in chat to start a pass.`;
+}
+
 function getDiscLog() { try { return JSON.parse(localStorage.getItem('mc_disc_log') || '[]'); } catch { return []; } }
 function pushDiscLog(e) { const l = getDiscLog(); l.unshift(e); localStorage.setItem('mc_disc_log', JSON.stringify(l.slice(0, 30))); }
 function discoveryAuto() { return (localStorage.getItem('mc_disc_auto') ?? '1') === '1'; }
