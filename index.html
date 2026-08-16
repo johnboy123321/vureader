@@ -6885,8 +6885,16 @@ const DISCOVERY_VOCAB = {
   trendDown:    'Close below the 50 EMA',
   rsiBelow30:   'RSI below 30',
   rsiBelow40:   'RSI below 40',
+  rsiBelow50:   'RSI below 50 (momentum with the sellers)',
+  rsiBelow60:   'RSI below 60 — room left before overbought, the classic trend-entry filter',
+  rsiAbove40:   'RSI above 40 (in an uptrend RSI often bottoms near 40, not 30)',
+  rsiAbove50:   'RSI above 50 (momentum with the buyers)',
   rsiAbove60:   'RSI above 60',
   rsiAbove70:   'RSI above 70',
+  rsiCrossUp50: 'RSI crossed UP through 50 on this bar — momentum regime flip',
+  rsiCrossDn50: 'RSI crossed DOWN through 50 on this bar',
+  rsiDivBull:   'Bullish RSI divergence — price made a lower low, RSI made a higher low',
+  rsiDivBear:   'Bearish RSI divergence — price made a higher high, RSI made a lower high',
   volAboveAvg:  'Volume ≥ 1.2× its recent average',
   volSpike:     'Volume ≥ 1.8× its recent average',
   bullFvg:      'Bullish fair-value gap formed within the last 3 bars (low above the high from 2 bars earlier)',
@@ -6948,7 +6956,14 @@ const DISC_CONTRA = [
   ['ribbonUp','ema21Below50'],['ribbonDown','ema21Above50'],['volDry','volSpike'],['volDry','volAboveAvg'],
   ['rangeHigh','breakdown20'],['rangeLow','breakout20'],
   ['vwapUp','vwapDown'],['vwapCrossUp','vwapCrossDown'],['vwapUp','vwapCrossDown'],['vwapDown','vwapCrossUp'],
-  ['rollUp','rollDown'],['rollUp','crossDown'],['rollDown','crossUp']
+  ['rollUp','rollDown'],['rollUp','crossDown'],['rollDown','crossUp'],
+  // RSI states that cannot be true together, or that fight each other
+  ['rsiBelow30','rsiAbove40'],['rsiBelow30','rsiAbove50'],['rsiBelow30','rsiAbove60'],['rsiBelow30','rsiAbove70'],
+  ['rsiBelow40','rsiAbove40'],['rsiBelow40','rsiAbove50'],['rsiBelow40','rsiAbove60'],['rsiBelow40','rsiAbove70'],
+  ['rsiBelow50','rsiAbove50'],['rsiBelow50','rsiAbove60'],['rsiBelow50','rsiAbove70'],
+  ['rsiBelow60','rsiAbove60'],['rsiBelow60','rsiAbove70'],
+  ['rsiCrossUp50','rsiCrossDn50'],['rsiCrossUp50','rsiBelow50'],['rsiCrossDn50','rsiAbove50'],
+  ['rsiDivBull','rsiDivBear'],['rsiDivBull','rsiAbove70'],['rsiDivBear','rsiBelow30']
 ];
 function condsContradict(list) { return DISC_CONTRA.some(([a, b]) => list.includes(a) && list.includes(b)); }
 
@@ -6960,6 +6975,7 @@ function discoveryFeatures(c) {
   const closes = c.map(x => x.c), e50 = emaArr(closes, 50), e21 = emaArr(closes, 21), atr = atrArr(c, 14);
   const e200 = emaArr(closes, 200);                       // long-trend context (v3 vocabulary)
   const wtPivHi = wtPivots(wt2, 'high'), wtPivLo = wtPivots(wt2, 'low'); // for the divergence tokens
+  const rsiPivHi = wtPivots(rsi, 'high'), rsiPivLo = wtPivots(rsi, 'low'); // same pivot finder, RSI series
   const vw = wt1.map((v, k) => v - wt2[k]);              // VuManChu VWAP wave (yellow), leads the dots
   const F = {}; for (const k in DISCOVERY_VOCAB) F[k] = new Array(n).fill(false);
   let lastLo = null, prevLo = null, lastHi = null, prevHi = null;
@@ -6972,8 +6988,13 @@ function discoveryFeatures(c) {
     F.greenDot[i] = cu && F.wtOversold[i];    F.redDot[i] = cd && F.wtOverbought[i];
     F.mfPositive[i] = mf[i] > 0;              F.mfNegative[i] = mf[i] < 0;
     F.trendUp[i] = closes[i] > e50[i];        F.trendDown[i] = closes[i] < e50[i];
-    const rv = rsi[i];
-    F.rsiBelow30[i] = rv < 30; F.rsiBelow40[i] = rv < 40; F.rsiAbove60[i] = rv > 60; F.rsiAbove70[i] = rv > 70;
+    const rv = rsi[i], rp = rsi[i - 1];
+    F.rsiBelow30[i] = rv < 30; F.rsiBelow40[i] = rv < 40; F.rsiBelow50[i] = rv < 50; F.rsiBelow60[i] = rv < 60;
+    F.rsiAbove40[i] = rv > 40; F.rsiAbove50[i] = rv > 50; F.rsiAbove60[i] = rv > 60; F.rsiAbove70[i] = rv > 70;
+    // The 50 line is RSI's regime marker — above it buyers own the average bar, below it sellers do.
+    // A CROSS is a different event from simply being on one side, so both are available.
+    F.rsiCrossUp50[i] = Number.isFinite(rp) && rp <= 50 && rv > 50;
+    F.rsiCrossDn50[i] = Number.isFinite(rp) && rp >= 50 && rv < 50;
     const vx = volRatio(c, i);
     F.volAboveAvg[i] = Number.isFinite(vx) && vx >= 1.2; F.volSpike[i] = Number.isFinite(vx) && vx >= 1.8;
     // ── price-action tokens (discovery v2) ──
@@ -7031,6 +7052,18 @@ function discoveryFeatures(c) {
       if (ls.length === 2 && i - ls[1] <= 12) {
         const [pa, pb] = ls;
         if (c[pb].l < c[pa].l && wt2[pb] > wt2[pa] + 1) F.bullDiv[i] = true;
+      }
+      // Same test on RSI. WaveTrend and RSI disagree often enough to be different signals —
+      // WT is fast and noisy, RSI is slower and turns later, so a divergence on one is not a
+      // divergence on the other. The gate decides which (if either) is worth anything here.
+      const rhs = rsiPivHi.filter(p => p <= i - 2).slice(-2), rls = rsiPivLo.filter(p => p <= i - 2).slice(-2);
+      if (rhs.length === 2 && i - rhs[1] <= 12) {
+        const [pa, pb] = rhs;
+        if (c[pb].h > c[pa].h && rsi[pb] < rsi[pa] - 1) F.rsiDivBear[i] = true;
+      }
+      if (rls.length === 2 && i - rls[1] <= 12) {
+        const [pa, pb] = rls;
+        if (c[pb].l < c[pa].l && rsi[pb] > rsi[pa] + 1) F.rsiDivBull[i] = true;
       }
     }
     // Range position over 60 bars + golden pocket of the dominant leg
