@@ -7398,6 +7398,35 @@ async function testDroppedStrategy(text) {
     ' Not added to the scanner.';
 }
 
+// ── What the lab reads from your knowledge base (2026-08-16) ─────────────────────────────────
+// John: "there's no point teaching the bot all these techniques if they just get logged and
+// that's that." Quite. Saved videos and notes fed the brain's CHAT answers but never reached the
+// lab, so watching three videos on RSI changed what the app SAID and nothing about what it TESTED.
+//
+// This hands the proposal step the material — trimmed, newest first, and capped so a long
+// transcript cannot crowd out the instructions that follow it.
+const LAB_KB_BUDGET = 7000;
+function labKnowledgeDigest() {
+  const wanted = s => { const id = s.id || ''; return /^(yt_|vid_|krown_|transcript_|u_)/.test(id); };
+  let kb = [];
+  try { kb = getKB().filter(wanted).sort((a, b) => (b.ts || 0) - (a.ts || 0)); } catch { return ''; }
+  if (!kb.length) return '';
+  const out = []; let used = 0;
+  for (const sec of kb) {
+    const body = String(sec.content || '').replace(/\s+/g, ' ').trim();
+    if (!body) continue;
+    const share = Math.max(400, Math.floor(LAB_KB_BUDGET / Math.min(kb.length, 6)));
+    const clip = body.slice(0, share);
+    if (used + clip.length > LAB_KB_BUDGET) break;
+    used += clip.length;
+    out.push(`[${sec.id}] ${String(sec.title || 'note').slice(0, 80)}: ${clip}`);
+  }
+  return out.length ? `
+
+WHAT THE USER HAS BEEN STUDYING (their own saved videos and notes — draw real techniques from this, do not just restate the vocabulary list). Cite the [id] you used in the "source" field so the technique can be traced back:
+${out.join('\n\n')}` : '';
+}
+
 async function proposeCandidates(apiKey, n) {
   const vocab = Object.entries(DISCOVERY_VOCAB).map(([k, v]) => `  ${k} — ${v}`).join('\n');
   const hr = feedHitRates().byDir, edges = backtestEdges();
@@ -7408,8 +7437,10 @@ Use ONLY these condition tokens (a setup fires when ALL its conditions are true 
 ${vocab}
 
 Return STRICT JSON only — an array of up to ${n} objects, no prose or markdown:
-[{"name":"short label","dir":"long","tf":"1D","conditions":["greenDot","trendUp"],"stopAtr":2,"targetR":2,"rationale":"one line"}]
-Rules: 1-4 conditions all from the list; tf is "1D" or "4H" (mix both across your proposals); stopAtr 0.5-4; targetR 1-4; keep conditions self-consistent (never combine contradictory tokens like trendUp+trendDown, oversold+overbought, mfPositive+mfNegative, higherLow+lowerHigh, bullFvg+bearFvg). Prefer combinations not already tested, and lean on the price-action tokens (FVGs, swing structure, breakouts, wicks, engulfing) — they are new and underexplored.`;
+[{"name":"short label","dir":"long","tf":"1D","conditions":["greenDot","trendUp"],"stopAtr":2,"targetR":2,"rationale":"one line","source":"[yt_abc123] or 'own idea'"}]
+Rules: 1-4 conditions all from the list; tf is "1D" or "4H" (mix both across your proposals); stopAtr 0.5-4; targetR 1-4; keep conditions self-consistent (never combine contradictory tokens like trendUp+trendDown, oversold+overbought, mfPositive+mfNegative, higherLow+lowerHigh, bullFvg+bearFvg). Prefer combinations not already tested, and lean on the price-action tokens (FVGs, swing structure, breakouts, wicks, engulfing) — they are new and underexplored.
+
+If the user's saved study material below describes a technique you CAN express in these tokens, propose it — that is the whole point of them saving it. Translate faithfully rather than loosely: if a video's method cannot be expressed, do not bend it into something else and claim it came from there. Say "own idea" in source instead.${labKnowledgeDigest()}`;
   const usr = `Evidence so far:
 - Live track record: longs ${hr.long.n ? Math.round(100 * hr.long.w / hr.long.n) + '% of ' + hr.long.n : 'n/a'}, shorts ${hr.short.n ? Math.round(100 * hr.short.w / hr.short.n) + '% of ' + hr.short.n : 'n/a'}.
 - Backtested edges: ${Object.keys(edges).length ? Object.entries(edges).map(([c, e]) => `${c}(L:${e.long || '?'},S:${e.short || '?'})`).join(', ') : 'none yet'}.
@@ -7427,7 +7458,10 @@ Propose up to ${n} NEW candidate patterns. JSON only.`;
   if (!Array.isArray(arr)) return { valid: [], invalid: [], raw: txt.slice(0, 200) };
   const valid = [], invalid = [];
   for (const cand of arr) {
-    if (cand && typeof cand === 'object') { cand.stopAtr = +cand.stopAtr || 2; cand.targetR = +cand.targetR || 2; }
+    if (cand && typeof cand === 'object') {
+      cand.stopAtr = +cand.stopAtr || 2; cand.targetR = +cand.targetR || 2;
+      if (cand.source) cand.source = String(cand.source).slice(0, 80);   // traceable back to the video/note
+    }
     const err = validateCandidate(cand);
     if (err) invalid.push({ cand, err }); else valid.push(cand);
   }
@@ -7628,6 +7662,14 @@ function liveRecordFor(label) {
   return { w, l, c, graded, hit: graded ? w/graded : null, avgPct: n ? sum/n : null };
 }
 
+// Turn "[yt_abc]" back into the note's title, so the register says "from Krown — RSI divergence"
+// rather than an id only the code understands.
+function labSourceTitle(src) {
+  const id = String(src || '').replace(/[\[\]]/g, '').trim();
+  try { const hit = getKB().find(s => s.id === id); if (hit && hit.title) return String(hit.title).slice(0, 48); } catch {}
+  return id.slice(0, 48);
+}
+
 function renderStrategies() {
   const el = document.getElementById('strat-list'); if (!el) return;
   const tab = stratTab();
@@ -7666,7 +7708,7 @@ function renderStrategies() {
     const b = p.breadth;
     return row({
       name: p.name || discKey(p), dir: p.dir, paused: (p.status||'live')==='paused',
-      meta: `${esc(p.tf||'1D')} · stop ${p.stopAtr}×ATR · target ${p.targetR}R · ${p.mutatedFrom?'mutation':(p.origin==='grid'?'grid search':'brain idea')}${(p.status||'live')==='paused'?' · PAUSED':''}`,
+      meta: `${esc(p.tf||'1D')} · stop ${p.stopAtr}×ATR · target ${p.targetR}R · ${p.mutatedFrom?'mutation':(p.origin==='grid'?'grid search':p.origin==='chat'?'dropped in chat':'brain idea')}${p.source && !/own idea/i.test(p.source) ? ' · from ' + esc(labSourceTitle(p.source)) : ''}${(p.status||'live')==='paused'?' · PAUSED':''}`,
       record: p.oos ? `out-of-sample ${(p.oos.winRate*100).toFixed(0)}% win, ${p.oos.expectancy>=0?'+':''}${p.oos.expectancy}R over ${p.oos.n} trades${b?` · profitable on ${b.positive}/${b.coins} coins`:''}` : null,
       losers: b && b.losers && b.losers.length ? b.losers.join(', ') : null,
     });
