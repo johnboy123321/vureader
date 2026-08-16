@@ -1048,6 +1048,66 @@ function applyLiveConfig(c) {
   return applied;
 }
 
+// ═══════════════ TIME STOP — make trades RESOLVE (2026-08-16) ═══════════════
+// John: "I don't believe we've hit a single TP or stop loss yet."
+//
+// He is right, and it is not impatience — it is a design hole. A trade has a stop and a 2.25R
+// target and nothing else, so a setup that simply goes nowhere sits open forever: capital held,
+// funding leaking, a correlation slot occupied, and — the part that bites hardest right now —
+// it never becomes a data point. A system that cannot resolve trades cannot learn from them.
+//
+// A time stop says: if the setup has not done its job within N bars, the thesis has expired.
+// Take the small win or loss and move on. Three things at once — a faster sample, less funding
+// bleed, and slots freed for better setups.
+//
+// N is what is being TESTED, so this runs as a shadow experiment first: baseline holds forever,
+// variants close at 20 / 40 / 60 bars. The variant that wins in R earns the job. Note the neat
+// part — this experiment MANUFACTURES the resolutions that every other experiment needs.
+const TIMESTOP_BARS = [20, 40, 60];
+const BAR_MS = { "15m": 9e5, "30m": 18e5, "1H": 36e5, "4H": 144e5, "1D": 864e5, "1W": 6048e5 };
+
+// How many bars has this position been open, on its own timeframe?
+function barsOpen(rec, now) {
+  const ms = BAR_MS[rec.tf || "1D"] || BAR_MS["1D"];
+  return Math.floor((now - rec.at) / ms);
+}
+
+// What WOULD a time stop of N bars have scored on a decision we already have candles for?
+// Deliberately reuses gradeOne's walk so the two arms are scored by identical rules — the only
+// difference between them is when they give up.
+function gradeWithTimeStop(rec, candles, maxBars) {
+  const risk = Math.abs(rec.entry - rec.stop);
+  if (!(risk > 0) || !candles || !candles.length) return null;
+  const isLong = rec.dir !== "short";
+  const start = candles.findIndex(c => c.t >= rec.at);
+  if (start < 0) return null;
+  for (let i = start; i < candles.length; i++) {
+    const c = candles[i];
+    if (isLong ? c.l <= rec.stop : c.h >= rec.stop) return -1;                       // stop first
+    if (isLong ? c.h >= rec.target : c.l <= rec.target) return +Math.abs(rec.target - rec.entry) / risk;
+    if (i - start >= maxBars) return (isLong ? c.c - rec.entry : rec.entry - c.c) / risk;  // time is up
+  }
+  return null;                                   // still open and still inside its window
+}
+
+// A live position the bot opened, still sitting there past its window. Closing is a REDUCE-ONLY
+// market order — it can only ever shrink a position, never open one, which is the property that
+// makes this safe to run automatically.
+function closeOrderFor(pos) {
+  const size = Math.abs(Number(pos.size) || 0);
+  if (!(size > 0)) return null;
+  const isLong = String(pos.posSide || pos.side || "").toLowerCase().startsWith("l");
+  return {
+    clOrdID: ("timestop" + String(pos.symbol || "").replace(/[^A-Z]/gi, "") + Date.now()).slice(0, 40),
+    symbol: String(pos.symbol).toUpperCase(),
+    side: isLong ? "Sell" : "Buy",               // the closing side
+    posSide: pos.posSide || "Merged",
+    ordType: "Market", orderQtyRq: String(size),
+    timeInForce: "ImmediateOrCancel",
+    reduceOnly: true, closeOnTrigger: true, text: "cipher-timestop",
+  };
+}
+
 // ═══════════════ THE SHADOW FRAMEWORK (2026-08-16) ═══════════════
 // John's brief: "build something different… nothing gets control until it has earned it."
 //
@@ -1426,6 +1486,45 @@ export default async function cipherAgent() {
       }
     }
     const gradedN = await gradeShadow(SHADOW);
+
+    // ── TIME-STOP EXPERIMENT ─────────────────────────────────────────────────────────────────
+    // Re-scores the SAME decisions the ranking experiment already recorded, under each candidate
+    // window. No extra trades, no extra risk — just a second question asked of the same data:
+    // would giving up after N bars have made more R than holding on?
+    const tsSlot = shadowSlot(SHADOW, "time_stop");
+    tsSlot.arms = tsSlot.arms || {};
+    const src = (SHADOW.rank_vs_threshold && SHADOW.rank_vs_threshold.records) || [];
+    const byKey = new Map();
+    for (const rec of src) {
+      if (rec.arm !== "baseline") continue;                       // score the live rule's trades
+      const k = rec.coin + "|" + (rec.tf || "1D");
+      if (!byKey.has(k)) byKey.set(k, []);
+      byKey.get(k).push(rec);
+    }
+    for (const [k, recs] of byKey) {
+      const [coin, tf] = k.split("|");
+      let candles = null;
+      try { candles = await fetchCandles(coin, tf, 300); } catch {}
+      if (!candles) continue;
+      for (const rec of recs) {
+        for (const n of TIMESTOP_BARS) {
+          const key = "bars" + n;
+          tsSlot.arms[key] = tsSlot.arms[key] || { sum: 0, n: 0, seen: [] };
+          const id = rec.coin + rec.at;
+          if (tsSlot.arms[key].seen.includes(id)) continue;
+          const R = gradeWithTimeStop(rec, candles, n);
+          if (R === null) continue;
+          tsSlot.arms[key].sum += R; tsSlot.arms[key].n++;
+          tsSlot.arms[key].seen.push(id);
+          if (tsSlot.arms[key].seen.length > SHADOW_MAX_RECORDS) tsSlot.arms[key].seen = tsSlot.arms[key].seen.slice(-SHADOW_MAX_RECORDS);
+        }
+      }
+    }
+    const holdStats = armStats(src, "baseline");
+    const tsLine = TIMESTOP_BARS.map(n => { const a = tsSlot.arms["bars" + n] || { sum: 0, n: 0 };
+      return `${n}b ${a.n ? (a.sum / a.n).toFixed(3) : "—"}R (${a.n})`; }).join(" · ");
+    console.log(`shadow time_stop: hold-forever ${holdStats.meanR}R (${holdStats.n}) · ${tsLine}`);
+
     const v = shadowJudge(SHADOW, "rank_vs_threshold");
     await saveShadow(SHADOW);
     console.log(`shadow rank_vs_threshold: baseline ${v.base.n} trades @ ${v.base.meanR}R · variant ${v.varr.n} @ ${v.varr.meanR}R · edge ${v.edge >= 0 ? "+" : ""}${v.edge}R${v.ready ? "" : " (still gathering)"}${v.changed ? " — " + v.changed.toUpperCase() : ""}${gradedN ? ` · graded ${gradedN} this run` : ""}`);
