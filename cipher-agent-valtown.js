@@ -1195,6 +1195,56 @@ function closeOrderFor(pos) {
   };
 }
 
+// ── AN EXISTING HEDGE IS A STANDING COST (2026-08-18) ─────────────────────────────────────────
+// The no-hedge rule stopped the bot OPENING an opposing leg. It never did anything about one
+// already sitting there: the run printed "WARNING: ... already hold BOTH sides" and carried on.
+// John's exchange screenshot on 2026-08-18 showed BTCUSDT holding a Long AND a Short, quietly
+// paying funding and fees on both legs to hold a net position it could have held with one.
+//
+// So the smaller leg gets closed. Deliberately the smaller one: the two legs offset, so removing
+// the smaller leaves the same NET exposure and strictly reduces cost, margin and risk. This
+// cannot open a position, cannot increase one, and cannot flip a direction — the order is
+// reduceOnly. Set HEDGE_FIX=0 to go back to warning only.
+function hedgeCloseOrder(pos) {
+  const o = closeOrderFor(pos);
+  if (o) { o.clOrdID = ("dehedge" + String(pos.symbol || "").replace(/[^A-Z]/gi, "") + Date.now()).slice(0, 40);
+           o.text = "cipher-dehedge"; }
+  return o;
+}
+
+async function resolveHedges(positions) {
+  const out = { found: 0, closed: 0, failed: 0 };
+  if (String(env("HEDGE_FIX", "1")) !== "1") return out;
+  const bySym = new Map();
+  for (const p of positions) {
+    if (!(Math.abs(Number(p.size) || 0) > 0)) continue;
+    const sym = String(p.symbol || "").toUpperCase();
+    if (!bySym.has(sym)) bySym.set(sym, []);
+    bySym.get(sym).push(p);
+  }
+  for (const [sym, legs] of bySym) {
+    const longs = legs.filter(p => String(p.posSide || p.side || "").toLowerCase().startsWith("l"));
+    const shorts = legs.filter(p => !String(p.posSide || p.side || "").toLowerCase().startsWith("l"));
+    if (!longs.length || !shorts.length) continue;                 // not a hedge
+    out.found++;
+    const notional = p => Math.abs(Number(p.size) || 0) * (+(p.markPriceRp || p.markPrice || 0) || 1);
+    const biggestLong = longs.sort((a, b) => notional(b) - notional(a))[0];
+    const biggestShort = shorts.sort((a, b) => notional(b) - notional(a))[0];
+    const smaller = notional(biggestLong) <= notional(biggestShort) ? biggestLong : biggestShort;
+    const order = hedgeCloseOrder(smaller);
+    if (!order) { out.failed++; continue; }
+    let ok = false;
+    try { const r = await execOrder(order); ok = r && r.status === 200 && r.data && !r.data.error; }
+    catch { ok = false; }
+    if (ok) out.closed++; else out.failed++;
+    const coin = sym.replace(/USDT$/, "");
+    await pushLog({ coin, dir: String(smaller.posSide || "").toLowerCase(),
+      result: ok ? "DE-HEDGED" : "ERR de-hedge",
+      skipped: `${sym} was holding both sides. Closed the smaller leg (${smaller.posSide}, ${Math.abs(Number(smaller.size))}) — same net exposure, one set of fees and funding instead of two.` });
+  }
+  return out;
+}
+
 // ═══════════════ THE SHADOW FRAMEWORK (2026-08-16) ═══════════════
 // John's brief: "build something different… nothing gets control until it has earned it."
 //
@@ -1285,6 +1335,89 @@ async function expireStaleOrders() {
   for (const id of Object.keys(book)) if (book[id].at < now - RESTING_FORGET_MS) delete book[id];
   await setJSON(RESTING_KEY, book);
   return out;
+}
+
+// ═══════════════════ RELATIVE STRENGTH (measurement only) ═══════════════════
+// The scanner scores every coin in isolation. It has never known whether the coin it is about to
+// buy is the strongest or the weakest thing on the board. Tested against the three-year replay on
+// 2026-08-18, that one number sorted the trades into a clean ladder:
+//
+//     trading the laggard against the field   −£1.47/trade   (gross −£0.96)
+//     ...                                       ...
+//     trading the leader with the field        +£0.98/trade   (gross +£1.53)
+//
+// A £2.49 swing in GROSS — the signal, not the costs — monotonic across four pre-specified
+// buckets, holding its sign in both halves of the sample, and NOT a restatement of distance from
+// the 200 EMA (within coins below their 200 EMA, leaders paid +£1.88 and laggards lost £1.42).
+//
+// It is still a backtest finding, so it decides nothing. Every recorded decision is stamped with
+// the coin's rank and the boxes are reported each run, exactly like the regime experiment.
+const RS_LOOKBACK_D = 7;                 // one week of return, the horizon the ladder was found on
+const RS_MIN_FIELD = 12;                 // fewer coins than this and a rank means very little
+
+let _rsCache = null;
+
+// Rank every coin in the whitelist by its 7-day return. Uses the same daily candles the scan
+// already fetches for its own timeframes, one extra call per coin at most, cached for the run.
+async function relativeStrength(symbols) {
+  if (_rsCache) return _rsCache;
+  const rows = [];
+  for (const sym of symbols) {
+    let c = null;
+    try { c = await fetchCandles(sym, "1D", 30); } catch { }
+    if (!c || c.length < RS_LOOKBACK_D + 1) continue;
+    const now = c[c.length - 1].c, then = c[c.length - 1 - RS_LOOKBACK_D].c;
+    if (!(now > 0 && then > 0)) continue;
+    rows.push({ coin: sym, ret: now / then - 1 });
+  }
+  if (rows.length < RS_MIN_FIELD) { _rsCache = { ok: false, n: rows.length, rank: () => null }; return _rsCache; }
+  rows.sort((a, b) => b.ret - a.ret);
+  const pos = new Map(rows.map((r, i) => [r.coin, i / (rows.length - 1)]));   // 0 = strongest
+  _rsCache = {
+    ok: true, n: rows.length,
+    leader: rows[0].coin, laggard: rows[rows.length - 1].coin,
+    // signed with the trade: 1 = you are trading the leader in your direction, 0 = the laggard
+    rank: (coin, dir) => {
+      const r = pos.get(coin);
+      if (r == null) return null;
+      return +(dir === "long" ? 1 - r : r).toFixed(3);
+    },
+  };
+  return _rsCache;
+}
+
+// Same shape as the regime boxes, and the same rule: a bucket is only believed once it has a real
+// sample AND agrees with itself across both halves of its own history.
+const RS_BANDS = [["a. fighting the field", 0.25], ["b. below middle", 0.5], ["c. above middle", 0.75], ["d. with the leader", 1.01]];
+function rsBand(v) { if (v == null) return null; for (const [name, hi] of RS_BANDS) if (v < hi) return name; return null; }
+
+function rsBoxes(records) {
+  const box = {};
+  for (const [name] of RS_BANDS) box[name] = [];
+  for (const r of records) {
+    if (r.arm !== "baseline" || r.R === null) continue;
+    const b = rsBand(r.rs);
+    if (b && box[b]) box[b].push(r);
+  }
+  const out = {};
+  for (const [k, rs] of Object.entries(box)) {
+    const sorted = [...rs].sort((a, b) => a.at - b.at);
+    const half = Math.floor(sorted.length / 2);
+    const meanOf = a => a.length ? +(a.reduce((x, r) => x + r.R, 0) / a.length).toFixed(3) : null;
+    out[k] = { n: sorted.length, meanR: meanOf(sorted), firstHalf: meanOf(sorted.slice(0, half)), secondHalf: meanOf(sorted.slice(half)) };
+  }
+  return out;
+}
+
+function rsVerdict(records) {
+  const boxes = rsBoxes(records);
+  const trustworthy = [];
+  for (const [k, b] of Object.entries(boxes)) {
+    if (b.n < REGIME_MIN_PER_BOX * 2) continue;
+    if (b.firstHalf === null || b.secondHalf === null) continue;
+    if ((b.firstHalf > 0) === (b.secondHalf > 0)) trustworthy.push({ box: k, ...b, sign: b.meanR > 0 ? "pays" : "costs" });
+  }
+  return { boxes, trustworthy, ready: trustworthy.length > 0 };
 }
 
 // ═══════════════════════ MARKET REGIME (measurement only) ═══════════════════════
@@ -1406,6 +1539,7 @@ function shadowRecord(sh, id, arm, t, meta) {
     entry: +t.entry, stop: +t.sl, target: +(t.tp2 ?? t.tp1),
     quality: meta && meta.quality, note: meta && meta.note,
     reg: (meta && meta.reg) || null,            // "bull" | "bear" at the moment of the decision
+    rs: (meta && meta.rs) != null ? meta.rs : null,  // 1 = trading the field's leader in your direction
     regDist: (meta && meta.regDist) ?? null,    // how far BTC was from its 200D line, in %
     breadth: (meta && meta.breadth) ?? null,    // share of scanned coins above their own 200D
     R: null,                                    // filled in by grading, later
@@ -1583,6 +1717,13 @@ export default async function cipherAgent() {
   const noteOpened = (book, coin, dir) => { addHeld(book, coin, dir); bookMap[posKey(coin, dir)] = book; };
   const dupes = [...heldDir].filter(([, set]) => set.size > 1).map(([k]) => k);
   if (dupes.length) console.log(`WARNING: ${dupes.length} coin(s) already hold BOTH sides — ${dupes.join(", ")}. Not adding to them.`);
+  // ...and, unlike before, do something about it. Reduce-only, smaller leg, armed mode only.
+  if (mode === "armed" && canSeeBook) {
+    try {
+      const hf = await resolveHedges(positions);
+      if (hf.found) console.log(`hedges found on ${hf.found} coin(s) — ${hf.closed} smaller leg(s) closed${hf.failed ? `, ${hf.failed} failed` : ""}`);
+    } catch (e) { console.error("de-hedge pass failed (harmless, reduce-only):", e && e.message); }
+  }
   // Positions are read ONCE per run, so trades opened during this run must be counted too —
   // otherwise a single pass can stack far past CORR_MAX before the next run notices. Found when
   // the ported detectors made one run place 10 orders (2026-08-11).
@@ -1616,8 +1757,10 @@ export default async function cipherAgent() {
   let scanned = 0, candidates = 0, placed = 0;
   const rankPool = [];                       // every coin's best signal this run, threshold or not
   const SHADOW = await loadShadow();
-  _regimeCache = null;                       // one BTC daily read per run
+  _regimeCache = null; _rsCache = null;      // one BTC daily read, one field ranking, per run
   const REGIME = await regimeSnapshot();
+  const RS = await relativeStrength(uni.slice(0, 40));
+  if (RS.ok) console.log(`field: ${RS.n} coins ranked over ${RS_LOOKBACK_D}d — leader ${RS.leader}, laggard ${RS.laggard} (measured only, it filters nothing)`);
   if (REGIME.label) console.log(`regime: ${REGIME.label} (BTC ${REGIME.distPct >= 0 ? "+" : ""}${REGIME.distPct}% vs its ${REGIME_MA}D average) — measured only, it filters nothing`);
 
   for (const coin of slice) {
@@ -1793,7 +1936,8 @@ export default async function cipherAgent() {
         const t = await planFor(x);
         if (t) shadowRecord(SHADOW, "rank_vs_threshold", arm, t,
           { quality: +x.quality.toFixed(1), note: x.label,
-            reg: REGIME.label, regDist: REGIME.distPct, breadth: REGIME.breadth });
+            reg: REGIME.label, regDist: REGIME.distPct, breadth: REGIME.breadth,
+            rs: RS.ok ? RS.rank(x.coin, x.dir) : null });
       }
     }
     const gradedN = await gradeShadow(SHADOW);
@@ -1865,6 +2009,24 @@ export default async function cipherAgent() {
     } else {
       const need = Object.entries(rv.boxes).filter(([, b]) => b.n < REGIME_MIN_PER_BOX * 2).length;
       console.log(`  → still gathering: ${need} of 4 boxes short of ${REGIME_MIN_PER_BOX * 2} resolved trades, and none may be believed until both halves agree`);
+    }
+
+    // ── RELATIVE STRENGTH EXPERIMENT ─────────────────────────────────────────────────────────
+    const sv = rsVerdict(src);
+    console.log('shadow relative_strength: ' + Object.entries(sv.boxes)
+      .map(([k, b]) => `${k.slice(3)} ${b.meanR === null ? "—" : (b.meanR >= 0 ? "+" : "") + b.meanR + "R"} (${b.n})`).join(" · "));
+    if (sv.ready) {
+      for (const t of sv.trustworthy) {
+        console.log(`  → ${t.box} ${t.sign} consistently: ${t.meanR}R over ${t.n}, and holds in both halves (${t.firstHalf} then ${t.secondHalf})`);
+      }
+      const slot = shadowSlot(SHADOW, "relative_strength");
+      const sig = sv.trustworthy.map(t => t.box + ":" + t.sign).sort().join(",");
+      if (slot.lastVerdict !== sig) {
+        slot.lastVerdict = sig;
+        slot.history.push({ at: Date.now(), changed: "evidence", boxes: sv.boxes, trustworthy: sv.trustworthy });
+        await pushLog({ shadow: "relative_strength", result: "EVIDENCE",
+          skipped: `rank boxes now stable: ${sv.trustworthy.map(t => `${t.box} ${t.sign} ${t.meanR}R over ${t.n}`).join("; ")}. Still advisory — nothing is filtered.` });
+      }
     }
     await saveShadow(SHADOW);
   } catch (e) { console.error("shadow pass failed (harmless, no orders involved):", e && e.message); }

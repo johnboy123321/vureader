@@ -9414,6 +9414,31 @@ document.addEventListener('click', function(e){
         if(bv.verdict==='PASS'){ pushLog(Object.assign({coin:t.coin,dir:t.dir,score,brain:'PASS',skipped:'BRAIN GATE — vetoed: '+(bv.reason||'no edge')},plan)); notify('Brain vetoed '+t.coin+' '+String(t.dir||'long').toUpperCase()+(bv.reason?' — '+String(bv.reason).slice(0,80):'')); return; }
         // TAKE or RESIZE → proceed past the score bar on the brain's authority
       } else if(score<num(LS.min,8) && !vetOK){ pushLog(Object.assign({coin:t.coin,dir:t.dir,score,skipped:(t.score!=null?'score '+score+' below minimum '+num(LS.min,8):'no brain score and backtest vet not positive')+(gateOn?' — brain gave no verdict in time, numeric fallback':'')},plan)); return; }
+      // ── NO OPPOSING LEG, AND ONE POSITION PER COIN (2026-08-18) ───────────────────────────────
+      // The server agent has refused to hold both sides of a coin since 2026-08-15. THIS path —
+      // the app's own exec — never had the check. There are two order placers and only one of
+      // them knew the rule, which is how BTCUSDT ended up holding a Long AND a Short at the same
+      // time. Screenshot from the exchange, 2026-08-18.
+      //
+      // The book is read LIVE rather than from the 5-minute snapshot, because a position opened
+      // four minutes ago is exactly the one this guard exists to catch. If the book cannot be
+      // read at all we place nothing — the same refusal the agent makes, for the same reason:
+      // missing a setup costs one setup, placing blind cost six tangled positions.
+      let book=null;
+      try{ book=await readBook(); }catch{}
+      if(!book){ pushLog(Object.assign({coin:t.coin,dir:t.dir,score,skipped:'REFUSED — cannot read open positions, so cannot check for an opposing leg'},plan)); return; }
+      {
+        const root=String(t.coin).toUpperCase()+'USDT';
+        const keys=Object.keys(book).filter(k=>String(k).split('|')[0]===root);
+        const other=(t.dir==='short')?'Long':'Short';
+        if(keys.some(k=>k.endsWith('|'+other))){
+          pushLog(Object.assign({coin:t.coin,dir:t.dir,score,skipped:'REFUSED — would open a '+(t.dir||'long')+' against an existing '+other.toLowerCase()+' on '+t.coin+'. This bot does not hedge.'},plan));
+          notify('Refused '+t.coin+' — would hedge an open '+other.toLowerCase()); return;
+        }
+        if(keys.length){
+          pushLog(Object.assign({coin:t.coin,dir:t.dir,score,skipped:'already holding '+t.coin+' — not adding to it'},plan)); return;
+        }
+      }
       // Correlation guard — alt majors move together; 4 shorts in one sweep is one bet, not four.
       const corrMax=num('mc_exec_corrmax',3);
       try{ const snap=JSON.parse(get('mc_exec_possnap','{}'))||{}; const dir=(t.dir==='short')?'Short':'Long';
@@ -9703,6 +9728,21 @@ document.addEventListener('click', function(e){
     }
   }
   // ── outcome sweep: watch the exchange every 5 min, shout on fills/closes ──
+  // One live read of the exchange's position list, shaped like mc_exec_possnap so every guard can
+  // use it. Returns null — never {} — when the read fails, so "no positions" and "I could not
+  // look" can never be confused with each other.
+  async function readBook(){
+    const url=get(LS.url,'').replace(/\/+$/,''); if(!url) return null;
+    let pr=null;
+    try{ pr=await (await fetch(url+'/positions',{headers:{Authorization:'Bearer '+get(LS.token,'')}})).json(); }catch{ return null; }
+    const rows=(pr&&pr.data&&pr.data.data&&pr.data.data.positions);
+    if(!Array.isArray(rows)) return null;
+    const out={};
+    rows.filter(p=>Number(p.size)>0).forEach(p=>{ out[p.symbol+'|'+(p.posSide||'')]={size:Number(p.size),mark:+(p.markPriceRp||p.markPrice||0),pnl:+(p.unRealisedPnlRv||p.unrealisedPnlRv||0)}; });
+    try{ set('mc_exec_possnap',JSON.stringify(out)); }catch{}
+    return out;
+  }
+
   async function sweepPositions(){
     try{
       const url=get(LS.url,'').replace(/\/+$/,''); if(!url) return;
