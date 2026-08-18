@@ -1203,6 +1203,102 @@ function closeOrderFor(pos) {
 //   · the system improves without John deciding it has improved — the evidence decides
 //
 // Nothing here places an order. A shadow record is a DECISION, never an instruction.
+// ═══════════════════════ MARKET REGIME (measurement only) ═══════════════════════
+// John's idea: "if you short in a bull market you'll get more losses, and vice versa — so define
+// bull vs bear and let the bot adjust."  Sound instinct, and testable. When it WAS tested against
+// three years of replay (2026-08-17) the four boxes looked decisive on the full sample and then
+// reversed: buying while BTC sat under its 200D average paid £8.14 a trade in the first half of
+// the data and lost money in the second, and the whole effect turned negative in 2026. A filter
+// built on that would have looked magnificent on every chart of the past and cost money from the
+// day it went in.
+//
+// So this does NOT filter anything. It tags every decision with the regime it was taken in and
+// waits for a forward sample. The promotion rule below is deliberately stricter than the other
+// experiments': a box has to win in BOTH halves of its own history before it may be believed,
+// because "wins on the full sample" is precisely the test the idea already passed and failed.
+//
+// NOTHING HERE PLACES, BLOCKS OR RESIZES AN ORDER.
+const REGIME_KEY = "cipher_regime";
+const REGIME_MA = 200;              // the standard long-term line; not tuned, deliberately
+const REGIME_MIN_PER_BOX = 30;      // resolved trades needed in a box before it means anything
+
+let _regimeCache = null;            // one BTC daily fetch per run, reused by every coin
+
+function smaAt(candles, n) {
+  if (!candles || candles.length < n) return null;
+  let s = 0;
+  for (let i = candles.length - n; i < candles.length; i++) s += candles[i].c;
+  return s / n;
+}
+
+// Bull or bear, from BTC against its own 200-day average. One number, no parameters to fit, and
+// the same definition every trader in the market can see — which is the point: a regime line only
+// anyone can compute is a regime line nobody else is reacting to.
+async function regimeSnapshot() {
+  if (_regimeCache) return _regimeCache;
+  let label = null, distPct = null;
+  try {
+    const d = await fetchCandles("BTC", "1D", 260);
+    const ma = smaAt(d, REGIME_MA);
+    if (ma && d.length) {
+      const px = d[d.length - 1].c;
+      label = px > ma ? "bull" : "bear";
+      distPct = +(((px - ma) / ma) * 100).toFixed(1);
+    }
+  } catch { /* no regime this run — records simply carry null and are excluded from the boxes */ }
+  _regimeCache = { label, distPct, breadth: null };
+  return _regimeCache;
+}
+
+// Breadth costs nothing: the scan already pulled every coin's daily candles, so count how many
+// closed above their own 200D line while we were there. A second opinion on the same question.
+function regimeBreadthTally(reg, dailyBars) {
+  if (!reg || !dailyBars) return;
+  const ma = smaAt(dailyBars, REGIME_MA);
+  if (!ma) return;
+  reg._bUp = (reg._bUp || 0) + (dailyBars[dailyBars.length - 1].c > ma ? 1 : 0);
+  reg._bN = (reg._bN || 0) + 1;
+  reg.breadth = +(reg._bUp / reg._bN).toFixed(2);
+}
+
+// ── the 2x2, and the stability test that decides whether to believe it ────────────────────────
+function regimeBoxes(records) {
+  const box = {};
+  for (const key of ["long|bull", "long|bear", "short|bull", "short|bear"]) box[key] = [];
+  for (const r of records) {
+    if (r.arm !== "baseline" || r.R === null || !r.reg) continue;
+    const k = (r.dir === "short" ? "short" : "long") + "|" + r.reg;
+    if (box[k]) box[k].push(r);
+  }
+  const out = {};
+  for (const [k, rs] of Object.entries(box)) {
+    const sorted = [...rs].sort((a, b) => a.at - b.at);
+    const half = Math.floor(sorted.length / 2);
+    const meanOf = (a) => a.length ? +(a.reduce((x, r) => x + r.R, 0) / a.length).toFixed(3) : null;
+    out[k] = {
+      n: sorted.length,
+      meanR: meanOf(sorted),
+      firstHalf: meanOf(sorted.slice(0, half)),
+      secondHalf: meanOf(sorted.slice(half)),
+    };
+  }
+  return out;
+}
+
+// A box is only "trustworthy" if it has a real sample AND both halves of that sample agree on the
+// sign. This is the whole lesson of 2026-08-17 written down as a gate: full-sample means lie.
+function regimeVerdict(records) {
+  const boxes = regimeBoxes(records);
+  const trustworthy = [];
+  for (const [k, b] of Object.entries(boxes)) {
+    if (b.n < REGIME_MIN_PER_BOX * 2) continue;                 // need enough to split in half
+    if (b.firstHalf === null || b.secondHalf === null) continue;
+    const agree = (b.firstHalf > 0) === (b.secondHalf > 0);
+    if (agree) trustworthy.push({ box: k, ...b, sign: b.meanR > 0 ? "pays" : "costs" });
+  }
+  return { boxes, trustworthy, ready: trustworthy.length > 0 };
+}
+
 const SHADOW_KEY = "cipher_shadow";
 const SHADOW_MIN_RESOLVED = 30;    // per arm, before a comparison means anything
 const SHADOW_MARGIN_R     = 0.05;  // variant must beat baseline by this much in mean R
@@ -1225,6 +1321,9 @@ function shadowRecord(sh, id, arm, t, meta) {
     at: Date.now(), arm, coin: t.coin, dir: t.dir, tf: t.planTf || t.tf || "1D",
     entry: +t.entry, stop: +t.sl, target: +(t.tp2 ?? t.tp1),
     quality: meta && meta.quality, note: meta && meta.note,
+    reg: (meta && meta.reg) || null,            // "bull" | "bear" at the moment of the decision
+    regDist: (meta && meta.regDist) ?? null,    // how far BTC was from its 200D line, in %
+    breadth: (meta && meta.breadth) ?? null,    // share of scanned coins above their own 200D
     R: null,                                    // filled in by grading, later
   });
   if (slot.records.length > SHADOW_MAX_RECORDS) slot.records = slot.records.slice(-SHADOW_MAX_RECORDS);
@@ -1424,6 +1523,9 @@ export default async function cipherAgent() {
   let scanned = 0, candidates = 0, placed = 0;
   const rankPool = [];                       // every coin's best signal this run, threshold or not
   const SHADOW = await loadShadow();
+  _regimeCache = null;                       // one BTC daily read per run
+  const REGIME = await regimeSnapshot();
+  if (REGIME.label) console.log(`regime: ${REGIME.label} (BTC ${REGIME.distPct >= 0 ? "+" : ""}${REGIME.distPct}% vs its ${REGIME_MA}D average) — measured only, it filters nothing`);
 
   for (const coin of slice) {
     if (Date.now() - started > 45000) { console.log("time budget reached — stopping early"); break; }
@@ -1433,6 +1535,7 @@ export default async function cipherAgent() {
     // Confluence timeframes, keeping the candles so the detectors can reuse them.
     const bars = {}, tfData = {};
     for (const tf of ["1D", "4H", "1H"]) { bars[tf] = await fetchCandles(coin, tf, 260); tfData[tf] = analyzeTF(bars[tf]); }
+    try { regimeBreadthTally(REGIME, bars["1D"]); } catch {}   // free: the candles are already here
     // Detector-only timeframes — the BTC 30m top the app missed lived here.
     for (const tf of ["30m", "15m"]) bars[tf] = await fetchCandles(coin, tf, 260);
 
@@ -1594,7 +1697,9 @@ export default async function cipherAgent() {
     for (const [arm, set] of [["baseline", baselineSet], ["variant", variantSet]]) {
       for (const x of set) {
         const t = await planFor(x);
-        if (t) shadowRecord(SHADOW, "rank_vs_threshold", arm, t, { quality: +x.quality.toFixed(1), note: x.label });
+        if (t) shadowRecord(SHADOW, "rank_vs_threshold", arm, t,
+          { quality: +x.quality.toFixed(1), note: x.label,
+            reg: REGIME.label, regDist: REGIME.distPct, breadth: REGIME.breadth });
       }
     }
     const gradedN = await gradeShadow(SHADOW);
@@ -1642,6 +1747,32 @@ export default async function cipherAgent() {
     console.log(`shadow rank_vs_threshold: baseline ${v.base.n} trades @ ${v.base.meanR}R · variant ${v.varr.n} @ ${v.varr.meanR}R · edge ${v.edge >= 0 ? "+" : ""}${v.edge}R${v.ready ? "" : " (still gathering)"}${v.changed ? " — " + v.changed.toUpperCase() : ""}${gradedN ? ` · graded ${gradedN} this run` : ""}`);
     if (v.changed) await pushLog({ shadow: "rank_vs_threshold", result: v.changed.toUpperCase(),
       skipped: `ranking ${v.changed}: variant ${v.varr.meanR}R vs baseline ${v.base.meanR}R over ${v.varr.n}/${v.base.n} resolved trades` });
+
+    // ── REGIME EXPERIMENT ────────────────────────────────────────────────────────────────────
+    // Same decisions again, asked a third question: does it matter which way the market was
+    // pointing? Reported every run so the sample builds in the open; believed only when a box
+    // wins in both halves of its own history.
+    const rv = regimeVerdict(src);
+    const boxLine = Object.entries(rv.boxes)
+      .map(([k, b]) => `${k} ${b.meanR === null ? "—" : (b.meanR >= 0 ? "+" : "") + b.meanR + "R"} (${b.n})`).join(" · ");
+    console.log(`shadow regime_direction: ${boxLine}`);
+    if (rv.ready) {
+      for (const t of rv.trustworthy) {
+        console.log(`  → ${t.box} ${t.sign} consistently: ${t.meanR}R over ${t.n}, and holds in both halves (${t.firstHalf} then ${t.secondHalf})`);
+      }
+      const prev = shadowSlot(SHADOW, "regime_direction");
+      const sig = rv.trustworthy.map(t => t.box + ":" + t.sign).sort().join(",");
+      if (prev.lastVerdict !== sig) {
+        prev.lastVerdict = sig;
+        prev.history.push({ at: Date.now(), changed: "evidence", boxes: rv.boxes, trustworthy: rv.trustworthy });
+        await pushLog({ shadow: "regime_direction", result: "EVIDENCE",
+          skipped: `regime boxes now stable: ${rv.trustworthy.map(t => `${t.box} ${t.sign} ${t.meanR}R over ${t.n}`).join("; ")}. Still advisory — nothing is filtered.` });
+      }
+    } else {
+      const need = Object.entries(rv.boxes).filter(([, b]) => b.n < REGIME_MIN_PER_BOX * 2).length;
+      console.log(`  → still gathering: ${need} of 4 boxes short of ${REGIME_MIN_PER_BOX * 2} resolved trades, and none may be believed until both halves agree`);
+    }
+    await saveShadow(SHADOW);
   } catch (e) { console.error("shadow pass failed (harmless, no orders involved):", e && e.message); }
 
   // ── Resolutions → the reverse look ─────────────────────────────────────────────────────────
