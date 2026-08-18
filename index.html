@@ -489,12 +489,22 @@ header {
 .qr-close:hover { transform:translateY(-1px); }
 
 /* Knowledge panel */
-#kb-panel, #log-panel, #scan-panel, #trades-panel, #macro-panel, #paper-panel, #lab-panel, #help-panel, #krown-panel, #bot-panel {
+#kb-panel, #log-panel, #scan-panel, #trades-panel, #macro-panel, #paper-panel, #lab-panel, #help-panel, #krown-panel, #bot-panel, #spend-panel {
   display:none; position:fixed; inset:0; z-index:80;
   background:rgba(9,9,11,0.72); backdrop-filter:blur(8px);
   align-items:flex-start; justify-content:center; padding:14px;
 }
-#kb-panel.show, #log-panel.show, #scan-panel.show, #trades-panel.show, #macro-panel.show, #paper-panel.show, #lab-panel.show, #help-panel.show, #krown-panel.show, #bot-panel.show { display:flex; }
+#kb-panel.show, #log-panel.show, #scan-panel.show, #trades-panel.show, #macro-panel.show, #paper-panel.show, #lab-panel.show, #help-panel.show, #krown-panel.show, #bot-panel.show, #spend-panel.show { display:flex; }
+.sp-big { font-size:30px; font-weight:600; letter-spacing:-.01em; margin-bottom:4px; }
+.sp-big small { font-size:12px; font-weight:400; color:var(--dim,#8a8a8a); letter-spacing:0; }
+.sp-note { font-size:11.5px; color:var(--dim,#8a8a8a); line-height:1.6; margin-bottom:10px; }
+.sp-h { font-size:10.5px; letter-spacing:.1em; text-transform:uppercase; color:var(--dim,#8a8a8a); margin:16px 0 6px; }
+.sp-t { width:100%; border-collapse:collapse; font-family:ui-monospace,monospace; font-size:11.5px; }
+.sp-t th { text-align:left; color:var(--dim,#8a8a8a); font-weight:600; padding:4px 6px; border-bottom:1px solid var(--line,#2a2a2a); }
+.sp-t td { padding:4px 6px; border-bottom:1px solid rgba(255,255,255,0.05); }
+.sp-t td.dim, .sp-t .dim { color:var(--dim,#8a8a8a); }
+.sp-in { width:52px; background:transparent; border:1px solid var(--line,#2a2a2a); border-radius:6px; color:inherit; padding:2px 6px; font:inherit; }
+.sp-btn { background:transparent; border:1px solid var(--line,#2a2a2a); border-radius:6px; color:inherit; padding:2px 9px; cursor:pointer; font-size:11px; }
 .bot-row { border:1px solid var(--line,#2a2a2a); border-radius:10px; padding:10px 12px; margin-bottom:8px; cursor:pointer; }
 .bot-detail { display:none; margin-top:8px; padding-top:8px; border-top:1px dashed var(--line,#2a2a2a); font-size:11px; color:var(--muted,#aaa); line-height:1.55; }
 .bot-row.open .bot-detail { display:block; }
@@ -1013,6 +1023,7 @@ body.layout-edit #layout-bar { display:flex; flex-wrap:wrap; justify-content:cen
     <button class="rail-btn" onclick="morningDigest()"><span class="rb-ic"><svg class="lic" viewBox="0 0 24 24"><path d="M8 6h13M8 12h13M8 18h13M3 6h.01M3 12h.01M3 18h.01"/></svg></span>Watchlist digest</button>
     <button class="rail-btn" onclick="toggleTrades()"><span class="rb-ic"><svg class="lic" viewBox="0 0 24 24"><path d="M18 8a6 6 0 0 0-12 0c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.7 21a2 2 0 0 1-3.4 0"/></svg></span>Alerts &amp; trades</button>
     <button class="rail-btn" onclick="toggleBot()"><span class="rb-ic"><svg class="lic" viewBox="0 0 24 24"><rect x="5" y="8" width="14" height="11" rx="2"/><path d="M12 8V5M12 5a1.5 1.5 0 1 0 0-3 1.5 1.5 0 0 0 0 3zM9 13h.01M15 13h.01M9.5 16.5h5"/></svg></span>Bot trades</button>
+    <button class="rail-btn" onclick="toggleSpend()"><span class="rb-ic"><svg class="lic" viewBox="0 0 24 24"><path d="M12 3v18M8 7h6a2.5 2.5 0 0 1 0 5H9a2.5 2.5 0 0 0 0 5h7"/></svg></span>API spend</button>
     <button class="rail-btn" id="rail-more-btn" onclick="toggleRailMore()"><span class="rb-ic"><svg class="lic" viewBox="0 0 24 24"><circle cx="5" cy="12" r="1.2"/><circle cx="12" cy="12" r="1.2"/><circle cx="19" cy="12" r="1.2"/></svg></span>More <span id="rail-more-chev" style="margin-left:auto;font-size:10px;color:var(--dim);">▸</span></button>
     <div id="rail-more" style="display:none;">
       <button class="rail-btn" onclick="toggleLog()"><span class="rb-ic"><svg class="lic" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6M16 13H8M16 17H8"/></svg></span>Chart log</button>
@@ -1385,6 +1396,16 @@ body.layout-edit #layout-bar { display:flex; flex-wrap:wrap; justify-content:cen
 </div>
 
 <!-- ══ BOT TRADES PANEL ══ -->
+<div id="spend-panel" onclick="if(event.target===this) toggleSpend()">
+  <div class="kb-box">
+    <div class="kb-title">API spend <button class="s-close" onclick="toggleSpend()">✕</button><button class="s-close" style="right:52px;font-size:13px;" onclick="renderSpend()" title="Refresh">⟳</button></div>
+    <div style="font-size:12px;color:var(--dim);margin-bottom:12px;line-height:1.5;">
+      Every call this app makes to the model, priced. "Uncached" is what the same day would have cost before the knowledge base was made cacheable — the gap is the saving, measured rather than claimed.
+    </div>
+    <div id="spend-body"></div>
+  </div>
+</div>
+
 <div id="bot-panel" onclick="closeBot(event)">
   <div class="kb-box">
     <div class="kb-title">Bot Trades <button class="s-close" onclick="toggleBot()">✕</button><button class="s-close" style="right:52px;font-size:13px;" onclick="CipherExec.renderBot()" title="Refresh — re-read the exchange and decisions">⟳</button></div>
@@ -2858,7 +2879,7 @@ async function runBacktest() {
       headers: { 'x-api-key': apiKey, 'anthropic-version': '2023-06-01', 'content-type': 'application/json', 'anthropic-dangerous-direct-browser-access': 'true' },
       body: JSON.stringify({
         model, max_tokens: 1500,
-        system: buildSystemPrompt('backtest review accuracy lessons'),
+        system: systemBlocks('backtest review accuracy lessons'),
         messages: [{ role: 'user', content: `Here is my CHART LOG — a sequence of my past analyses with the real market price recorded at each one (oldest first):
 
 ${table}
@@ -4070,12 +4091,158 @@ function botContext() {
   } catch (e) { return ''; }
 }
 
-function buildSystemPrompt(query, opts) {
-  opts = opts || {};
-  const kb = opts.full ? getKB() : selectKB(query);
-  const kbLabel = opts.full ? 'FULL KNOWLEDGE BASE (use all of it):' : 'RELEVANT KNOWLEDGE BASE (selected for this question):';
+// ═══════════════════ API SPEND METER (2026-08-18) ═══════════════════
+// John: "the bot and app is using up a lot of api credits." The honest first move is to measure
+// rather than guess — the same discipline the backtest work ran on. Every call to the Messages
+// API goes through one shim that reads the `usage` block off a CLONE of the response (never the
+// original body — reading a Response twice is what killed the agent overnight on 2026-08-12),
+// prices it, and files it by day, by model and by caller.
+//
+// Nothing here changes a request. It only counts.
+const SPEND_KEY = 'mc_spend';
+// $ per million tokens, from the published table on 2026-08-18. Editable in the panel because
+// prices change and a stale number quietly makes every figure below wrong.
+const PRICE_DEFAULT = {
+  'claude-opus-4-8': { in: 5, out: 25 }, 'claude-opus-4-6': { in: 5, out: 25 },
+  'claude-sonnet-4-6': { in: 3, out: 15 }, 'claude-haiku-4-5-20251001': { in: 1, out: 5 },
+  'claude-fable-5': { in: 10, out: 50 },
+};
+const GBP_PER_USD = 0.78;
+function priceTable() {
+  try { return Object.assign({}, PRICE_DEFAULT, JSON.parse(localStorage.getItem('mc_prices') || '{}')); }
+  catch { return PRICE_DEFAULT; }
+}
+function spendLog() { try { return JSON.parse(localStorage.getItem(SPEND_KEY) || '{}') || {}; } catch { return {}; } }
+function saveSpend(v) { try { localStorage.setItem(SPEND_KEY, JSON.stringify(v)); } catch {} }
+
+// Cache writes cost 1.25x input on a 5-minute TTL and 2x on an hour; reads cost 0.1x. We ask for
+// 1h, so a write is 2x — which is why the panel shows writes separately: a prompt that never gets
+// re-read is COSTING money, not saving it, and that has to be visible.
+function priceCall(model, u) {
+  const P = priceTable()[model] || { in: 3, out: 15 };
+  const fresh = (u.input_tokens || 0), write = (u.cache_creation_input_tokens || 0),
+        read = (u.cache_read_input_tokens || 0), out = (u.output_tokens || 0);
+  const usd = (fresh * P.in + write * P.in * 2 + read * P.in * 0.1 + out * P.out) / 1e6;
+  // what the same call would have cost with no caching at all — the saving, measured not claimed
+  const usdUncached = ((fresh + write + read) * P.in + out * P.out) / 1e6;
+  return { usd, usdUncached, fresh, write, read, out };
+}
+
+function recordSpend(model, tag, usage) {
+  if (!usage) return;
+  const c = priceCall(model, usage);
+  const day = new Date().toISOString().slice(0, 10);
+  const L = spendLog();
+  const d = L[day] = L[day] || { calls: 0, usd: 0, usdUncached: 0, fresh: 0, write: 0, read: 0, out: 0, byTag: {}, byModel: {} };
+  d.calls++; d.usd += c.usd; d.usdUncached += c.usdUncached;
+  d.fresh += c.fresh; d.write += c.write; d.read += c.read; d.out += c.out;
+  const t = d.byTag[tag] = d.byTag[tag] || { calls: 0, usd: 0 };
+  t.calls++; t.usd += c.usd;
+  const m = d.byModel[model] = d.byModel[model] || { calls: 0, usd: 0 };
+  m.calls++; m.usd += c.usd;
+  for (const k of Object.keys(L)) if (k < new Date(Date.now() - 31 * 864e5).toISOString().slice(0, 10)) delete L[k];
+  saveSpend(L);
+}
+
+function spendToday() { return spendLog()[new Date().toISOString().slice(0, 10)] || { calls: 0, usd: 0, usdUncached: 0 }; }
+function spendCapUsd() { const v = parseFloat(localStorage.getItem('mc_spend_cap') || '3'); return Number.isFinite(v) ? v : 3; }
+
+// The cap stops the app spending money while John is not looking. It NEVER blocks something he
+// asked for — a chat message, a card he tapped — only the automatic paths: auto-scan verdicts,
+// the shadow brain, the discovery lab. Being unable to send your own message because a background
+// job ate the budget would be the worst possible version of this feature.
+function autoSpendAllowed() {
+  const cap = spendCapUsd();
+  if (!(cap > 0)) return true;
+  return spendToday().usd < cap;
+}
+
+// Which function asked for this call. Derived from the stack, so no call site has to be touched
+// and none can forget to label itself. Diagnostic only — a wrong label costs nothing.
+function callerTag() {
+  try {
+    const lines = String(new Error().stack || '').split('\n').slice(2, 9);
+    for (const l of lines) {
+      const m = l.match(/at\s+(?:async\s+)?([A-Za-z_$][\w$]*)\s/);
+      if (m && !/^(fetch|recordSpend|callerTag|_wrapped|Promise|eval)$/.test(m[1])) return m[1];
+    }
+  } catch {}
+  return 'unknown';
+}
+
+(function meterFetch() {
+  if (window._spendWrapped) return;
+  window._spendWrapped = true;
+  const real = window.fetch.bind(window);
+  window.fetch = function (input, init) {
+    const url = typeof input === 'string' ? input : (input && input.url) || '';
+    if (!/api\.anthropic\.com/.test(url)) return real(input, init);
+    let model = 'unknown';
+    try { model = JSON.parse((init && init.body) || '{}').model || 'unknown'; } catch {}
+    const tag = callerTag();
+    return real(input, init).then(res => {
+      // A CLONE, and only ever the clone. The original body is untouched for the caller.
+      try { res.clone().json().then(j => { try { recordSpend(model, tag, j && j.usage); } catch {} }).catch(() => {}); } catch {}
+      return res;
+    });
+  };
+})();
+
+function renderSpend() {
+  const el = document.getElementById('spend-body'); if (!el) return;
+  const L = spendLog(), days = Object.keys(L).sort().reverse().slice(0, 14);
+  const d = spendToday();
+  const gbp = (u) => '£' + (u * GBP_PER_USD).toFixed(2);
+  const saved = Math.max(0, d.usdUncached - d.usd);
+  const rows = days.map(k => {
+    const x = L[k];
+    return `<tr><td>${k}</td><td>${x.calls}</td><td>${gbp(x.usd)}</td><td class="dim">${gbp(x.usdUncached)}</td></tr>`;
+  }).join('');
+  const tags = Object.entries(d.byTag || {}).sort((a, b) => b[1].usd - a[1].usd).slice(0, 10)
+    .map(([k, v]) => `<tr><td>${k}</td><td>${v.calls}</td><td>${gbp(v.usd)}</td><td class="dim">${d.usd ? (v.usd / d.usd * 100).toFixed(0) + '%' : '—'}</td></tr>`).join('');
+  const models = Object.entries(d.byModel || {}).sort((a, b) => b[1].usd - a[1].usd)
+    .map(([k, v]) => `<tr><td>${k.replace('claude-', '').replace('-20251001', '')}</td><td>${v.calls}</td><td>${gbp(v.usd)}</td><td class="dim"></td></tr>`).join('');
+  el.innerHTML = `
+    <div class="sp-big">${gbp(d.usd)}<small> today · ${d.calls} calls</small></div>
+    <div class="sp-note">Caching saved ${gbp(saved)} today${d.usdUncached ? ` (${((saved / d.usdUncached) * 100).toFixed(0)}% off)` : ''}.
+      Cache reads ${(d.read || 0).toLocaleString()} tokens · writes ${(d.write || 0).toLocaleString()} · uncached ${(d.fresh || 0).toLocaleString()}.</div>
+    <div class="sp-note">Automatic calls stop for the day at <input id="sp-cap" class="sp-in" value="${spendCapUsd()}"> USD.
+      <button class="sp-btn" onclick="setSpendCap()">Save</button> Your own chats and taps are never blocked.</div>
+    <div class="sp-h">Where it went today</div><table class="sp-t"><tr><th>caller</th><th>calls</th><th>cost</th><th></th></tr>${tags || '<tr><td colspan=4 class="dim">nothing yet</td></tr>'}</table>
+    <div class="sp-h">By model</div><table class="sp-t">${models || '<tr><td colspan=4 class="dim">nothing yet</td></tr>'}</table>
+    <div class="sp-h">Last 14 days</div><table class="sp-t"><tr><th>day</th><th>calls</th><th>cost</th><th>uncached</th></tr>${rows}</table>`;
+}
+function setSpendCap() {
+  const v = parseFloat((document.getElementById('sp-cap') || {}).value);
+  if (Number.isFinite(v) && v >= 0) { localStorage.setItem('mc_spend_cap', String(v)); renderSpend(); }
+}
+function toggleSpend() {
+  const p = document.getElementById('spend-panel'); if (!p) return;
+  p.classList.toggle('show'); if (p.classList.contains('show')) renderSpend();
+}
+
+// ── THE SYSTEM PROMPT, SPLIT SO IT CAN BE CACHED (2026-08-18) ────────────────────────────────
+// Measured before this change: a deep read sent 55,194 characters — about 15,300 tokens — of
+// system prompt, and 97% of it was byte-identical from one call to the next. It was re-sent, and
+// re-charged, on every single call, with no cache_control anywhere in the file. Every five-minute
+// auto-scan, every shadow verdict, every chat message paid full price for the same knowledge base.
+//
+// So the prompt is now built in two pieces:
+//   STABLE   — the instructions, the app description and the whole knowledge base. Identical on
+//              every call, marked cacheable with a 1-hour TTL: a cache write costs 2x input, a
+//              cache read costs 0.1x, so it pays for itself on the second call of the hour and
+//              everything after that is a tenth of the price.
+//   VOLATILE — live positions, snapshots, alerts, pattern stats, lab and macro. Changes every
+//              call, so it sits AFTER the cache breakpoint where it costs full price on its own.
+//
+// The knowledge base is now ALWAYS sent in full. Selecting a subset per question was saving
+// tokens at full price; sending everything at cache-read price is cheaper than that AND removes
+// the risk of the selector dropping the one note that mattered.
+function systemStable() {
+  const kb = getKB();
+  const kbLabel = 'FULL KNOWLEDGE BASE (use all of it):';
   return `You are the user's personal market-analysis brain. They follow Market Cipher / Vu Man Chu style charts, market structure, risk management, and a library of trader knowledge and opinions they have fed you. Read the signals, apply the setup rules and scoring from the knowledge base, and give a plain verdict.
-${appSelfContext()}${opts.noBot ? '' : botContext()}
+${appSelfContext()}
 
 OVERRIDE STALE DENIALS: if earlier messages in this conversation claim you have "no bot feed", "no account data", "no Discovery Lab count", that a number "lives in the Lab panel", that you "can't see the full library", or that you "only know what you're told" — those were sent BEFORE the feeds above existed. They exist now, in this very prompt. Never repeat those claims, and never defer to your own earlier answer over the data in front of you. Answer bot, position, decision AND Discovery Lab questions directly from the BOT EXECUTION, YOUR OWN APP and DISCOVERY LAB blocks above. In particular: the exact count of live, paused and retired lab patterns IS in the DISCOVERY LAB block — read it and state the number. Telling the user to go and open a panel to find a figure you have been handed is a failure, not caution.
 
@@ -4093,7 +4260,34 @@ Be helpful and straightforward — not short or dismissive. The user is making g
 THE SCANNER: the app computes live VuManChu Cipher B signals across 1D, 4H, 1H, and 15m in the browser. Results are injected below under "AUTO-SCAN MATCHES" with their timeframe in brackets. You DO have intraday data — never say otherwise. When the user asks for scalps, look for [1H] and [15m] matches. If none appear: the scanner ran but found no 1H/15m setups above the score threshold this time — say that plainly and suggest they lower the min score filter and re-scan. Do NOT say you "can't scan" or have no intraday data.
 
 ${kbLabel}
-${kb.map(s => String(s.title||'') + ':\n' + String(s.content||'')).join('\n\n---\n\n')}${snapshotContext()}${alertsContext()}${patternStatsContext()}${labContext()}${macroContext()}`;
+${kb.map(s => String(s.title||'') + ':\n' + String(s.content||'')).join('\n\n---\n\n')}`;
+}
+
+// Everything that can differ between two calls a minute apart. Kept after the cache breakpoint.
+function systemVolatile(query, opts) {
+  opts = opts || {};
+  return (opts.noBot ? '' : botContext()) + snapshotContext() + alertsContext()
+       + patternStatsContext() + labContext() + macroContext();
+}
+
+// Unchanged for every caller that just wants the whole thing as one string.
+function buildSystemPrompt(query, opts) {
+  return systemStable() + systemVolatile(query, opts);
+}
+
+// A single static prompt, marked cacheable. Same 0.1x read price, no restructuring needed.
+function cacheable(text) {
+  return [{ type: 'text', text: String(text), cache_control: { type: 'ephemeral', ttl: '1h' } }];
+}
+
+// What the API should actually be sent: the stable half marked cacheable, the live half after it.
+// If the stable half is ever too small to cache the API simply ignores the marker, so this is
+// safe on any model — no minimum-token branching needed here.
+function systemBlocks(query, opts) {
+  return [
+    { type: 'text', text: systemStable(), cache_control: { type: 'ephemeral', ttl: '1h' } },
+    { type: 'text', text: systemVolatile(query, opts) },
+  ];
 }
 
 // ═══════════════════════════ COIN ═══════════════════════════
@@ -4362,7 +4556,7 @@ async function chatVideoDrop(rawText) {
     const res = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
       headers: { 'Content-Type':'application/json', 'x-api-key': apiKey, 'anthropic-version':'2023-06-01', 'anthropic-dangerous-direct-browser-access':'true' },
-      body: JSON.stringify({ model: modelFor('smart'), max_tokens: 1200, system: buildSystemPrompt('video dropped into chat'),
+      body: JSON.stringify({ model: modelFor('smart'), max_tokens: 1200, system: systemBlocks('video dropped into chat'),
         messages: [{ role:'user', content: `The user dropped a video link into chat. Here is its transcript (auto-captions, may have errors):\n\n${transcript.slice(0, 60000)}\n\nGive a tight, useful read — three sections, no fluff:\n1. WHAT IT SAYS — the key information or method in a few bullets.\n2. SETUPS — any specific tradeable views in it (asset, direction, levels, conditions). If it teaches a METHOD with no live calls, give the method's exact entry/exit rules instead.\n3. FIT — one short paragraph: how this fits or clashes with the user's swing system (4H/Daily/Weekly; sub-4H signals are treated as noise). If it's scalping or sub-4H material, say plainly that it conflicts with the system unless used as a separate playbook.` }] })
     });
     const data = await res.json();
@@ -4718,7 +4912,7 @@ For a WAIT, you may leave price/slLevel/targets as null. Otherwise base levels o
       body: JSON.stringify({
         model,
         max_tokens: 800,
-        system: buildSystemPrompt((text || '') + ' ' + coin, { full: true }),
+        system: systemBlocks((text || '') + ' ' + coin, { full: true }),
         messages: [{ role: 'user', content: msgContent }]
       })
     });
@@ -4876,7 +5070,7 @@ Give me ONE line per asset, format exactly "TICKER: direction → key level — 
     const res = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'x-api-key': apiKey, 'anthropic-version': '2023-06-01', 'anthropic-dangerous-direct-browser-access': 'true' },
-      body: JSON.stringify({ model: modelFor('smart'), max_tokens: 600, system: buildSystemPrompt(q), messages: [{ role: 'user', content: q }] })
+      body: JSON.stringify({ model: modelFor('smart'), max_tokens: 600, system: systemBlocks(q), messages: [{ role: 'user', content: q }] })
     });
     if (!res.ok) { const e = await res.json().catch(() => ({})); throw new Error(e.error?.message || `HTTP ${res.status}`); }
     const reply = extractText(await res.json()) || '(no text returned)';
@@ -5127,7 +5321,7 @@ async function send() {
       body: JSON.stringify({
         model,
         max_tokens: deepMode ? 2000 : 1024,
-        system: buildSystemPrompt((text || '') + ' ' + ((asset && asset.sym) || coin), { full: deepMode }),
+        system: systemBlocks((text || '') + ' ' + ((asset && asset.sym) || coin), { full: deepMode }),
         messages: history
       })
     });
@@ -6376,7 +6570,7 @@ async function sigBrainRead(h) {
     const res = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
       headers: { 'Content-Type':'application/json', 'x-api-key': apiKey, 'anthropic-version':'2023-06-01', 'anthropic-dangerous-direct-browser-access':'true' },
-      body: JSON.stringify({ model: modelFor('light'), max_tokens: 220, system: buildSystemPrompt(h.coin + ' signal card read'),
+      body: JSON.stringify({ model: modelFor('light'), max_tokens: 220, system: systemBlocks(h.coin + ' signal card read'),
         messages: [{ role:'user', content:
 `The auto-scan flagged ${h.coin} ${h.dir.toUpperCase()}: ${h.label || 'setup'}. Evidence: ${(h.ev || []).join('; ') || 'n/a'}.
 Computed plan (1D): entry ${formatPrice(h.entry)}${h.plan ? `, stop ${formatPrice(h.plan.stop)}, T1 ${formatPrice(h.plan.targets[0].px)} / T2 ${formatPrice(h.plan.targets[1].px)} / T3 ${formatPrice(h.plan.targets[2].px)}` : ''}.
@@ -6500,7 +6694,7 @@ async function sigFullVerdict() {
     const res = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
       headers: { 'Content-Type':'application/json', 'x-api-key': apiKey, 'anthropic-version':'2023-06-01', 'anthropic-dangerous-direct-browser-access':'true' },
-      body: JSON.stringify({ model: modelFor('smart'), max_tokens: 900, system: buildSystemPrompt(h.coin + ' full verdict signal card', { full: true }),
+      body: JSON.stringify({ model: modelFor('smart'), max_tokens: 900, system: systemBlocks(h.coin + ' full verdict signal card', { full: true }),
         messages: [{ role:'user', content:
 `The auto-scan flagged ${h.coin} ${h.dir.toUpperCase()}: ${h.label || 'setup'}. Evidence: ${(h.ev || []).join('; ') || 'n/a'}.
 Computed plan (1D): entry ${formatPrice(h.entry)}${h.plan ? `, stop ${formatPrice(h.plan.stop)}, targets ${h.plan.targets.map(t=>formatPrice(t.px)).join(' / ')}` : ''}.
@@ -7426,7 +7620,7 @@ Rules: 1-4 conditions, all from the list; dir is "long" or "short" (pick the one
   const res = await fetch('https://api.anthropic.com/v1/messages', {
     method: 'POST',
     headers: { 'x-api-key': apiKey, 'anthropic-version': '2023-06-01', 'content-type': 'application/json', 'anthropic-dangerous-direct-browser-access': 'true' },
-    body: JSON.stringify({ model: modelFor('smart'), max_tokens: 700, system: sys, messages: [{ role: 'user', content: text.slice(0, 2000) }] })
+    body: JSON.stringify({ model: modelFor('smart'), max_tokens: 700, system: cacheable(sys), messages: [{ role: 'user', content: text.slice(0, 2000) }] })
   });
   const data = await res.json();
   let txt = extractText(data).trim(), obj = null;
@@ -7532,7 +7726,7 @@ Propose up to ${n} NEW candidate patterns. JSON only.`;
   const res = await fetch('https://api.anthropic.com/v1/messages', {
     method: 'POST',
     headers: { 'x-api-key': apiKey, 'anthropic-version': '2023-06-01', 'content-type': 'application/json', 'anthropic-dangerous-direct-browser-access': 'true' },
-    body: JSON.stringify({ model: modelFor('smart'), max_tokens: 1500, system: sys, messages: [{ role: 'user', content: usr }] })
+    body: JSON.stringify({ model: modelFor('smart'), max_tokens: 1500, system: cacheable(sys), messages: [{ role: 'user', content: usr }] })
   });
   const data = await res.json();
   let txt = extractText(data).trim(), arr = null;
@@ -7598,6 +7792,11 @@ async function runDiscovery(manual) {
     }
     // ── Idea source 2: the brain proposes fresh combinations ──
     setLabStatus('Asking the brain for candidate patterns…');
+    if (typeof autoSpendAllowed === 'function' && !autoSpendAllowed()) {
+      // The lab is entirely background work, so it yields to the cap without argument.
+      try { setLabStatus && setLabStatus('Paused — daily API budget reached.'); } catch {}
+      return { valid: [], invalid: [] };
+    }
     const { valid, invalid } = await proposeCandidates(apiKey, 14);
     setLabStatus(`Backtesting ${valid.length} candidates out-of-sample (1D + 4H)…`);
     for (const cand of valid) {
@@ -8305,7 +8504,7 @@ Give me your single most accurate, calibrated VERDICT, cross-checking these comp
     const res = await fetch('https://api.anthropic.com/v1/messages', {
       method:'POST',
       headers:{ 'Content-Type':'application/json','x-api-key':apiKey,'anthropic-version':'2023-06-01','anthropic-dangerous-direct-browser-access':'true' },
-      body: JSON.stringify({ model, max_tokens: 1500, system: buildSystemPrompt(r.coin + ' verdict scan', { full: true }), messages: [{ role:'user', content: q }] })
+      body: JSON.stringify({ model, max_tokens: 1500, system: systemBlocks(r.coin + ' verdict scan', { full: true }), messages: [{ role:'user', content: q }] })
     });
     if (!res.ok) { const e = await res.json().catch(()=>({})); throw new Error(e.error?.message || `HTTP ${res.status}`); }
     const reply = (extractText(await res.json()) || '').trim() || '(no response)';
@@ -9058,13 +9257,21 @@ document.addEventListener('click', function(e){
       if((t.market||'crypto')!=='crypto') return;                    // the bot only trades crypto
       if(!Number.isFinite(+t.sl)||!Number.isFinite(+t.tp1)) return;  // no plan = ungradeable, skip
       const key=localStorage.getItem('mc_key'); if(!key) return;     // no API key = shadow stays silent
+      // The daily cap only ever stops AUTOMATIC spending. This verdict is one the app decided to
+      // ask for, so it is exactly what the cap is for; a message John types is not.
+      if(typeof autoSpendAllowed==='function' && !autoSpendAllowed()){
+        if(!window._capSaid){ window._capSaid=1;
+          try{ if(typeof addAIMsg==='function') addAIMsg('**Daily API budget reached.** Background work — shadow verdicts, the discovery lab — is paused until midnight. Your chats and anything you tap still run normally. Raise or clear the cap in the API spend panel.'); }catch{}
+        }
+        return;
+      }
       if(brainLog().some(e=>e.id===t.id)) return;                    // one verdict per trade
       const score=Number(t.score||0);
       const vetOK=(t.source==='auto-scan'&&t.vetGrade&&t.vetGrade!=='negative'); // demo phase: only a negative vet disqualifies
       const botTook=(score>=num(LS.min,8))||vetOK;                   // the numeric rule's call (pre-guards)
       // noBot: the decision log is full of "score X below minimum 8" — showing it would anchor
       // the verdict on the very rule we're testing it against. KB + pattern stats still attached.
-      const sys=(typeof buildSystemPrompt==='function')?buildSystemPrompt(t.coin+' '+(t.dir||'long')+' exec verdict',{noBot:true}):'You are a disciplined crypto trading brain.';
+      const sys=(typeof systemBlocks==='function')?systemBlocks(t.coin+' '+(t.dir||'long')+' exec verdict',{noBot:true}):'You are a disciplined crypto trading brain.';
       // BLIND JUDGEMENT (2026-08-09): the numeric verdict and the raw score are deliberately
       // WITHHELD. Shown them, the brain just echoed "score 5 below minimum 8" — anchoring on the
       // rule instead of reading the setup, which makes the brain-vs-numeric comparison worthless.
