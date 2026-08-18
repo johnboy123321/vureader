@@ -617,7 +617,18 @@ function planValid(t) {
   if (isLong && sl >= en) return `LONG stop ${sl} is not below entry ${en}`;
   if (!isLong && sl <= en) return `SHORT stop ${sl} is not above entry ${en}`;
   const dist = Math.abs(en - sl) / en;
-  if (dist < 0.003) return `stop only ${(dist * 100).toFixed(2)}% from entry — too tight`;
+  // ── A STOP MUST BE WIDE ENOUGH TO PAY FOR THE TRADE (2026-08-18) ─────────────────────────────
+  // The old floor was 0.3%. Round-trip cost is about 22bps (2 x 6bps taker + 10bps slippage), and
+  // cost measured in R is simply cost% / stop% — so a 0.3% stop hands 73% of the risk to the
+  // exchange before the idea has a chance. For costs to stay under a tenth of R the stop has to
+  // clear ~2.2%. Three years of replay drew the same line independently: coins with an ATR under
+  // 2% of price lost £0.91 a trade while the rest made money.
+  //
+  // The exchange agrees. Every TE_SELL_SL_SHOULD_GT_BASE / TE_BUY_SL_SHOULD_LT_BASE rejection in
+  // the live log on 2026-08-17/18 was a stop between 0.4% and 0.8% wide — close enough to the
+  // market that it was already on the wrong side by the time the order arrived.
+  const MIN_STOP_PCT = num("MIN_STOP_PCT", 0.022);
+  if (dist < MIN_STOP_PCT) return `stop only ${(dist * 100).toFixed(2)}% from entry — below the ${(MIN_STOP_PCT * 100).toFixed(1)}% floor, costs would eat ${(0.0022 / dist * 100).toFixed(0)}% of the risk`;
   if (dist > 0.35) return `stop ${(dist * 100).toFixed(0)}% from entry — implausible plan`;
   const tp = +t.tp1;
   if (Number.isFinite(tp) && tp > 0 && ((isLong && tp <= en) || (!isLong && tp >= en))) return `target ${tp} on the wrong side of entry`;
@@ -1560,14 +1571,29 @@ function gradeOne(rec, candles) {
     const c = candles[i];
     const hitStop = isLong ? c.l <= rec.stop : c.h >= rec.stop;
     const hitTgt  = isLong ? c.h >= rec.target : c.l <= rec.target;
+    if (hitStop && hitTgt) rec.ambiguous = (rec.ambiguous || 0) + 1;   // counted, never hidden
     if (hitStop) return -1;
     if (hitTgt) return +Math.abs(rec.target - rec.entry) / risk;
-    if (i - start >= SHADOW_TIMEOUT_BARS) {
+    // The cap is 40 bars OF THE SIGNAL'S timeframe. Graded on a finer one, that is 4x as many
+    // bars — otherwise a 4H idea would be marked to market after less than a day.
+    if (i - start >= SHADOW_TIMEOUT_BARS * (rec.tfMult || 4)) {
       return (isLong ? c.c - rec.entry : rec.entry - c.c) / risk;   // marked to market
     }
   }
   return null;                                  // not enough candles yet — leave it open
 }
+
+// ── GRADE ON A FINER TIMEFRAME THAN THE SIGNAL (2026-08-18) ──────────────────────────────────
+// gradeOne checks the stop BEFORE the target inside each candle, which is the right pessimism —
+// but applied to the SIGNAL's own timeframe it is ruinous. A 4H candle is wide enough to contain
+// both a 1R stop and a 2.25R target most of the time, so every such bar scored as a loss. The
+// live evidence on 2026-08-18: of 43 graded 4H records, **43 were losses**. Not a market fact,
+// an artefact of the resolution it was measured at — and this grader is what decides which rules
+// get promoted, so it was quietly corrupting every conclusion the shadow framework reached.
+//
+// Walking the timeframe BELOW the signal cuts the candles that can contain both levels by 4x.
+// The same reasoning the confirmation watcher already uses.
+const GRADE_TF_BELOW = { "1D": "4H", "4H": "1H", "1H": "30m", "30m": "15m", "15m": "15m" };
 
 async function gradeShadow(sh) {
   const cutoff = Date.now() - SHADOW_GRADE_AFTER_H * 3600e3;
@@ -1575,20 +1601,23 @@ async function gradeShadow(sh) {
   for (const id of Object.keys(sh)) {
     for (const rec of sh[id].records) {
       if (rec.R !== null || rec.at > cutoff) continue;
-      const k = rec.coin + "|" + (rec.tf || "1D");
+      const gtf = GRADE_TF_BELOW[rec.tf || "1D"] || "1H";
+      const k = rec.coin + "|" + gtf;
       if (!need.has(k)) need.set(k, []);
       need.get(k).push(rec);
     }
   }
   let graded = 0;
   for (const [k, recs] of need) {
-    const [coin, tf] = k.split("|");
+    const [coin, gtf] = k.split("|");
     let candles = null;
-    try { candles = await fetchCandles(coin, tf, 300); } catch {}
+    // 600 bars of the finer timeframe covers a longer stretch of history than 300 of the coarser
+    // one did, so a decision cannot age out of the window before it resolves.
+    try { candles = await fetchCandles(coin, gtf, 600); } catch {}
     if (!candles) continue;
     for (const rec of recs) {
       const R = gradeOne(rec, candles);
-      if (R !== null) { rec.R = +R.toFixed(3); graded++; }
+      if (R !== null) { rec.R = +R.toFixed(3); rec.gtf = gtf; graded++; }
     }
   }
   return graded;
@@ -1610,10 +1639,18 @@ function shadowJudge(sh, id) {
   const ready = base.n >= SHADOW_MIN_RESOLVED && varr.n >= SHADOW_MIN_RESOLVED;
   const edge = +(varr.meanR - base.meanR).toFixed(3);
   let changed = null;
-  if (ready && !slot.promoted && edge >= SHADOW_MARGIN_R) {
+  // ── BEATING A LOSER IS NOT WINNING (2026-08-18) ──────────────────────────────────────────────
+  // On 2026-08-18 this gate promoted rank_vs_threshold on an edge of +0.084R — while the variant
+  // was losing 0.705R a trade and the baseline 0.789R. "Better than the incumbent" was the only
+  // test, so the system handed control to a rule that loses money, because it lost slightly less.
+  // A relative test needs an absolute floor underneath it or it will always find a winner.
+  const variantPays = varr.meanR > 0;
+  if (ready && !slot.promoted && edge >= SHADOW_MARGIN_R && variantPays) {
     slot.promoted = true; changed = "promoted";
-  } else if (ready && slot.promoted && edge < 0) {
-    slot.promoted = false; changed = "demoted";     // hands control straight back
+  } else if (ready && slot.promoted && (edge < 0 || varr.meanR <= 0)) {
+    // Demoted either for falling behind the baseline OR for simply not making money. The second
+    // clause also unwinds any promotion granted before the floor existed.
+    slot.promoted = false; changed = "demoted";
   }
   if (changed) slot.history.push({ at: Date.now(), changed, base, varr, edge });
   return { ready, base, varr, edge, promoted: slot.promoted, changed };
