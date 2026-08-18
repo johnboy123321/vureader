@@ -667,7 +667,16 @@ function buildOrder(t) {
   // off a price we never trade at makes the £ risk wrong in both modes — and in structure mode it
   // was wrong by the entire point of the feature, cancelling out the bigger position the better
   // entry had earned. Found by a test asserting the size should grow. It had not.
-  const stopDist = Math.abs(cross - sl);
+  // ── ...WHICH IS NOT ALWAYS THE ORDER PRICE (2026-08-18) ──────────────────────────────────────
+  // The 2026-08-15 note above is right for one of the two modes. A limit that crosses 1% THROUGH
+  // the market is marketable: it fills at the market, which is about `entry` — it does NOT fill at
+  // `cross`. Sizing off `cross` in immediate mode therefore adds a phantom 1% of price to the stop
+  // distance and buys too little. Measured over a 3-year replay of the live rules: the bot risked
+  // a mean of £7.28 every time it believed it was risking £10, and on a tight stop it was worse
+  // than that. A RESTING limit (structure mode) genuinely does fill at its own price, and there
+  // `cross` was always correct. So size off whichever price this order will actually trade at.
+  const fillPx = entryKind === "immediate" ? entry : cross;
+  const stopDist = Math.abs(fillPx - sl);
   if (!(stopDist > 0)) return { err: "zero stop distance at the order price" };
   let qty = roundQty(CFG.risk() / stopDist); if (!(qty > 0)) return { err: "computed qty <= 0" };
 
@@ -685,6 +694,7 @@ function buildOrder(t) {
     if (!(qty > 0)) return { err: "notional cap leaves no tradeable size" };
   }
   const riskActual = +(qty * stopDist).toFixed(2);
+  const sizedOff = +fillPx;                     // recorded so "what did it actually risk" is answerable
   const tp2 = Number(t.tp2);
   const exitPx = Number.isFinite(tp2) && tp2 > 0 ? tp2 : (Number.isFinite(tp1) ? tp1 : undefined);
   return {
@@ -695,7 +705,7 @@ function buildOrder(t) {
       takeProfitRp: exitPx,
       clOrdID: ("agent" + t.coin + Date.now()).replace(/[^a-zA-Z0-9]/g, "").slice(0, 30),
     },
-    meta: { symbol, qty, exitPx, riskActual, clamped, entryKind, stopKind: t.stopKind, zone: t.zone || undefined },
+    meta: { symbol, qty, exitPx, riskActual, clamped, entryKind, sizedOff, stopKind: t.stopKind, zone: t.zone || undefined },
   };
 }
 
@@ -1203,6 +1213,80 @@ function closeOrderFor(pos) {
 //   · the system improves without John deciding it has improved — the evidence decides
 //
 // Nothing here places an order. A shadow record is a DECISION, never an instruction.
+// ═══════════════════ UNFILLED ORDERS MUST NOT LIVE FOREVER (2026-08-18) ═══════════════════
+// `ENTRY_EXPIRY_H` has sat in CFG since the entry-mode work and was never read once, so every
+// unfilled limit was GoodTillCancel in the most literal sense: it rested until something touched
+// it, however long that took and however dead the idea had become. In a three-year replay of
+// these rules, 74 orders filled AFTER price had already traded through their own stop level —
+// opening a position the exchange then closed on the spot. The signal was hours or days old and
+// the stop and target had been computed from a bar that no longer meant anything.
+//
+// So: remember what was placed, and cancel anything still resting past the expiry. An order that
+// has already filled is simply forgotten — that position is real and its stop is on the exchange.
+const RESTING_KEY = "cipher_resting";
+const RESTING_FORGET_MS = 7 * 864e5;          // a record we could never resolve is dropped after a week
+
+// Pure, so it can be tested without a venue: which remembered orders are past their expiry.
+function staleIds(book, now, hours) {
+  const cutoff = now - hours * 3600e3;
+  return Object.keys(book || {}).filter(id => book[id] && book[id].at <= cutoff);
+}
+
+async function rememberResting(meta, order, coin, dir, orderID) {
+  if (!meta || !order || !order.clOrdID) return;
+  const book = await getJSON(RESTING_KEY, {});
+  book[order.clOrdID] = { symbol: meta.symbol, clOrdID: order.clOrdID, orderID: orderID || "",
+                          coin, dir, at: Date.now() };
+  await setJSON(RESTING_KEY, book);
+}
+
+async function cancelOrder(symbol, orderID, clOrdID) {
+  if (!CFG.direct()) return false;              // the relay has no cancel route; say so rather than pretend
+  try {
+    const q = `symbol=${encodeURIComponent(symbol)}&` +
+              (orderID ? `orderID=${encodeURIComponent(orderID)}` : `clOrdID=${encodeURIComponent(clOrdID)}`);
+    const r = await phemexCall("DELETE", "/g-orders/cancel", q, null);
+    return r.status === 200 && r.data && !r.data.error;
+  } catch { return false; }
+}
+
+async function expireStaleOrders() {
+  const hours = CFG.entryExpiryH();
+  const out = { checked: 0, cancelled: 0, cleared: 0, blind: 0 };
+  if (!(hours > 0)) return out;
+  const book = await getJSON(RESTING_KEY, {});
+  const stale = staleIds(book, Date.now(), hours);
+
+  const bySym = new Map();
+  for (const id of stale) {
+    const r = book[id];
+    if (!bySym.has(r.symbol)) bySym.set(r.symbol, []);
+    bySym.get(r.symbol).push({ id, ...r });
+  }
+  for (const [symbol, recs] of bySym) {
+    out.checked += recs.length;
+    let live = null;
+    try { live = await execOrdersFor(symbol); } catch { live = null; }
+    // If we cannot see the book we do NOT guess. Cancelling blind and forgetting blind are both
+    // ways of losing track of a real order — the same reasoning as the no-hedge rule's refusal.
+    if (!Array.isArray(live)) { out.blind += recs.length; continue; }
+    for (const r of recs) {
+      const still = live.find(o => o && (o.clOrdID === r.clOrdID || (r.orderID && o.orderID === r.orderID)));
+      if (!still) { delete book[r.id]; out.cleared++; continue; }          // filled, or already gone
+      const ok = await cancelOrder(symbol, still.orderID, r.clOrdID);
+      if (ok) {
+        delete book[r.id]; out.cancelled++;
+        await pushLog({ coin: r.coin, dir: r.dir, result: "EXPIRED",
+          skipped: `unfilled after ${hours}h — cancelled. The plan behind it is stale; a fresh signal can place a fresh order.` });
+      }
+    }
+  }
+  const now = Date.now();
+  for (const id of Object.keys(book)) if (book[id].at < now - RESTING_FORGET_MS) delete book[id];
+  await setJSON(RESTING_KEY, book);
+  return out;
+}
+
 // ═══════════════════════ MARKET REGIME (measurement only) ═══════════════════════
 // John's idea: "if you short in a bull market you'll get more losses, and vice versa — so define
 // bull vs bear and let the bot adjust."  Sound instinct, and testable. When it WAS tested against
@@ -1520,6 +1604,15 @@ export default async function cipherAgent() {
   const dayAgo = Date.now() - 864e5;
   let placedToday = log24.filter(e => new Date(e.at).getTime() > dayAgo).length;
 
+  // Clear out anything that never filled before scanning, so a coin freed by an expiry can be
+  // looked at again on this same run rather than waiting another fifteen minutes.
+  if (mode === "armed") {
+    try {
+      const ex = await expireStaleOrders();
+      if (ex.checked) console.log(`entry expiry: ${ex.checked} past ${CFG.entryExpiryH()}h — ${ex.cancelled} cancelled, ${ex.cleared} already gone${ex.blind ? `, ${ex.blind} unreadable (left alone)` : ""}`);
+    } catch (e) { console.error("entry expiry pass failed (harmless, cancels only):", e && e.message); }
+  }
+
   let scanned = 0, candidates = 0, placed = 0;
   const rankPool = [];                       // every coin's best signal this run, threshold or not
   const SHADOW = await loadShadow();
@@ -1675,7 +1768,8 @@ export default async function cipherAgent() {
     // fault is not a decision, so undo the mark and let the next sweep have another go. A 4xx IS
     // a decision (cap breached, bad symbol) and would just repeat, so that one stays burned.
     if (!ok && r.status >= 500) delete fired[key];
-    if (ok) { placed++; placedToday++; placedInBook[book]++;
+    if (ok) { try { await rememberResting(built.meta, built.order, coin, sig.bias, oid); } catch {}
+      placed++; placedToday++; placedInBook[book]++;
       openedThisRun.push({ book, dir: sig.bias, coin, plan: { entry: t.entry, stop: t.sl, target: t.tp2 ?? t.tp1 } });
       held.add(book + "|" + coin); noteOpened(book, coin, sig.bias); }
   }
