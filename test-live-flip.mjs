@@ -343,6 +343,40 @@ console.log('\n  A SETTINGS READ THAT TIMES OUT HANDS CONTROL TO A STALE DEFAULT
   ok('a failed read still changes nothing', /live config: unreachable[\s\S]{0,120}return null/.test(src));
 }
 
+console.log('\n  A REFUSED SELL, AND WHY IT WAS REFUSED');
+{
+  // 2026-08-19, first live flip sell: an order for the entire wallet balance came back
+  // TE_PLACE_ORDER_INSUFFICIENT_BASE_BALANCE. Two causes, both fixed here.
+  ok('sell quantities are floored, never rounded up',
+     /order\.baseQtyEv = Math\.floor/.test(src));
+  ok('buy amounts are floored too', /order\.quoteQtyEv = Math\.floor/.test(src));
+  ok('no Math.round survives in the order builder',
+     !/Math\.round\((baseQty|quoteQty)/.test(src));
+  ok('the sell is sized against the wallet as well as the book', /Math\.min\(e\.units, walletBase\)/.test(src));
+  ok('and the buy against the quote wallet', /Math\.min\(e\.cash, walletQuote\)/.test(src));
+  ok('the cap is checked against what will actually be sent', /const notional = isSell \? sellQty \* e\.px : buyQty;/.test(src));
+  ok('locked balance is separated from total', /baseAvailable = \(ev - lockedEv\)/.test(src));
+  ok('and available wins when the venue reports it', /if \(out\.baseAvailable >= 0\) out\.baseBalance = out\.baseAvailable;/.test(src));
+
+  // The rollback that saved this one has to keep working.
+  ok('a refusal still rolls the book back rather than absorbing it',
+     /if \(placeFailed\)[\s\S]{0,400}lfBefore/.test(src));
+}
+
+console.log('\n  FLOORING IS ARITHMETICALLY SAFE');
+{
+  // Floor can only ever leave a crumb; round can ask for more than is held.
+  const scale = 8;
+  const held = 0.00767931;
+  const evFloor = Math.floor(held * 10 ** scale);
+  ok('a floored quantity never exceeds the balance', evFloor / 10 ** scale <= held,
+     `${evFloor / 10 ** scale} vs ${held}`);
+  const awkward = 0.123456789;               // more precision than the scale can hold
+  ok('and that holds for a quantity finer than the scale',
+     Math.floor(awkward * 10 ** scale) / 10 ** scale <= awkward);
+  ok('rounding would NOT have held', Math.round(awkward * 10 ** scale) / 10 ** scale > awkward);
+}
+
 fs.unlinkSync(out);
 console.log(`\n  ${pass} passed, ${fail} failed\n`);
 process.exit(fail ? 1 : 0);

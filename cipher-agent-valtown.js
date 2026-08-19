@@ -2230,15 +2230,21 @@ function buildSpotOrder(sym, side, { price, baseQty, quoteQty }, products) {
   // qtyType is REQUIRED and tells the venue which of the two quantity fields to read. Missing it
   // was a real defect, caught 2026-08-19 by reading Phemex's own spot docs rather than trusting
   // the shape I had inferred. A sell is sized in the coin; a buy is sized in the money.
+  // ── FLOOR, NEVER ROUND (2026-08-19) ────────────────────────────────────────────────────────
+  // Math.round can round a quantity UP, which asks the venue to sell coins that are not there or
+  // spend money that is not there. Phemex answers that with
+  // TE_PLACE_ORDER_INSUFFICIENT_BASE_BALANCE — which is exactly what killed the first live flip
+  // sell, an order for the entire wallet balance where the last scaled digit went the wrong way.
+  // Flooring can only ever leave a sub-tick crumb behind; rounding can lose the whole order.
   if (side === "Sell") {
     if (!(baseQty > 0)) return { err: "sell needs a base quantity" };
     order.qtyType = "ByBase";
-    order.baseQtyEv = Math.round(baseQty * 10 ** p.baseValueScale);
+    order.baseQtyEv = Math.floor(baseQty * 10 ** p.baseValueScale);
     if (!(order.baseQtyEv > 0)) return { err: "base quantity rounds to zero at this scale" };
   } else {
     if (!(quoteQty > 0)) return { err: "buy needs a quote amount" };
     order.qtyType = "ByQuote";
-    order.quoteQtyEv = Math.round(quoteQty * 10 ** p.quoteValueScale);
+    order.quoteQtyEv = Math.floor(quoteQty * 10 ** p.quoteValueScale);
     if (!(order.quoteQtyEv > 0)) return { err: "quote amount rounds to zero at this scale" };
   }
   return { order };
@@ -2287,6 +2293,17 @@ async function spotPreflight(coin) {
       if (row && Number.isFinite(scale)) {
         const ev = Number(row.balanceEv ?? row.balance);
         if (Number.isFinite(ev)) out.baseBalance = ev / 10 ** scale;
+        // AVAILABLE is not the same as BALANCE. Anything locked in a resting order is still in
+        // `balanceEv` but cannot be sold, and the venue answers the difference with
+        // INSUFFICIENT_BASE_BALANCE rather than telling you which part was unavailable. Record
+        // both, and prefer the available figure when the venue reports one.
+        const lockedEv = Number(row.lockedTradingBalanceEv ?? row.lockedBalanceEv ?? row.lockedEv);
+        if (Number.isFinite(lockedEv)) {
+          out.baseLocked = lockedEv / 10 ** scale;
+          out.baseAvailable = (ev - lockedEv) / 10 ** scale;
+          if (out.baseAvailable >= 0) out.baseBalance = out.baseAvailable;
+        }
+        out.baseRow = JSON.stringify(row).slice(0, 300);   // so a refusal can be diagnosed once
       }
       const qrow = all.find(r => String(r.currency || r.currencyCode || "").toUpperCase() === "USDT");
       const qscale = out.product ? out.product.quoteValueScale : NaN;
@@ -2894,14 +2911,23 @@ async function runAccumulator() {
               let execNote = "Measure only — no order placed.";
               try {
                 const prods = await spotProducts();
+                // ── SIZE FROM THE WALLET, NOT ONLY FROM THE BOOK ─────────────────────────────
+                // The book is what the strategy believes it holds; the wallet is what Phemex will
+                // actually let it sell. They can differ — a fee taken in base, part of the balance
+                // locked, a rounding crumb — and the venue arbitrates, not us. Taking the smaller
+                // of the two means a disagreement costs a crumb rather than the whole order.
+                const walletBase = PF && Number.isFinite(PF.baseBalance) ? PF.baseBalance : null;
+                const sellQty = walletBase != null ? Math.min(e.units, walletBase) : e.units;
+                const walletQuote = PF && Number.isFinite(PF.quoteBalance) ? PF.quoteBalance : null;
+                const buyQty = walletQuote != null ? Math.min(e.cash, walletQuote) : e.cash;
                 const built = isSell
-                  ? buildSpotOrder(coin, "Sell", { price: e.px, baseQty: e.units }, prods)
-                  : buildSpotOrder(coin, "Buy", { price: e.px, quoteQty: e.cash }, prods);
+                  ? buildSpotOrder(coin, "Sell", { price: e.px, baseQty: sellQty }, prods)
+                  : buildSpotOrder(coin, "Buy", { price: e.px, quoteQty: buyQty }, prods);
                 if (built.err) {
                   execNote = `Spot order NOT built: ${built.err}`;
                   if (armedExec) placeFailed = built.err;
                 } else {
-                  const notional = isSell ? e.units * e.px : e.cash;
+                  const notional = isSell ? sellQty * e.px : buyQty;
                   const sr = await sendSpotOrder(built.order, notional, { cap: capUsdt });
                   execNote = sr.ok ? `SPOT ${isSell ? "SELL" : "BUY"} PLACED (${built.order.clOrdID})`
                            : sr.dry ? `dry run — would have sent a SPOT ${isSell ? "sell" : "buy"} (${sr.why})`
