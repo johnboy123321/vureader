@@ -14,7 +14,7 @@ import { pathToFileURL } from 'node:url';
 const src = fs.readFileSync('cipher-agent-valtown.js', 'utf8');
 const out = path.join(process.cwd(), '.liveflip-under-test.mjs');
 fs.writeFileSync(out, src.replace(/\n\/\/ ── Node \/ GitHub Actions entry point[\s\S]*$/, '\n') +
-  '\nexport { liveFlipStep, accumFlipStep, accumStep, applyLiveConfig, CFG, FLIP_TFS, aggregateBars, waveTrend };\n');
+  '\nexport { liveFlipStep, accumFlipStep, accumStep, applyLiveConfig, CFG, FLIP_TFS, aggregateBars, waveTrend, runAccumulator };\n');
 const M = await import(pathToFileURL(out).href);
 
 let pass = 0, fail = 0;
@@ -276,6 +276,32 @@ console.log('\n  GUARDS PRESENT IN THE DRIVER');
   ok('the live arm is stored apart from the paper arms', /LIVE_FLIP_KEY = "cipher_accum_liveflip"/.test(src));
   ok('the live arm books at the real fee, not the paper 1bp',
      /feeBps = num\("ACCUM_FEE_BPS", 10\)/.test(src));
+}
+
+console.log('\n  THE ACCUMULATOR IS NOT GOVERNED BY THE FUTURES BOT');
+{
+  // 2026-08-19: the relay /config read timed out, MODE fell back to "off", the agent returned at
+  // the idle check, and the accumulator — a different strategy on a different product — never
+  // ran. John watched dots print with nothing listening. These pin the fix.
+  ok('the accumulator lives in its own function', /async function runAccumulator\(\)/.test(src));
+  ok('MODE=off still runs it before returning',
+     /MODE=off[\s\S]{0,600}await runAccumulator\(\);\s*\n\s*return;/.test(src));
+  ok('the idle log no longer claims the whole agent is idle', /futures scanner idle/.test(src));
+  ok('the scan path still runs it too', (src.match(/await runAccumulator\(\);/g) || []).length === 2,
+     (src.match(/await runAccumulator\(\);/g) || []).length);
+  ok('KILL still stops spot orders on the order path', /if \(CFG\.kill\(\)\) return \{ dry: true, why: "KILL switch is on"/.test(src));
+
+  // Declaration hoisting makes source order irrelevant, so assert the thing that actually
+  // matters: the module loads and the function is really there to be called.
+  ok('runAccumulator is a real callable, not just a string in the source',
+     typeof M.runAccumulator === 'function', typeof M.runAccumulator);
+}
+
+console.log('\n  A SETTINGS READ THAT TIMES OUT HANDS CONTROL TO A STALE DEFAULT');
+{
+  ok('the config read timeout is no longer 8s', !/ac\.abort\(\), 8000/.test(src));
+  ok('it is 20s, and overridable', /num\("CONFIG_TIMEOUT_MS", 20000\)/.test(src));
+  ok('a failed read still changes nothing', /live config: unreachable[\s\S]{0,120}return null/.test(src));
 }
 
 fs.unlinkSync(out);

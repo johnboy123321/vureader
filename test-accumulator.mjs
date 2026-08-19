@@ -145,7 +145,8 @@ console.log('\n7. The DECISION core cannot trade (the spot rails are a separate,
   ok('no order function anywhere in the decision core',
      !/execOrder|directOrder|buildOrder|cancelOrder|closeOrderFor|rememberResting|phemexCall|sendSpotOrder/.test(block));
   ok('and no venue I/O at all in it', !/fetch\(|phemexPublic/.test(block));
-  const runBlock = src.slice(src.indexOf('THE ACCUMULATOR: a second objective'), src.indexOf('await setJSON(BOOKMAP_KEY'));
+  const runBlock = src.slice(src.indexOf('async function runAccumulator()'), src.indexOf('// \u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550 THE LOOP'));
+  if(runBlock.length < 5000) { fail++; console.log('  FAIL runBlock slice collapsed \u2014 markers moved, length ' + runBlock.length); }
   ok('the run loop never touches the FUTURES order path', !/execOrder|directOrder|buildOrder\(/.test(runBlock));
   ok('it reaches the venue only through the braked spot helper', /sendSpotOrder\(/.test(runBlock));
   ok('it can be switched off', /env\("ACCUM", "1"\)/.test(src));
