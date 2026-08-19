@@ -1643,6 +1643,110 @@ function smaAt(candles, n) {
   return s / n;
 }
 
+// ═══════════════ THE ACCUMULATOR (2026-08-19) ═══════════════
+// A SECOND, SEPARATE OBJECTIVE. Everything else in this file is trying to make £. This is trying
+// to end the year holding more BTC than it started with — units, not money. John's spec:
+//
+//   "sell on the daily red dot, then stagger buys back in as soon as price drops below the sell
+//    entry. We don't have to find tops and bottoms, just trade within ranges."
+//
+// Backtested first on 14.5 years of real BTC before a line of this was written. What that said:
+//   · the revisit tendency is REAL — a −1% level comes back 83% of the time within 5 days, −2%
+//     comes back 68%. Measured on BTC and TSLA; the numbers are nearly identical.
+//   · the VuManChu dot barely improves those odds (1–5 points on BTC, nothing on TSLA). The
+//     ladder works because of the market's revisit tendency, not because of the signal.
+//   · the arithmetic is brutal and exact: at a −2% rung you win ~1.8% of the slice 83% of the
+//     time and lose a MEDIAN 20% the other 17%. That is −1.9% per cycle in units.
+//   · so it GAINS units in ranges and falls, and LOSES them in sustained rallies. Full history
+//     −27.8%; since Jan 2024 +14.9%. Costs are irrelevant either way (zero fees moved TSLA by
+//     0.12 of a percentage point — stranding is 15× the total gains).
+//
+// Which is why this ships MEASURE-ONLY. It holds a virtual 1.0 BTC, records exactly what it would
+// have done, and reports units against the one baseline that cannot be argued with: buy-and-hold
+// is 1.0000 forever. If the live record beats that over a real sample it can be argued about then.
+// ACCUM=off disables it entirely. Nothing in this block can place, size, or cancel an order.
+const ACCUM_KEY = "cipher_accum";
+const ACCUM_COIN = () => env("ACCUM_COIN", "BTC");
+
+// The ladder, at real levels below the sell price — swing lows first (they paid best in the
+// replay: 27 fills / +0.080 BTC, ahead of FVGs and order blocks), then unfilled bullish zones.
+function accumLevels(daily, sellPx, maxRungs = 4, maxAwayPct = 0.12, minGapPct = 0.002) {
+  const cand = [];
+  const { lows } = pricePivots(daily);
+  for (const i of lows.slice(-12)) if (daily[i].l < sellPx) cand.push({ px: daily[i].l, src: "swingLow" });
+  for (const z of findOrderBlocks(daily)) if (z.kind === "bullish" && z.top < sellPx) cand.push({ px: z.top, src: "OB" });
+  for (const z of findFVGs(daily)) if (z.kind === "bullish" && z.top < sellPx) cand.push({ px: z.top, src: "FVG" });
+  const out = [];
+  for (const z of cand.filter(z => z.px > 0 && (sellPx - z.px) / sellPx <= maxAwayPct).sort((a, b) => b.px - a.px)) {
+    if (out.length >= maxRungs) break;
+    if (out.some(o => Math.abs(o.px - z.px) / sellPx < minGapPct)) continue;
+    out.push(z);
+  }
+  return out;
+}
+
+// PURE: one closed daily bar in, new state + a list of what happened out. No I/O, no clock, so
+// every rule here is testable without a venue — the same discipline as breakerStep.
+function accumStep(state, daily, cfg = {}) {
+  const { slicePct = 0.20, feeBps = 10, maxConcurrent = 4, maxCashPct = 0.5, maxRungs = 4 } = cfg;
+  const st = {
+    units: 1, cash: 0, open: [], sells: 0, fills: 0, lastDay: null, startedAt: null,
+    ...(state || {}),
+  };
+  const events = [];
+  if (!daily || daily.length < 60) return { st, events };
+  const bar = daily[daily.length - 1];
+  const day = new Date(bar.t).toISOString().slice(0, 10);
+  if (st.lastDay === day) return { st, events };            // one action per closed daily bar
+  st.lastDay = day;
+  if (!st.startedAt) { st.startedAt = day; st.startPx = bar.c; }
+
+  // 1) fills first — a rung fills when the day traded down through it
+  for (let k = st.open.length - 1; k >= 0; k--) {
+    const r = st.open[k];
+    if (bar.l <= r.px) {
+      const got = (r.usdt / r.px) * (1 - feeBps / 1e4);
+      st.units += got; st.cash -= r.usdt; st.fills++;
+      st.open.splice(k, 1);
+      events.push({ kind: "fill", px: r.px, src: r.src, units: +got.toFixed(8),
+                    delta: +(got - r.soldUnits).toFixed(8) });
+    }
+  }
+
+  // 2) the red dot, with the money-flow gate that cut the trending-market damage in the replay
+  const { wt1, wt2 } = waveTrend(daily);
+  const mf = vmcMoneyFlow(daily);
+  const n = daily.length - 1;
+  const d0 = wt1[n] - wt2[n], d1 = wt1[n - 1] - wt2[n - 1];
+  const redDot = Number.isFinite(wt2[n]) && Number.isFinite(wt2[n - 1]) && d1 >= 0 && d0 < 0;
+  if (!redDot) return { st, events };
+  if (!(Number.isFinite(mf[n]) && mf[n] < 0)) { events.push({ kind: "skip", why: "money flow not negative" }); return { st, events }; }
+
+  const ladders = new Set(st.open.map(r => r.sinceDay)).size;
+  if (ladders >= maxConcurrent) { events.push({ kind: "skip", why: `${ladders} ladders already resting` }); return { st, events }; }
+  const portfolio = st.units * bar.c + st.cash;
+  if (portfolio > 0 && (st.cash + st.units * slicePct * bar.c) / portfolio > maxCashPct) {
+    events.push({ kind: "skip", why: "cash ceiling — too much of the stack would be waiting for a dip" }); return { st, events };
+  }
+  const levels = accumLevels(daily, bar.c, maxRungs);
+  if (!levels.length) { events.push({ kind: "skip", why: "no level below to buy back at" }); return { st, events }; }
+
+  const sellUnits = st.units * slicePct;
+  const proceeds = sellUnits * bar.c * (1 - feeBps / 1e4);
+  st.units -= sellUnits; st.cash += proceeds; st.sells++;
+  const per = proceeds / levels.length, perUnits = sellUnits / levels.length;
+  for (const z of levels) st.open.push({ px: z.px, src: z.src, usdt: per, soldUnits: perUnits, sellPx: bar.c, sinceDay: day });
+  events.push({ kind: "sell", px: bar.c, units: +sellUnits.toFixed(8), rungs: levels.map(z => `${z.src}@${formatPrice(z.px)}`) });
+  return { st, events };
+}
+
+// Units held right now, counting cash at the current price — the only number that matters, and
+// the only one comparable to buy-and-hold's flat 1.0000.
+function accumUnits(st, px) {
+  if (!st || !(px > 0)) return null;
+  return st.units + (st.cash || 0) / px;
+}
+
 // ═══════════════ INSIGHT SCANNER (2026-08-19) ═══════════════
 // John: "I want the brain to really see the market, really scan and learn and check for new
 // insight from the indicators." The honest version of that is not more oscillators — it is
@@ -2588,6 +2692,35 @@ export default async function cipherAgent() {
       }
     }
   } catch (e) { console.error("resolution pass failed (no orders involved):", e && e.message); }
+
+  // ── THE ACCUMULATOR: a second objective, measured only ─────────────────────────────────────
+  // Units, not money. Holds a virtual 1.0 and reports against buy-and-hold's flat 1.0000.
+  // Cannot place an order — accumStep is pure and the only thing done with its output is logging.
+  if (String(env("ACCUM", "1")) === "1") {
+    try {
+      const coin = ACCUM_COIN();
+      const bars = await fetchCandles(coin, "1D", 260);
+      if (bars && bars.length >= 60) {
+        const prev = await getJSON(ACCUM_KEY, null);
+        const { st, events } = accumStep(prev, bars);
+        const px = bars[bars.length - 1].c;
+        const units = accumUnits(st, px);
+        if (events.length) {
+          await setJSON(ACCUM_KEY, st);
+          for (const e of events) {
+            if (e.kind === "sell") await pushLog({ coin, result: "ACCUM SELL",
+              skipped: `sold ${(0.2 * 100).toFixed(0)}% of the virtual stack at ${formatPrice(e.px)} on a red dot with money flow negative; buy-backs laddered at ${e.rungs.join(", ")}. Measure only — no order placed.` });
+            if (e.kind === "fill") await pushLog({ coin, result: "ACCUM BUY",
+              skipped: `laddered buy filled at the ${e.src} level ${formatPrice(e.px)} — ${e.delta >= 0 ? "+" : ""}${e.delta.toFixed(6)} ${coin} on that slice. Measure only.` });
+          }
+        }
+        if (units != null) {
+          const since = st.startedAt || "today";
+          console.log(`accumulator (${coin}, measure only): ${units.toFixed(5)} units vs buy-and-hold 1.00000 — ${((units - 1) * 100 >= 0 ? "+" : "")}${((units - 1) * 100).toFixed(2)}% since ${since} · ${st.sells} sells, ${st.fills} fills, ${st.open.length} rungs resting`);
+        }
+      }
+    } catch (e) { console.error("accumulator failed (harmless, measures only):", e && e.message); }
+  }
 
   await setJSON(BOOKMAP_KEY, bookMap);
   await setJSON(KEY.fired, fired);
