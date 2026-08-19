@@ -1935,16 +1935,30 @@ async function spotProducts() {
   if (_spotProducts) return _spotProducts;
   try {
     const r = await phemexPublic("/public/products");
-    const list = (r && r.data && (r.data.products || r.data.data?.products)) || [];
+    const body = (r && r.data && (r.data.data || r.data)) || {};
+    const list = body.products || [];
+    // ── WHERE THE SCALES ACTUALLY LIVE (found 2026-08-19 by running the preflight) ────────────
+    // The first version looked for baseValueScale on the PRODUCT and never found it, so every
+    // symbol failed the readiness check even though the market plainly exists. Phemex keeps
+    // value scales on the CURRENCY, not the product: /public/products returns a `currencies`
+    // array where each entry carries its own valueScale. A spot pair therefore needs two
+    // lookups — one for the coin, one for the money.
+    const cur = {};
+    for (const c of (body.currencies || [])) {
+      if (c && c.currency) cur[String(c.currency).toUpperCase()] = Number(c.valueScale);
+    }
     const map = {};
     for (const p of list) {
       if (!p || !p.symbol || !String(p.symbol).startsWith("s")) continue;   // spot symbols only
+      const base = String(p.baseCurrency || "").toUpperCase();
+      const quote = String(p.quoteCurrency || "").toUpperCase();
       map[p.symbol] = {
-        baseCurrency: p.baseCurrency, quoteCurrency: p.quoteCurrency,
-        priceScale: Number(p.priceScale ?? p.pricePrecision),
+        baseCurrency: base, quoteCurrency: quote,
+        priceScale: Number(p.priceScale ?? p.pricePrecision ?? 8),
         ratioScale: Number(p.ratioScale),
         baseTickSize: p.baseTickSize, quoteTickSize: p.quoteTickSize,
-        baseValueScale: Number(p.baseValueScale), quoteValueScale: Number(p.quoteValueScale),
+        baseValueScale: Number.isFinite(cur[base]) ? cur[base] : Number(p.baseValueScale),
+        quoteValueScale: Number.isFinite(cur[quote]) ? cur[quote] : Number(p.quoteValueScale),
       };
     }
     if (Object.keys(map).length) _spotProducts = map;
@@ -2989,7 +3003,14 @@ export default async function cipherAgent() {
           console.log(`spot preflight: ${PF.symbol} — products ${PF.productsRead ? PF.spotSymbolCount + " spot symbols" : "UNREADABLE"} · ${prod} · wallet http ${PF.walletStatus ?? "?"}${PF.balances ? " · holding " + (PF.balances.join(", ") || "nothing") : ""}${PF.walletErr ? " · wallet error " + PF.walletErr : ""}${PF.productsErr ? " · products error " + PF.productsErr : ""}`);
           // A console line lives only in the Actions log, which is not where John looks. The
           // verdict belongs in the state file so the app can show it plainly.
-          PF.ready = !!(PF.product && Number.isFinite(PF.product.baseValueScale) && PF.walletStatus === 200);
+          PF.ready = !!(PF.product && Number.isFinite(PF.product.baseValueScale)
+                        && Number.isFinite(PF.product.quoteValueScale) && PF.walletStatus === 200
+                        && (PF.balances || []).length > 0);
+          PF.why = !PF.product ? "no spot market for this coin"
+                 : !Number.isFinite(PF.product.baseValueScale) ? "could not read the value scales"
+                 : PF.walletStatus !== 200 ? "spot wallet unreadable"
+                 : !(PF.balances || []).length ? "the SPOT wallet is empty — it needs funding before it can trade"
+                 : "ready";
           PF.checkedAt = Date.now();
         } catch (e) { console.error("spot preflight failed (read-only, harmless):", e && e.message); }
       }
@@ -3045,7 +3066,8 @@ export default async function cipherAgent() {
           console.log(`accumulator (${coin} SPOT, core ${(state.coreUnits||0).toFixed(5)}, ${String(env("ACCUM_EXEC", "dry")) === "armed" ? "ARMED" : "measure only"}): ${units.toFixed(5)} units vs buy-and-hold 1.00000 — ${((units - 1) * 100 >= 0 ? "+" : "")}${((units - 1) * 100).toFixed(2)}% since ${since} · ${state.sells} sells, ${state.fills} fills · resting: ${resting}`);
           state.unitsNow = +units.toFixed(6); state.pxNow = px;
           state.trigger = env("ACCUM_TRIGGER", "pump3");
-          if (PF) state.spot = { ready: PF.ready, symbol: PF.symbol, hasProduct: !!PF.product,
+          if (PF) state.spot = { ready: PF.ready, why: PF.why, symbol: PF.symbol, hasProduct: !!PF.product,
+                                 scales: PF.product ? `${PF.product.priceScale}/${PF.product.baseValueScale}/${PF.product.quoteValueScale}` : null,
                                  spotSymbols: PF.spotSymbolCount || 0, walletStatus: PF.walletStatus ?? null,
                                  balances: PF.balances || [], err: PF.walletErr || PF.productsErr || null,
                                  exec: String(env("ACCUM_EXEC", "dry")), checkedAt: PF.checkedAt };
