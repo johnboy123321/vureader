@@ -200,7 +200,11 @@ console.log('\n10. Spot execution has three independent brakes');
   const fn = src.slice(src.indexOf('async function sendSpotOrder'), src.indexOf('// Units held right now'));
   ok('KILL switch checked', /CFG\.kill\(\)/.test(fn));
   ok('notional cap checked', /ACCUM_MAX_USDT/.test(fn));
-  ok('must be explicitly ARMED', /ACCUM_EXEC", "dry"\)\) === "armed"/.test(fn));
+  // Armed by instruction 2026-08-19, so the DEFAULT is now "armed". The assertion that still
+  // matters is that a single explicit value stands it down, and that the other brakes are intact.
+  ok('the arm switch exists and is checked', /ACCUM_EXEC", "armed"\)\) === "armed"/.test(fn));
+  ok('setting ACCUM_EXEC to anything else stands it down', /const armed = String\(env\("ACCUM_EXEC"[^)]*\)\) === "armed"/.test(fn));
+  ok('the cap was raised to clear a full-stack slice', /num\("ACCUM_MAX_USDT", 200\)/.test(src));
   ok('all three are checked BEFORE the wire call', fn.indexOf('phemexCall') > fn.indexOf('armed'));
   ok('the venue base URL is still hard-locked to testnet', /const PHEMEX_BASE = "https:\/\/testnet-api\.phemex\.com"/.test(src));
 }
@@ -308,7 +312,10 @@ console.log('\n15. The PUMP trigger — John\'s rule, measured to beat the red d
   ok('the money-flow gate can still veto it', (()=>{ const r=M.accumStep(null, mk(0.04), {trigger:'pump3', mfGate:true, minOrderUsdt:0});
       return r.events.some(e=>e.kind==='sell') || /money flow/.test((r.events.find(e=>e.kind==='skip')||{}).why||''); })());
   ok('red dot remains selectable', /trigger === "reddot"/.test(src) || /trig === "reddot"/.test(src));
-  ok('default is the measured-better pump3', /env\("ACCUM_TRIGGER", "pump3"\)/.test(src));
+  // Default lowered to pump1 on 2026-08-19 for FREQUENCY (~48 trades/yr vs ~15) while the
+  // plumbing is being proven. pump3 is the stronger signal and is one env change away.
+  ok('default is pump1 while the plumbing is proven', /env\("ACCUM_TRIGGER", "pump1"\)/.test(src));
+  ok('any pumpN threshold parses, not just a hardcoded few', /\^pump\(\[\\d\.\]\+\)\$/.test(src));
 }
 console.log('\n16. Real money: the ladder must fit the venue minimum');
 {

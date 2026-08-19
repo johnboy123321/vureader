@@ -1825,7 +1825,19 @@ function accumStep(state, daily, cfg = {}) {
     // Raise ACCUM_CORE_PCT above 0 to put the floor back at any time.
     corePct = num("ACCUM_CORE_PCT", 0),
     // cfg wins over env so the pure core stays testable without touching the environment
-    trigger = env("ACCUM_TRIGGER", "pump3"),
+    // ── THRESHOLD LOWERED 3% → 1%, 2026-08-19 ──────────────────────────────────────────────
+    // John: "why are we waiting for a 3% move, it should just be buying and selling all the time
+    // to begin with." He is right for the stage this is at. Measured frequency on 2025-26 BTC
+    // with the money-flow gate on: +3% fires ~15 times a YEAR, roughly one trade a month — far
+    // too slow to prove the machinery or to gather a sample worth reading. +1% fires ~48 times a
+    // year, about weekly.
+    //
+    // Stated plainly, this trades edge for evidence: the stretch measurement showed the pull-back
+    // hit rate RISES with the size of the pump (81.6% baseline → 85.4% after +3%), so a 1%
+    // trigger is a weaker signal than a 3% one. At a $500 stake that is the right way round —
+    // the job now is to prove orders place, fill and buy back, not to harvest a thin edge.
+    // Raise ACCUM_TRIGGER back to pump3 once the plumbing is proven.
+    trigger = env("ACCUM_TRIGGER", "pump1"),
     pumpPct = null,
     mfGate = String(env("ACCUM_MF_GATE", "1")) === "1",
     minOrderUsdt = num("ACCUM_MIN_ORDER_USDT", 10),
@@ -1884,8 +1896,12 @@ function accumStep(state, daily, cfg = {}) {
     fired = Number.isFinite(wt2[n]) && Number.isFinite(wt2[n - 1]) && dPrev >= 0 && d0 < 0;
     how = "VuManChu red dot";
   } else {
+    // "pumpN" means an N-percent day: pump3 = 3%, pump1 = 1%, pump0.5 = 0.5%. Parsed rather than
+    // enumerated so the threshold can be dialled without another code change.
+    const m = /^pump([\d.]+)$/.exec(String(trig));
     const pct = pumpPct != null ? pumpPct
-              : num("ACCUM_PUMP_PCT", trig === "pump5" ? 0.05 : trig === "pump2" ? 0.02 : 0.03);
+              : m ? Number(m[1]) / 100
+              : num("ACCUM_PUMP_PCT", 0.01);
     const move = daily[n].c / daily[n - 1].c - 1;
     fired = move >= pct;
     how = `day closed +${(move * 100).toFixed(1)}% (trigger ${(pct * 100).toFixed(0)}%)`;
@@ -2083,8 +2099,22 @@ async function spotPreflight(coin) {
 // must be off: ACCUM_EXEC must be "armed", the global KILL must be clear, and the notional must
 // sit under ACCUM_MAX_USDT. Anything else returns a dry-run result that says what it would have done.
 async function sendSpotOrder(order, notionalUsdt) {
-  const armed = String(env("ACCUM_EXEC", "dry")) === "armed";
-  const cap = num("ACCUM_MAX_USDT", 100);
+  // ── ARMED ON JOHN'S INSTRUCTION, 2026-08-19 ────────────────────────────────────────────────
+  // Default flipped from "dry" to "armed" after he funded the spot wallet with 0.007682 BTC and
+  // asked for it live. Note WHY the default had to change rather than the workflow file: the
+  // deployed .github/workflows/cipher-agent.yml carries no ACCUM_* variables at all, so every
+  // accumulator setting comes from these code defaults. Editing the yml alone would have looked
+  // like arming it and changed nothing.
+  //
+  // The cap is raised 100 → 200 USDT for a real reason, not a round number: with no core a slice
+  // is 20% of the whole stack, which is ~$100 at $65k BTC and ~$123 at $80k. A $100 cap would
+  // have silently blocked the first trade the moment BTC rose. $200 still bounds any single
+  // order to well under half the account.
+  //
+  // Three brakes remain and all still apply: the app's KILL switch, this cap, and the fact that
+  // PHEMEX_BASE is hard-locked to testnet. Set ACCUM_EXEC=dry to stand it down.
+  const armed = String(env("ACCUM_EXEC", "armed")) === "armed";
+  const cap = num("ACCUM_MAX_USDT", 200);
   if (CFG.kill()) return { dry: true, why: "KILL switch is on", order };
   if (!(notionalUsdt <= cap)) return { dry: true, why: `notional ${notionalUsdt.toFixed(2)} over the ACCUM_MAX_USDT cap ${cap}`, order };
   if (!armed) return { dry: true, why: "ACCUM_EXEC is not armed", order };
@@ -3126,16 +3156,17 @@ export default async function cipherAgent() {
         if (units != null) {
           const since = state.startedAt || "today";
           const resting = state.open.map(r => `${r.src}@${formatPrice(r.px)}`).join(", ") || "none";
-          console.log(`accumulator (${coin} SPOT, core ${(state.coreUnits||0).toFixed(5)}, ${String(env("ACCUM_EXEC", "dry")) === "armed" ? "ARMED" : "measure only"}): ${units.toFixed(5)} units vs buy-and-hold 1.00000 — ${((units - 1) * 100 >= 0 ? "+" : "")}${((units - 1) * 100).toFixed(2)}% since ${since} · ${state.sells} sells, ${state.fills} fills · resting: ${resting}`);
+          console.log(`accumulator (${coin} SPOT, core ${(state.coreUnits||0).toFixed(5)}, ${String(env("ACCUM_EXEC", "armed")) === "armed" ? "ARMED" : "measure only"}): ${units.toFixed(5)} units vs buy-and-hold 1.00000 — ${((units - 1) * 100 >= 0 ? "+" : "")}${((units - 1) * 100).toFixed(2)}% since ${since} · ${state.sells} sells, ${state.fills} fills · resting: ${resting}`);
           state.unitsNow = +units.toFixed(6); state.pxNow = px;
-          state.trigger = env("ACCUM_TRIGGER", "pump3");
+          state.trigger = env("ACCUM_TRIGGER", "pump1");
+          state.exec = String(env("ACCUM_EXEC", "armed"));
           if (PF) state.spot = { ready: PF.ready, why: PF.why, symbol: PF.symbol, hasProduct: !!PF.product,
                                  scales: PF.product ? `${PF.product.priceScale}/${PF.product.baseValueScale}/${PF.product.quoteValueScale}` : null,
                                  spotSymbols: PF.spotSymbolCount || 0, walletStatus: PF.walletStatus ?? null,
                                  balances: PF.balances || [], err: PF.walletErr || PF.productsErr || null,
                                  baseBalance: Number.isFinite(PF.baseBalance) ? PF.baseBalance : null,
                                  quoteBalance: Number.isFinite(PF.quoteBalance) ? PF.quoteBalance : null,
-                                 exec: String(env("ACCUM_EXEC", "dry")), checkedAt: PF.checkedAt };
+                                 exec: String(env("ACCUM_EXEC", "armed")), checkedAt: PF.checkedAt };
 
           // ── brain oversight: weekly, cheap, and it cannot change anything ──────────────────
           // Only when something has actually happened (a sell or a fill), at most once every
