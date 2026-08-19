@@ -2345,7 +2345,23 @@ async function sendSpotOrder(order, notionalUsdt, opts = {}) {
   if (CFG.kill()) return { dry: true, why: "KILL switch is on", order };
   if (!(notionalUsdt <= cap)) return { dry: true, why: `notional ${notionalUsdt.toFixed(2)} over the ACCUM_MAX_USDT cap ${cap}`, order };
   if (!armed) return { dry: true, why: "ACCUM_EXEC is not armed", order };
-  const r = await phemexCall("POST", "/spot/orders", "", order);
+  // ── A TRANSPORT BLIP MUST NOT COST A WHOLE CYCLE (2026-08-19) ─────────────────────────────
+  // The second live flip sell died on a bare `spot http 502` — Cloudflare, not Phemex, and not a
+  // rejection of anything. On a bot that wakes every 30–40 minutes that one blip cost the entire
+  // trade: by the next run the signal had flipped back and the move was over. A 5xx says nothing
+  // about the order, so retry it; a 4xx or a Phemex error code is a real answer, so never do.
+  //
+  // What makes the retry safe is that it re-sends the SAME order object, and that object carries
+  // a clOrdID minted once in buildSpotOrder. If the first attempt actually reached the venue and
+  // only the response was lost, the retry arrives with an ID the venue has already seen and is
+  // rejected as a duplicate rather than filled twice. Retrying a POST without a stable client ID
+  // would be the dangerous version of this.
+  let r = await phemexCall("POST", "/spot/orders", "", order);
+  for (let attempt = 1; attempt <= num("SPOT_RETRIES", 2) && r.status >= 500; attempt++) {
+    console.log(`spot order http ${r.status} — retry ${attempt}`);
+    await new Promise(res => setTimeout(res, 1200 * attempt));
+    r = await phemexCall("POST", "/spot/orders", "", order);
+  }
   const code = r.data && r.data.code;
   if (r.status !== 200) return { ok: false, status: r.status, error: `spot http ${r.status}`, sent: order, phemex: r.data };
   if (code !== 0 && code !== undefined) return { ok: false, status: 422, error: `phemex ${code}: ${(r.data && r.data.msg) || "rejected"}`, sent: order, phemex: r.data };
@@ -2946,8 +2962,20 @@ async function runAccumulator() {
                 // actually let it sell. They can differ — a fee taken in base, part of the balance
                 // locked, a rounding crumb — and the venue arbitrates, not us. Taking the smaller
                 // of the two means a disagreement costs a crumb rather than the whole order.
+                // ── NEVER ASK FOR 100% OF THE BALANCE (2026-08-19) ───────────────────────────
+                // Proved by arithmetic after the live refusal: 0.00767931 BTC scales to exactly
+                // 767931, which is exactly the wallet's balanceEv — so the order asked for every
+                // last satoshi and Phemex answered INSUFFICIENT_BASE_BALANCE. Flooring did not
+                // help because there was no fractional slack to floor away. The venue wants room
+                // for its fee, so leave it some.
+                //
+                // For THIS strategy the reserve is close to free: what stays behind stays as
+                // BTC, and BTC is the thing being accumulated. A sell that never places is far
+                // more expensive — it misses the whole cycle, which is what happened at 17:09.
+                const reserveBps = num("ACCUM_SELL_RESERVE_BPS", 15);
                 const walletBase = PF && Number.isFinite(PF.baseBalance) ? PF.baseBalance : null;
-                const sellQty = walletBase != null ? Math.min(e.units, walletBase) : e.units;
+                const sellable = walletBase != null ? walletBase * (1 - reserveBps / 1e4) : null;
+                const sellQty = sellable != null ? Math.min(e.units, sellable) : e.units;
                 const walletQuote = PF && Number.isFinite(PF.quoteBalance) ? PF.quoteBalance : null;
                 const buyQty = walletQuote != null ? Math.min(e.cash, walletQuote) : e.cash;
                 const built = isSell

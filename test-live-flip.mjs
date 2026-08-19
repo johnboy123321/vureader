@@ -352,7 +352,7 @@ console.log('\n  A REFUSED SELL, AND WHY IT WAS REFUSED');
   ok('buy amounts are floored too', /order\.quoteQtyEv = Math\.floor/.test(src));
   ok('no Math.round survives in the order builder',
      !/Math\.round\((baseQty|quoteQty)/.test(src));
-  ok('the sell is sized against the wallet as well as the book', /Math\.min\(e\.units, walletBase\)/.test(src));
+  ok('the sell is sized against the wallet as well as the book', /Math\.min\(e\.units, sellable\)/.test(src));
   ok('and the buy against the quote wallet', /Math\.min\(e\.cash, walletQuote\)/.test(src));
   ok('the cap is checked against what will actually be sent', /const notional = isSell \? sellQty \* e\.px : buyQty;/.test(src));
   ok('locked balance is separated from total', /baseAvailable = \(ev - lockedEv\)/.test(src));
@@ -392,6 +392,35 @@ console.log('\n  THE WALLET IS THE ARBITER, NOT THE BOOK');
   ok('it is reported to the decision log, not just the console', /result: "FLIP OUT OF SYNC"/.test(src));
   ok('it tells the user how to recover', /re-arm to reseed from what is actually there/.test(src));
   ok('a dry run is not blocked by it', /armedExec && \(shortOfCoins \|\| shortOfCash\)/.test(src));
+}
+
+console.log('\n  THE TWO REFUSALS THAT COST THE FIRST TWO CYCLES');
+{
+  // 17:09 — INSUFFICIENT_BASE_BALANCE. 0.00767931 BTC scales to exactly 767931, which is exactly
+  // the wallet balanceEv, so the order asked for every satoshi. Flooring could not help: there
+  // was no fractional slack to floor away.
+  const bal = 0.00767931, scale = 8;
+  ok('the failing case really did scale to the exact balance',
+     Math.floor(bal * 10 ** scale) === 767931);
+  ok('a reserve is now taken off the sell side', /ACCUM_SELL_RESERVE_BPS", 15/.test(src));
+  ok('the reserve applies to the wallet figure, not the book',
+     /walletBase \* \(1 - reserveBps \/ 1e4\)/.test(src));
+  const reserved = bal * (1 - 15 / 1e4);
+  ok('and it leaves the venue room for its fee',
+     Math.floor(reserved * 10 ** scale) < 767931,
+     `${Math.floor(reserved * 10 ** scale)} vs 767931`);
+  ok('while still selling essentially the whole stack',
+     reserved / bal > 0.998, (reserved / bal).toFixed(5));
+
+  // 17:31 — bare `spot http 502`. Cloudflare, not Phemex, and not a rejection of anything.
+  ok('5xx is retried', /r\.status >= 500/.test(src));
+  ok('the retry is bounded', /num\("SPOT_RETRIES", 2\)/.test(src));
+  ok('it backs off between attempts', /setTimeout\(res, 1200 \* attempt\)/.test(src));
+  ok('a 4xx or a phemex code is NEVER retried',
+     !/r\.status >= 400/.test(src) && /r\.status >= 500/.test(src));
+  ok('the retry re-sends the same order object, so the clOrdID is stable',
+     /r = await phemexCall\("POST", "\/spot\/orders", "", order\);/.test(src));
+  ok('clOrdID is minted once, in the builder', /clOrdID: \("accum" \+ sym \+ Date\.now\(\)\)/.test(src));
 }
 
 fs.unlinkSync(out);
