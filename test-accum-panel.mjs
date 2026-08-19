@@ -18,11 +18,25 @@ fn({}, []);
 ok('shows a clear not-started message', /Not started/.test(html));
 
 console.log('\n2. Fully holding, ahead of buy-and-hold');
-fn({ cipher_accum: { units:1.0123, cash:0, open:[], sells:3, fills:12, startedAt:'2026-08-19', pxNow:64000 } }, []);
+fn({ cipher_accum: { units:1.0123, cash:0, open:[], sells:3, fills:12, startedAt:'2026-08-19', pxNow:64000, startUnits:1 } }, []);
 ok('state reads FULLY HOLDING', /FULLY HOLDING/.test(html));
 ok('shows the unit count', /1\.01230 BTC/.test(html));
 ok('shows the gain vs hold', /\+1\.23%/.test(html), html.match(/[+-][\d.]+%/));
-ok('names the benchmark', /1\.00000/.test(html));
+ok('names the benchmark', /1\b/.test(html));
+
+console.log('\n2b. A REAL small balance is compared against ITSELF, not against 1.0');
+{
+  // The bug John caught: 0.00768 BTC vs a hardcoded 1.00000 benchmark read -99.23%.
+  fn({ cipher_accum: { units:0.00767931, cash:0, open:[], sells:0, fills:0, pxNow:65000,
+                       startUnits:0.00767931, seededAt:'2026-08-19' } }, []);
+  ok('a freshly seeded real wallet reads 0.00%, not -99%', /0\.00%/.test(html) && !/-99/.test(html),
+     (html.match(/[+-]?[\d.]+%/)||[])[0]);
+  ok('the benchmark shown is the real starting balance', /0\.00767931/.test(html));
+  // and it still reports a genuine gain correctly
+  fn({ cipher_accum: { units:0.00790000, cash:0, open:[], sells:2, fills:5, pxNow:65000,
+                       startUnits:0.00767931 } }, []);
+  ok('a real gain shows as a positive percentage', /\+2\.87%/.test(html), (html.match(/[+-][\d.]+%/)||[])[0]);
+}
 
 console.log('\n3. Sold, waiting, with rungs resting');
 fn({ cipher_accum: { units:0.8, cash:12800, open:[
@@ -40,7 +54,7 @@ ok('marks a suggestion as advisory', /must win a shadow arm/.test(html));
 ok('shows recent activity', /RECENT ACTIVITY/.test(html) && /SELL/.test(html));
 
 console.log('\n4. Behind buy-and-hold is shown honestly');
-fn({ cipher_accum: { units:0.94, cash:0, open:[], sells:9, fills:20, startedAt:'2026-01-01', pxNow:64000 } }, []);
+fn({ cipher_accum: { units:0.94, cash:0, open:[], sells:9, fills:20, startedAt:'2026-01-01', pxNow:64000, startUnits:1 } }, []);
 ok('shows a negative number, not a spun one', /-6\.00%/.test(html), html.match(/[+-][\d.]+%/));
 
 console.log('\n5. Junk state does not crash the panel');

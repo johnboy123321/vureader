@@ -3156,7 +3156,10 @@ export default async function cipherAgent() {
         if (units != null) {
           const since = state.startedAt || "today";
           const resting = state.open.map(r => `${r.src}@${formatPrice(r.px)}`).join(", ") || "none";
-          console.log(`accumulator (${coin} SPOT, core ${(state.coreUnits||0).toFixed(5)}, ${String(env("ACCUM_EXEC", "armed")) === "armed" ? "ARMED" : "measure only"}): ${units.toFixed(5)} units vs buy-and-hold 1.00000 — ${((units - 1) * 100 >= 0 ? "+" : "")}${((units - 1) * 100).toFixed(2)}% since ${since} · ${state.sells} sells, ${state.fills} fills · resting: ${resting}`);
+          // Benchmark is the STARTING balance, not 1.0 — see the same fix in the app panel.
+          const startU = Number(state.startUnits) > 0 ? Number(state.startUnits) : 1;
+          const gainPct = (units / startU - 1) * 100;
+          console.log(`accumulator (${coin} SPOT, core ${(state.coreUnits || 0).toFixed(8)}, ${String(env("ACCUM_EXEC", "armed")) === "armed" ? "ARMED" : "measure only"}): ${units.toFixed(8)} units vs buy-and-hold ${startU.toFixed(8)} — ${gainPct >= 0 ? "+" : ""}${gainPct.toFixed(2)}% since ${since} · ${state.sells} sells, ${state.fills} fills · resting: ${resting}`);
           state.unitsNow = +units.toFixed(6); state.pxNow = px;
           state.trigger = env("ACCUM_TRIGGER", "pump1");
           state.exec = String(env("ACCUM_EXEC", "armed"));

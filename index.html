@@ -1415,7 +1415,7 @@ body.layout-edit #layout-bar { display:flex; flex-wrap:wrap; justify-content:cen
     </div>
     <div id="accum-panel"><div style="font-size:11px;color:var(--dim);">Loading…</div></div>
     <div style="font-size:10px;color:var(--dim);margin-top:14px;line-height:1.5;">
-      Measured on 14.5 years of real BTC before it was built: it gains units in ranging and falling markets and loses them in sustained rallies (+14.9% since Jan 2024, −27.8% over the full history). It runs on SPOT, not futures — you cannot accumulate coins on a perpetual. Currently measure-only; it places nothing until explicitly armed.
+      Measured on 14.5 years of real BTC before it was built: it gains units in ranging and falling markets and loses them in sustained rallies (+14.9% since Jan 2024, −27.8% over the full history). It runs on SPOT, not futures — you cannot accumulate coins on a perpetual. The state line above says whether it is ARMED (placing real orders) or dry.
     </div>
   </div>
 </div>
@@ -9966,7 +9966,12 @@ document.addEventListener('click', function(e){
     if(!a){ el.innerHTML = '<div style="font-size:11px;color:var(--dim);">Not started. It acts on the first daily VuManChu red dot with money flow negative — roughly 35 red dots a year on BTC, and the money-flow gate turns most of them down.</div>'; return; }
     const px = Number(a.pxNow)||0;
     const units = (Number(a.units)||0) + (px ? (Number(a.cash)||0)/px : 0);
-    const gain = units - 1;
+    // ── BENCHMARK IS THE STARTING BALANCE, NOT 1.0 (fixed 2026-08-19) ────────────────────────
+    // This read −99.23% the moment the real wallet was seeded: it was comparing 0.00768 BTC
+    // against a hardcoded 1.00000. "Buy and hold ends with exactly what you started with" is the
+    // principle; the NUMBER is whatever you started with, which is now a real 0.00767931.
+    const start = Number(a.startUnits) > 0 ? Number(a.startUnits) : 1;
+    const gain = start > 0 ? units / start - 1 : 0;
     const col = gain > 0.0001 ? '#9c9' : gain < -0.0001 ? '#e88' : 'var(--muted)';
     const resting = Array.isArray(a.open) ? a.open : [];
     const waiting = resting.length > 0;
@@ -9978,7 +9983,7 @@ document.addEventListener('click', function(e){
        + '<span style="margin-left:auto;color:'+col+';font-weight:700;">'+units.toFixed(5)+' BTC</span></div>';
     h += '<div class="bot-nums" style="margin-top:6px;">'
        + '<span>vs buy-and-hold <b style="color:'+col+'">'+(gain>=0?'+':'')+(gain*100).toFixed(2)+'%</b></span>'
-       + '<span>benchmark <b>1.00000</b></span>'
+       + '<span>benchmark <b>'+start.toFixed(8).replace(/0+$/,'').replace(/\.$/,'')+'</b></span>'
        + '<span>sells <b>'+(a.sells||0)+'</b></span>'
        + '<span>buy-backs <b>'+(a.fills||0)+'</b></span>'
        + (a.cash>0?'<span>cash idle <b>'+Number(a.cash).toFixed(2)+' USDT</b></span>':'')
@@ -9986,7 +9991,7 @@ document.addEventListener('click', function(e){
        + (a.coreUnits?'<span>tradeable <b>'+Math.max(0,(Number(a.units)||0)-Number(a.coreUnits)).toFixed(5)+'</b></span>':'')
        + (a.trigger?'<span>trigger <b>'+esc(a.trigger)+'</b></span>':'')
        + '</div>';
-    h += '<div class="bot-why" style="color:var(--dim);">Buy-and-hold always ends on exactly 1.00000 — that is the line this has to beat. Since '+esc(a.startedAt||'—')+'.</div>';
+    h += '<div class="bot-why" style="color:var(--dim);">Buy-and-hold always ends on exactly what you started with — '+start.toFixed(8).replace(/0+$/,'').replace(/\.$/,'')+' — and that is the line this has to beat. Since '+esc(a.startedAt||a.seededAt||'—')+'.</div>';
     // Can it actually trade? The bot checks the venue itself each run and records the verdict.
     const sp = a.spot;
     if(sp){
