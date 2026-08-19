@@ -9984,6 +9984,21 @@ document.addEventListener('click', function(e){
        + (a.cash>0?'<span>cash idle <b>'+Number(a.cash).toFixed(2)+' USDT</b></span>':'')
        + '</div>';
     h += '<div class="bot-why" style="color:var(--dim);">Buy-and-hold always ends on exactly 1.00000 — that is the line this has to beat. Since '+esc(a.startedAt||'—')+'.</div>';
+    // Can it actually trade? The bot checks the venue itself each run and records the verdict.
+    const sp = a.spot;
+    if(sp){
+      const armed = sp.exec === 'armed';
+      const col2 = sp.ready ? (armed ? '#9c9' : '#e8c07a') : '#e88';
+      const what = !sp.ready ? 'SPOT NOT AVAILABLE'
+                 : armed ? 'SPOT READY — ARMED, placing real orders'
+                 : 'SPOT READY — but dry, so it places nothing';
+      const detail = !sp.hasProduct ? 'no '+esc(sp.symbol)+' spot market found on the venue ('+sp.spotSymbols+' spot symbols seen)'
+                   : sp.walletStatus !== 200 ? 'spot wallet unreadable (HTTP '+esc(sp.walletStatus)+')'+(sp.err?' — '+esc(sp.err):'')
+                   : 'holding '+(sp.balances && sp.balances.length ? esc(sp.balances.join(', ')) : 'nothing in the spot wallet');
+      h += '<div class="bot-why" style="color:'+col2+';"><b>'+what+'</b> — '+detail+'.</div>';
+    } else {
+      h += '<div class="bot-why" style="color:var(--dim);">Venue check has not run yet.</div>';
+    }
     h += '</div>';
 
     if(waiting){

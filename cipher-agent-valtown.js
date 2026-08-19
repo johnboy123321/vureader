@@ -2911,13 +2911,18 @@ export default async function cipherAgent() {
     try {
       const coin = ACCUM_COIN();
       // Read-only preflight: report whether spot is actually usable here. No orders.
+      let PF = null;
       if (String(env("ACCUM_PREFLIGHT", "1")) === "1") {
         try {
-          const pf = await spotPreflight(coin);
-          const prod = pf.product
-            ? `scales price/base/quote ${pf.product.priceScale}/${pf.product.baseValueScale}/${pf.product.quoteValueScale}`
+          PF = await spotPreflight(coin);
+          const prod = PF.product
+            ? `scales price/base/quote ${PF.product.priceScale}/${PF.product.baseValueScale}/${PF.product.quoteValueScale}`
             : "NOT FOUND";
-          console.log(`spot preflight: ${pf.symbol} — products ${pf.productsRead ? pf.spotSymbolCount + " spot symbols" : "UNREADABLE"} · ${prod} · wallet http ${pf.walletStatus ?? "?"}${pf.balances ? " · holding " + (pf.balances.join(", ") || "nothing") : ""}${pf.walletErr ? " · wallet error " + pf.walletErr : ""}${pf.productsErr ? " · products error " + pf.productsErr : ""}`);
+          console.log(`spot preflight: ${PF.symbol} — products ${PF.productsRead ? PF.spotSymbolCount + " spot symbols" : "UNREADABLE"} · ${prod} · wallet http ${PF.walletStatus ?? "?"}${PF.balances ? " · holding " + (PF.balances.join(", ") || "nothing") : ""}${PF.walletErr ? " · wallet error " + PF.walletErr : ""}${PF.productsErr ? " · products error " + PF.productsErr : ""}`);
+          // A console line lives only in the Actions log, which is not where John looks. The
+          // verdict belongs in the state file so the app can show it plainly.
+          PF.ready = !!(PF.product && Number.isFinite(PF.product.baseValueScale) && PF.walletStatus === 200);
+          PF.checkedAt = Date.now();
         } catch (e) { console.error("spot preflight failed (read-only, harmless):", e && e.message); }
       }
       const bars = await fetchCandles(coin, "1D", 260);
@@ -2971,6 +2976,10 @@ export default async function cipherAgent() {
           const resting = state.open.map(r => `${r.src}@${formatPrice(r.px)}`).join(", ") || "none";
           console.log(`accumulator (${coin} SPOT, ${String(env("ACCUM_EXEC", "dry")) === "armed" ? "ARMED" : "measure only"}): ${units.toFixed(5)} units vs buy-and-hold 1.00000 — ${((units - 1) * 100 >= 0 ? "+" : "")}${((units - 1) * 100).toFixed(2)}% since ${since} · ${state.sells} sells, ${state.fills} fills · resting: ${resting}`);
           state.unitsNow = +units.toFixed(6); state.pxNow = px;
+          if (PF) state.spot = { ready: PF.ready, symbol: PF.symbol, hasProduct: !!PF.product,
+                                 spotSymbols: PF.spotSymbolCount || 0, walletStatus: PF.walletStatus ?? null,
+                                 balances: PF.balances || [], err: PF.walletErr || PF.productsErr || null,
+                                 exec: String(env("ACCUM_EXEC", "dry")), checkedAt: PF.checkedAt };
 
           // ── brain oversight: weekly, cheap, and it cannot change anything ──────────────────
           // Only when something has actually happened (a sell or a fill), at most once every
