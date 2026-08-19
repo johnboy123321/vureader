@@ -10043,12 +10043,19 @@ document.addEventListener('click', function(e){
     const liveTf = lfv.tf || null;
 
     h += '<div style="font-size:11px;font-weight:700;color:var(--muted);margin:12px 0 6px;">DOT FLIP — WHICH TIMEFRAME TRADES THE REAL COINS</div>';
-    h += '<div style="display:flex;flex-wrap:wrap;gap:4px;margin-bottom:6px;">';
-    h += '<button class="flip-tf" data-tf="off" onclick="setFlipTf(\'off\')" style="flex:0 0 auto;padding:5px 10px;font-size:11px;border:1px solid '+(liveTf?'var(--line)':'var(--fg)')+';background:none;color:'+(liveTf?'var(--dim)':'var(--fg)')+';font-weight:'+(liveTf?'400':'700')+';border-radius:3px;">OFF</button>';
-    for(const t of ORDER){
-      const on = liveTf===t;
-      h += '<button class="flip-tf" data-tf="'+esc(t)+'" onclick="setFlipTf(\''+esc(t)+'\')" style="flex:0 0 auto;padding:5px 10px;font-size:11px;border:1px solid '+(on?'#8bd':'var(--line)')+';background:none;color:'+(on?'#8bd':'var(--dim)')+';font-weight:'+(on?'700':'400')+';border-radius:3px;">'+esc(t)+'</button>';
-    }
+    // These have to LOOK pressable. The first version drew them as bare text on a dark panel and
+    // John read the whole row as a label — a control nobody can see is a control that does not
+    // exist. Hence a filled chip, a real border and a proper tap target.
+    const chip = (label, tf, on) =>
+      '<button class="flip-tf" data-tf="'+esc(tf)+'" onclick="setFlipTf(\''+esc(tf)+'\')" '
+      + 'style="flex:0 0 auto;padding:9px 15px;font-size:13px;cursor:pointer;border-radius:6px;'
+      + 'border:1px solid '+(on?'#8bd':'#4a4a4a')+';'
+      + 'background:'+(on?'rgba(136,187,221,0.20)':'rgba(255,255,255,0.07)')+';'
+      + 'color:'+(on?'#8bd':'#cfcfcf')+';font-weight:'+(on?'700':'500')+';">'+esc(label)+'</button>';
+
+    h += '<div style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:8px;">';
+    h += chip('OFF', 'off', !liveTf);
+    for(const t of ORDER) h += chip(t, t, liveTf===t);
     h += '</div>';
     h += '<div id="flip-msg" style="font-size:11px;color:var(--dim);min-height:14px;margin-bottom:4px;"></div>';
 
@@ -10190,9 +10197,10 @@ document.addEventListener('click', function(e){
       // the bot has run, and showing it as live before then would be a lie.
       document.querySelectorAll('.flip-tf').forEach(b=>{
         const on = b.getAttribute('data-tf') === got;
-        b.style.borderColor = on ? (got==='off'?'var(--fg)':'#8bd') : 'var(--line)';
-        b.style.color       = on ? (got==='off'?'var(--fg)':'#8bd') : 'var(--dim)';
-        b.style.fontWeight  = on ? '700' : '400';
+        b.style.borderColor = on ? '#8bd' : '#4a4a4a';
+        b.style.background  = on ? 'rgba(136,187,221,0.20)' : 'rgba(255,255,255,0.07)';
+        b.style.color       = on ? '#8bd' : '#cfcfcf';
+        b.style.fontWeight  = on ? '700' : '500';
       });
     }catch(e){ say(String(e && e.message || e), true); }
   }

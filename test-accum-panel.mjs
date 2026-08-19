@@ -108,5 +108,26 @@ console.log('\n7. The paper record is labelled honestly');
   ok('and the reader is warned the two numbers will not agree', /will not agree/.test(html));
 }
 
+console.log('\n8. The toggles look like something you can press');
+{
+  // The first version drew them as bare text and John could not see them. A control that does
+  // not read as a control is a bug, so it gets an assertion like any other.
+  const flips = { '1H':{gainPct:0.86,trips:28,holding:true} };
+  fn({ cipher_accum: { units:0.0077, cash:0, open:[], sells:0, fills:0, pxNow:65000, startUnits:0.0077, flips } }, []);
+  const chips = html.match(/<button class="flip-tf"[^>]*>/g) || [];
+  ok('nine chips render', chips.length === 9, chips.length);
+  ok('every chip has a visible fill', chips.every(c => /background:rgba/.test(c)));
+  ok('every chip has a visible border', chips.every(c => /border:1px solid #(8bd|4a4a4a)/.test(c)));
+  ok('every chip says it is clickable', chips.every(c => /cursor:pointer/.test(c)));
+  ok('the tap target is not tiny', chips.every(c => /padding:9px 15px/.test(c)));
+  ok('unselected chips are readable, not dimmed to nothing', chips.some(c => /color:#cfcfcf/.test(c)));
+  ok('OFF is highlighted when nothing is armed', /data-tf="off"[^>]*color:#8bd/.test(html));
+
+  fn({ cipher_accum: { units:0.0077, cash:0, open:[], sells:0, fills:0, pxNow:65000, startUnits:0.0077, flips,
+                       liveFlip:{ tf:'1H', holding:true, gainPct:0.1, sells:1, trips:0 } } }, []);
+  ok('the armed chip is highlighted instead', /data-tf="1H"[^>]*color:#8bd/.test(html));
+  ok('and OFF is not', !/data-tf="off"[^>]*color:#8bd/.test(html));
+}
+
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail?1:0);
