@@ -1814,7 +1814,16 @@ function accumStep(state, daily, cfg = {}) {
     //
     // The core also RATCHETS: when total units make a new high the core rises with them, so
     // accumulated coins are progressively locked away rather than re-risked forever.
-    corePct = num("ACCUM_CORE_PCT", 0.60),
+    //
+    // ── SET TO 0 ON JOHN'S INSTRUCTION, 2026-08-19 ──────────────────────────────────────────
+    // "let's not save any of the acquired BTC, put that back in, risk it all every time."
+    // Chosen deliberately with the measured trade-off in front of him: on the 14.5-year replay
+    // no core gives 2025-26 +14.48% (vs +5.73% at a 60% core) but full-history −27.81% (vs
+    // −11.13%), and the stranding loss more than doubles, 0.156 → 0.389 of the stack. The core
+    // is a linear exposure dial, so this is the full dose in both directions — at a deliberately
+    // small stake, to prove the machinery before any bigger portfolio.
+    // Raise ACCUM_CORE_PCT above 0 to put the floor back at any time.
+    corePct = num("ACCUM_CORE_PCT", 0),
     // cfg wins over env so the pure core stays testable without touching the environment
     trigger = env("ACCUM_TRIGGER", "pump3"),
     pumpPct = null,
