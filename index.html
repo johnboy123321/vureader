@@ -489,12 +489,12 @@ header {
 .qr-close:hover { transform:translateY(-1px); }
 
 /* Knowledge panel */
-#kb-panel, #log-panel, #scan-panel, #trades-panel, #macro-panel, #paper-panel, #lab-panel, #help-panel, #krown-panel, #bot-panel, #spend-panel {
+#kb-panel, #log-panel, #scan-panel, #trades-panel, #macro-panel, #paper-panel, #lab-panel, #help-panel, #krown-panel, #bot-panel, #spend-panel, #accum-panel-shell {
   display:none; position:fixed; inset:0; z-index:80;
   background:rgba(9,9,11,0.72); backdrop-filter:blur(8px);
   align-items:flex-start; justify-content:center; padding:14px;
 }
-#kb-panel.show, #log-panel.show, #scan-panel.show, #trades-panel.show, #macro-panel.show, #paper-panel.show, #lab-panel.show, #help-panel.show, #krown-panel.show, #bot-panel.show, #spend-panel.show { display:flex; }
+#kb-panel.show, #log-panel.show, #scan-panel.show, #trades-panel.show, #macro-panel.show, #paper-panel.show, #lab-panel.show, #help-panel.show, #krown-panel.show, #bot-panel.show, #spend-panel.show, #accum-panel-shell.show { display:flex; }
 .sp-big { font-size:30px; font-weight:600; letter-spacing:-.01em; margin-bottom:4px; }
 .sp-big small { font-size:12px; font-weight:400; color:var(--dim,#8a8a8a); letter-spacing:0; }
 .sp-note { font-size:11.5px; color:var(--dim,#8a8a8a); line-height:1.6; margin-bottom:10px; }
@@ -1023,6 +1023,7 @@ body.layout-edit #layout-bar { display:flex; flex-wrap:wrap; justify-content:cen
     <button class="rail-btn" onclick="morningDigest()"><span class="rb-ic"><svg class="lic" viewBox="0 0 24 24"><path d="M8 6h13M8 12h13M8 18h13M3 6h.01M3 12h.01M3 18h.01"/></svg></span>Watchlist digest</button>
     <button class="rail-btn" onclick="toggleTrades()"><span class="rb-ic"><svg class="lic" viewBox="0 0 24 24"><path d="M18 8a6 6 0 0 0-12 0c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.7 21a2 2 0 0 1-3.4 0"/></svg></span>Alerts &amp; trades</button>
     <button class="rail-btn" onclick="toggleBot()"><span class="rb-ic"><svg class="lic" viewBox="0 0 24 24"><rect x="5" y="8" width="14" height="11" rx="2"/><path d="M12 8V5M12 5a1.5 1.5 0 1 0 0-3 1.5 1.5 0 0 0 0 3zM9 13h.01M15 13h.01M9.5 16.5h5"/></svg></span>Bot trades</button>
+    <button class="rail-btn" onclick="toggleAccum()"><span class="rb-ic"><svg class="lic" viewBox="0 0 24 24"><path d="M12 3v18"/><path d="M7 8h7a3 3 0 0 1 0 6H8a3 3 0 0 0 0 6h7"/></svg></span>Accumulator</button>
     <button class="rail-btn" onclick="toggleSpend()"><span class="rb-ic"><svg class="lic" viewBox="0 0 24 24"><path d="M12 3v18M8 7h6a2.5 2.5 0 0 1 0 5H9a2.5 2.5 0 0 0 0 5h7"/></svg></span>API spend</button>
     <button class="rail-btn" id="rail-more-btn" onclick="toggleRailMore()"><span class="rb-ic"><svg class="lic" viewBox="0 0 24 24"><circle cx="5" cy="12" r="1.2"/><circle cx="12" cy="12" r="1.2"/><circle cx="19" cy="12" r="1.2"/></svg></span>More <span id="rail-more-chev" style="margin-left:auto;font-size:10px;color:var(--dim);">▸</span></button>
     <div id="rail-more" style="display:none;">
@@ -1406,6 +1407,19 @@ body.layout-edit #layout-bar { display:flex; flex-wrap:wrap; justify-content:cen
   </div>
 </div>
 
+<div id="accum-panel-shell" onclick="if(event.target===this) toggleAccum()">
+  <div class="kb-box">
+    <div class="kb-title">Accumulator <button class="s-close" onclick="toggleAccum()">✕</button><button class="s-close" style="right:52px;font-size:13px;" onclick="loadAccum()" title="Refresh — re-read the bot's state">⟳</button></div>
+    <div style="font-size:12px;color:var(--dim);margin-bottom:12px;line-height:1.5;">
+      A different scoreboard from every other panel here: this one is counted in <b>coins, not pounds</b>. It sells a slice on a daily VuManChu red dot when money flow is negative, then ladders buy-backs at real levels below — swing lows, order blocks, unfilled gaps. The benchmark is not a profit target, it is the flat <b>1.00000</b> units you would hold by doing nothing at all. Under that line means it has cost you Bitcoin.
+    </div>
+    <div id="accum-panel"><div style="font-size:11px;color:var(--dim);">Loading…</div></div>
+    <div style="font-size:10px;color:var(--dim);margin-top:14px;line-height:1.5;">
+      Measured on 14.5 years of real BTC before it was built: it gains units in ranging and falling markets and loses them in sustained rallies (+14.9% since Jan 2024, −27.8% over the full history). It runs on SPOT, not futures — you cannot accumulate coins on a perpetual. Currently measure-only; it places nothing until explicitly armed.
+    </div>
+  </div>
+</div>
+
 <div id="bot-panel" onclick="closeBot(event)">
   <div class="kb-box">
     <div class="kb-title">Bot Trades <button class="s-close" onclick="toggleBot()">✕</button><button class="s-close" style="right:52px;font-size:13px;" onclick="CipherExec.renderBot()" title="Refresh — re-read the exchange and decisions">⟳</button></div>
@@ -1456,9 +1470,6 @@ body.layout-edit #layout-bar { display:flex; flex-wrap:wrap; justify-content:cen
         Settings take effect on the agent's next run. Stop everything halts the app instantly and cancels resting orders; the 24/7 bot stops at its next run, within 15 minutes. Open positions are never closed automatically.
       </div>
     </div>
-
-    <div style="font-size:11px;font-weight:700;color:var(--muted);margin-bottom:6px;">ACCUMULATOR — MORE BTC, NOT MORE £</div>
-    <div id="accum-panel" style="margin-bottom:16px;"><div style="font-size:11px;color:var(--dim);">Loading…</div></div>
 
     <div style="font-size:11px;font-weight:700;color:var(--muted);margin-bottom:6px;">SERVER DECISIONS (24/7 AGENT)</div>
     <div id="srv-log" style="margin-bottom:16px;"><div style="font-size:11px;color:var(--dim);">Loading…</div></div>
@@ -10048,6 +10059,25 @@ document.addEventListener('click', function(e){
       el.innerHTML = h;
     }catch(e){ el.innerHTML = '<div style="font-size:11px;color:var(--dim);">server log unavailable: ' + esc(String(e && e.message || e)) + '</div>'; }
   }
+
+  // The accumulator has its own rail section, so it fetches its own state rather than depending
+  // on the Bot Trades panel being open. Same public state file, same cache-buster.
+  async function loadAccum(){
+    const el = document.getElementById('accum-panel'); if(!el) return;
+    el.innerHTML = '<div style="font-size:11px;color:var(--dim);">Reading the bot\'s state…</div>';
+    try{
+      const res = await fetch(SRV_STATE_URL + '?t=' + Date.now(), { cache:'no-store' });
+      if(!res.ok){ el.innerHTML = '<div style="font-size:11px;color:var(--dim);">could not read the bot state (' + res.status + ')</div>'; return; }
+      const st = JSON.parse(await res.text());
+      renderAccum(st, Array.isArray(st.cipher_log) ? st.cipher_log : []);
+    }catch(e){ el.innerHTML = '<div style="font-size:11px;color:var(--dim);">state unavailable: ' + esc(String(e && e.message || e)) + '</div>'; }
+  }
+  window.loadAccum = loadAccum;
+  window.toggleAccum = function(){
+    const p = document.getElementById('accum-panel-shell'); if(!p) return;
+    p.classList.toggle('show');
+    if(p.classList.contains('show')) loadAccum();
+  };
 
   function refreshServerPanel(){ loadServerConfig(); loadServerLog(); }
 
