@@ -1097,9 +1097,47 @@ function snapshotOpen(positions, bookMap, prev) {
     if (d !== "long" && d !== "short") d = Number(p.size) < 0 ? "short" : "long";
     const k = posKey(coin, d);
     out[k] = { coin, dir: d, size: Math.abs(Number(p.size) || 0), book: bookMap[k] || null,
-               plan: (prev && prev[k] && prev[k].plan) || null, since: (prev && prev[k] && prev[k].since) || Date.now() };
+               plan: (prev && prev[k] && prev[k].plan) || null, since: (prev && prev[k] && prev[k].since) || Date.now(),
+               // the exchange's own average entry, so an adopted position can be graded against
+               // the price it was really opened at rather than wherever price happens to be today
+               avgEntry: +(p.avgEntryPriceRp ?? p.avgEntryPrice) || (prev && prev[k] && prev[k].avgEntry) || undefined,
+               adopted: (prev && prev[k] && prev[k].adopted) || undefined };
   }
   return out;
+}
+
+// ── ADOPT WHAT WE ARE ALREADY HOLDING (2026-08-19) ────────────────────────────────────────────
+// XRP|long and UNI|long predate the books feature: plan null, book null. Nothing could classify
+// their exit, no time stop can ever apply to them, and an unknown position is "protected in both
+// books" — so each orphan silently occupied a slot in BOTH books while nothing managed it.
+// Adoption is pure bookkeeping: build the plan the bot WOULD build today from current daily
+// structure (entry = the exchange's average entry price when it reports one), file the position
+// under the swing book. No order is placed and nothing on the exchange moves — the plan simply
+// gives the resolution pass, the correlation guard and any future time stop something to hold.
+async function adoptOrphans(nowOpen, bookMap) {
+  const adopted = [];
+  for (const [k, pos] of Object.entries(nowOpen || {})) {
+    if (pos.plan || !(pos.size > 0)) continue;
+    let bars = null;
+    try { bars = await fetchCandles(pos.coin, "1D", 260); } catch { }
+    if (!bars || !bars.length) continue;
+    // The stop and target are anchored to TODAY's price and structure — the position may have
+    // been opened far from here, and a stop hung off a stale entry can land on the wrong side of
+    // the market or fail the 3-ATR sanity check. The recorded entry stays the exchange's true
+    // average entry, so "closed in profit / at a loss" is judged against reality.
+    const cur = bars[bars.length - 1].c;
+    const plan = buildTradePlan(bars, pos.dir, cur);
+    if (!plan) continue;
+    const ref = Number.isFinite(pos.avgEntry) && pos.avgEntry > 0 ? pos.avgEntry : cur;
+    pos.plan = { entry: ref, stop: plan.stop, target: plan.targets[1] ?? plan.targets[0] };
+    pos.book = pos.book || "swing";
+    pos.adopted = Date.now();
+    bookMap[k] = pos.book;
+    adopted.push(pos);
+    await pushLog({ coin: pos.coin, dir: pos.dir, book: pos.book, result: "ADOPTED",
+      skipped: `held with no plan (predates the books feature) — given a ${plan.stopKind} stop ${formatPrice(pos.plan.stop)} and target ${formatPrice(pos.plan.target)} from today's daily structure, entry marked at ${formatPrice(ref)}, filed under the swing book. Bookkeeping only: no order placed.` });
+  }
+  return adopted;
 }
 
 // Anything in the previous snapshot that is no longer open has resolved. Classify it by where
@@ -1186,6 +1224,64 @@ function gradeWithTimeStop(rec, candles, maxBars) {
     if (i - start >= maxBars) return (isLong ? c.c - rec.entry : rec.entry - c.c) / risk;  // time is up
   }
   return null;                                   // still open and still inside its window
+}
+
+// ═══════════════ MAKER ENTRY (shadow, 2026-08-19) ═══════════════
+// The cost work said fees are the binding constraint — 2.2× gross profit, and the three-year
+// replay flips sign if both sides pay maker. The live entry is a marketable limit crossed 1%
+// through the market: a guaranteed fill, at taker. The candidate is a post-only limit AT the
+// signal price: it pays maker IF price trades back through the level inside the entry-expiry
+// window, and it MISSES the trades that run without a pullback — which the entry-mode note
+// (2026-08-15) warned are often the best ones. Whether the fee saved pays for the trades missed
+// is an empirical question, so it is measured here and decides nothing. Scored on the same
+// decisions every other experiment uses. Nothing in this path places or changes an order.
+const MAKER_FEE = num("MAKER_FEE", 0.0001);   // Phemex maker 0.01%
+const TAKER_FEE = num("TAKER_FEE", 0.0006);   // Phemex taker 0.06%
+
+// Pure candle walk from a given bar: −1 on stop, +R on target, marked to market at the cap.
+// Stop before target inside a candle — the same pessimism as gradeOne. Mutates nothing.
+function walkFromBar(rec, candles, from, fillPx) {
+  const risk = Math.abs(fillPx - rec.stop);
+  if (!(risk > 0)) return null;
+  const isLong = rec.dir !== "short";
+  for (let i = from; i < candles.length; i++) {
+    const c = candles[i];
+    if (isLong ? c.l <= rec.stop : c.h >= rec.stop) return -1;
+    if (isLong ? c.h >= rec.target : c.l <= rec.target) return +Math.abs(rec.target - fillPx) / risk;
+    if (i - from >= SHADOW_TIMEOUT_BARS * (rec.tfMult || 4))
+      return (isLong ? c.c - fillPx : fillPx - c.c) / risk;   // time is up — marked to market
+  }
+  return null;                                  // still open — grade it on a later run
+}
+
+// Score one decision both ways, net of fees, in R. Returns null until both arms can settle.
+//   taker — fills immediately at the signal price; pays taker in and (pessimistically) taker out.
+//   maker — post-only at the signal price; fills only when a later candle trades back through the
+//           level inside expiryH. Unfilled by expiry = the trade never happened: 0R, counted as
+//           missed, because a fee saved on no position earns nothing.
+// Cost in R is fee% ÷ stop% — the same arithmetic that set the 2.2% stop floor.
+function gradeMakerEntry(rec, candles, expiryH) {
+  const risk = Math.abs(rec.entry - rec.stop);
+  if (!(risk > 0) || !candles || !candles.length) return null;
+  const isLong = rec.dir !== "short";
+  const start = candles.findIndex(c => c.t >= rec.at);
+  if (start < 0) return null;
+  const stopPct = risk / rec.entry;
+  const takerGross = walkFromBar(rec, candles, start, rec.entry);
+  if (takerGross === null) return null;
+  const takerR = +(takerGross - (2 * TAKER_FEE) / stopPct).toFixed(3);
+  const cutoff = rec.at + expiryH * 3600e3;
+  let fill = -1;
+  for (let i = start; i < candles.length && candles[i].t <= cutoff; i++) {
+    if (isLong ? candles[i].l <= rec.entry : candles[i].h >= rec.entry) { fill = i; break; }
+  }
+  if (fill < 0) {
+    const windowOver = candles[candles.length - 1].t > cutoff;
+    return windowOver ? { takerR, makerR: 0, filled: false } : null;   // wait the window out
+  }
+  const makerGross = walkFromBar(rec, candles, fill, rec.entry);
+  if (makerGross === null) return null;
+  return { takerR, makerR: +(makerGross - (MAKER_FEE + TAKER_FEE) / stopPct).toFixed(3), filled: true };
 }
 
 // A live position the bot opened, still sitting there past its window. Closing is a REDUCE-ONLY
@@ -2017,6 +2113,42 @@ export default async function cipherAgent() {
       return `${n}b ${a.n ? (a.sum / a.n).toFixed(3) : "—"}R (${a.n})`; }).join(" · ");
     console.log(`shadow time_stop: hold-forever ${holdStats.meanR}R (${holdStats.n}) · ${tsLine}`);
 
+    // ── MAKER-ENTRY EXPERIMENT (2026-08-19) ──────────────────────────────────────────────────
+    // The same decisions, a fourth question: what would a post-only limit at the signal price
+    // have returned, net of fees, against the marketable limit the bot actually sends? Graded on
+    // the timeframe below the signal so a fill and a stop can be told apart within the bar.
+    const meSlot = shadowSlot(SHADOW, "maker_entry");
+    meSlot.arms = meSlot.arms || { taker: { sum: 0, n: 0 }, maker: { sum: 0, n: 0, filled: 0, missed: 0 } };
+    meSlot.seen = meSlot.seen || [];
+    const meNeed = new Map();
+    for (const rec of src) {
+      if (rec.arm !== "baseline") continue;
+      if (meSlot.seen.includes(rec.coin + rec.at)) continue;
+      const gtf = GRADE_TF_BELOW[rec.tf || "1D"] || "1H";
+      const mk = rec.coin + "|" + gtf;
+      if (!meNeed.has(mk)) meNeed.set(mk, []);
+      meNeed.get(mk).push(rec);
+    }
+    for (const [mk, mrecs] of meNeed) {
+      const [coin, gtf] = mk.split("|");
+      let candles = null;
+      try { candles = await fetchCandles(coin, gtf, 600); } catch { }
+      if (!candles) continue;
+      for (const rec of mrecs) {
+        const g = gradeMakerEntry(rec, candles, CFG.entryExpiryH() || 8);
+        if (!g) continue;                       // not settled yet — try again next run
+        meSlot.arms.taker.sum += g.takerR; meSlot.arms.taker.n++;
+        meSlot.arms.maker.sum += g.makerR; meSlot.arms.maker.n++;
+        if (g.filled) meSlot.arms.maker.filled++; else meSlot.arms.maker.missed++;
+        meSlot.seen.push(rec.coin + rec.at);
+        if (meSlot.seen.length > SHADOW_MAX_RECORDS) meSlot.seen = meSlot.seen.slice(-SHADOW_MAX_RECORDS);
+      }
+    }
+    {
+      const a = meSlot.arms, meanME = x => x.n ? (x.sum / x.n).toFixed(3) : "—";
+      console.log(`shadow maker_entry: taker ${meanME(a.taker)}R (${a.taker.n}) · maker ${meanME(a.maker)}R (${a.maker.n}: ${a.maker.filled} filled, ${a.maker.missed} missed)`);
+    }
+
     const v = shadowJudge(SHADOW, "rank_vs_threshold");
     await saveShadow(SHADOW);
     console.log(`shadow rank_vs_threshold: baseline ${v.base.n} trades @ ${v.base.meanR}R · variant ${v.varr.n} @ ${v.varr.meanR}R · edge ${v.edge >= 0 ? "+" : ""}${v.edge}R${v.ready ? "" : " (still gathering)"}${v.changed ? " — " + v.changed.toUpperCase() : ""}${gradedN ? ` · graded ${gradedN} this run` : ""}`);
@@ -2079,6 +2211,9 @@ export default async function cipherAgent() {
       nowOpen[k].plan = o.plan || nowOpen[k].plan || null;
       nowOpen[k].book = o.book;
     }
+    // Anything held with no plan gets adopted — see adoptOrphans. Bookkeeping only, no orders.
+    const adopted = await adoptOrphans(nowOpen, bookMap);
+    if (adopted.length) console.log(`adopted ${adopted.length} plan-less position(s): ${adopted.map(p => p.coin + " " + p.dir).join(", ")} — plan and book attached, no orders placed`);
     const resolved = resolvedSince(prevOpen, nowOpen, priceOf);
     const queue = [];
     for (const r of resolved) {
