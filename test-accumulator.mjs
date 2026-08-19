@@ -215,6 +215,19 @@ console.log('\n11. The brain may observe the accumulator, never change it');
   ok('it is rate limited', /ACCUM_REVIEW_DAYS/.test(runBlock));
   ok('and shares the daily spend cap', /brainBudget/.test(runBlock));
 }
+console.log('\n12. The spot preflight is read-only');
+{
+  const fn = src.slice(src.indexOf('async function spotPreflight'), src.indexOf('// The only function that can put a spot order on the wire.'));
+  ok('preflight exists', fn.length > 200);
+  ok('it only ever GETs', !/POST|DELETE|PUT/.test(fn));
+  ok('it cannot build or send an order', !/buildSpotOrder|sendSpotOrder|execOrder|directOrder/.test(fn));
+  ok('it reads the product table', /spotProducts\(\)/.test(fn));
+  ok('it reads the spot wallet', /\/spot\/wallets/.test(fn));
+  ok('every read is wrapped so a failure cannot break the run', (fn.match(/catch/g)||[]).length >= 2);
+  const call = src.slice(src.indexOf('Read-only preflight'), src.indexOf('const bars = await fetchCandles(coin, "1D", 260)'));
+  ok('it can be switched off', /ACCUM_PREFLIGHT/.test(call));
+  ok('and it runs before anything else in the accumulator', call.length > 100);
+}
 fs.unlinkSync(out);
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail?1:0);

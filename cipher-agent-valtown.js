@@ -1921,6 +1921,36 @@ function buildSpotOrder(sym, side, { price, baseQty, quoteQty }, products) {
   return { order };
 }
 
+// PREFLIGHT — read-only, answers "can this actually trade spot here?" from the runner itself.
+// Written because the machine this code was authored on cannot reach Phemex at all, so the only
+// honest way to find out is to have the bot look and report back. Three questions, in order:
+//   1. does the venue expose a spot market for this coin, and what are its scales?
+//   2. is there a spot wallet, and does it hold anything?
+//   3. what would the very next order look like, byte for byte?
+// It places nothing. Run it, read the log, and only then decide whether to arm.
+async function spotPreflight(coin) {
+  const out = { symbol: "s" + String(coin).toUpperCase() + "USDT" };
+  try {
+    const prods = await spotProducts();
+    out.productsRead = !!prods;
+    out.product = prods && prods[out.symbol] ? prods[out.symbol] : null;
+    out.spotSymbolCount = prods ? Object.keys(prods).length : 0;
+  } catch (e) { out.productsErr = String(e && e.message || e).slice(0, 120); }
+  try {
+    const w = await phemexCall("GET", "/spot/wallets", "", null);
+    out.walletStatus = w.status;
+    const rows = (w.data && (w.data.data || w.data.result)) || [];
+    if (Array.isArray(rows)) {
+      out.balances = rows
+        .filter(r => r && (Number(r.balanceEv) > 0 || Number(r.balance) > 0))
+        .map(r => `${r.currency || r.currencyCode || "?"}:${r.balanceEv ?? r.balance}`)
+        .slice(0, 8);
+      out.walletRows = rows.length;
+    } else out.walletShape = typeof rows;
+  } catch (e) { out.walletErr = String(e && e.message || e).slice(0, 120); }
+  return out;
+}
+
 // The only function that can put a spot order on the wire. Three independent brakes, all of which
 // must be off: ACCUM_EXEC must be "armed", the global KILL must be clear, and the notional must
 // sit under ACCUM_MAX_USDT. Anything else returns a dry-run result that says what it would have done.
@@ -2880,6 +2910,16 @@ export default async function cipherAgent() {
   if (String(env("ACCUM", "1")) === "1") {
     try {
       const coin = ACCUM_COIN();
+      // Read-only preflight: report whether spot is actually usable here. No orders.
+      if (String(env("ACCUM_PREFLIGHT", "1")) === "1") {
+        try {
+          const pf = await spotPreflight(coin);
+          const prod = pf.product
+            ? `scales price/base/quote ${pf.product.priceScale}/${pf.product.baseValueScale}/${pf.product.quoteValueScale}`
+            : "NOT FOUND";
+          console.log(`spot preflight: ${pf.symbol} — products ${pf.productsRead ? pf.spotSymbolCount + " spot symbols" : "UNREADABLE"} · ${prod} · wallet http ${pf.walletStatus ?? "?"}${pf.balances ? " · holding " + (pf.balances.join(", ") || "nothing") : ""}${pf.walletErr ? " · wallet error " + pf.walletErr : ""}${pf.productsErr ? " · products error " + pf.productsErr : ""}`);
+        } catch (e) { console.error("spot preflight failed (read-only, harmless):", e && e.message); }
+      }
       const bars = await fetchCandles(coin, "1D", 260);
       if (bars && bars.length >= 60) {
         let state = await getJSON(ACCUM_KEY, null);
