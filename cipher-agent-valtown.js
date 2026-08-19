@@ -1690,6 +1690,141 @@ function insightScan(records) {
   return rows.sort((a, b) => b.n - a.n);
 }
 
+// ═══════════════ THE SERVER-SIDE BRAIN: LOSER AUTOPSY (2026-08-19) ═══════════════
+// John: "give it eyes so it learns" — and give it the server, so it works while the laptop is
+// closed. This is the LLM doing the one thing it is actually good at in a trading system: reading
+// the messy context of a trade that FAILED and naming what happened. It never predicts price,
+// never sizes, never places, never blocks. Its output is a label on a record.
+//
+// The learning loop, held to the same evidence bar as everything else:
+//   1. every newly graded LOSING decision is sent (in ONE batched call) to a small cheap model
+//   2. the model must pick a cause from a PRE-REGISTERED taxonomy — free text can't be clustered,
+//      and an unclusterable excuse is not learning
+//   3. causes accumulate on the records; when one cause has a real sample AND its trades lose in
+//      both halves of history, it is reported as a VETO CANDIDATE
+//   4. a candidate stays advisory. Gating real orders would need its own shadow arm and a
+//      deliberate flag — nothing here touches the order path, and the tests assert that.
+//
+// Cost is engineered down before it is capped: one call per run at most, only when there are new
+// graded losses, batch of AUTOPSY_BATCH, compact JSON in and out, small model. Then capped anyway:
+// BRAIN_DAILY_USD (default $0.25/day) is a hard stop, tracked in the state file where John can
+// see it. No ANTHROPIC_API_KEY secret = the whole feature is silently off.
+const AUTOPSY_CAUSES = [
+  "chased-extended",   // entered far into a move that had already paid
+  "against-field",     // fought the cross-sectional leader/laggard read
+  "quiet-market",      // ATR too small for the costs — the known killer
+  "vol-collapse",      // volatility died right after entry; the move never came
+  "crowded-level",     // obvious level, stop where everyone's stop was
+  "signal-noise",      // low-timeframe signal that was never more than wiggle
+  "late-fill",         // the idea was right, the entry was stale by fill time
+  "regime-turn",       // BTC/the field turned over right after entry
+  "unknown",
+];
+const AUTOPSY_MAX_R = () => num("AUTOPSY_MAX_R", -0.4);   // what counts as a loss worth reading
+const AUTOPSY_BATCH = () => Math.max(1, num("AUTOPSY_BATCH", 8));
+const VETO_MIN_N = () => Math.max(4, num("VETO_MIN_N", 10));
+
+// Compact, deterministic prompt. Everything the model sees is data the record already carries.
+function buildAutopsyPrompt(losses) {
+  const rows = losses.map((r, i) => ({
+    i, coin: r.coin, dir: r.dir, tf: r.tf || "1D", det: (r.note || "?").split(" ")[0],
+    q: r.quality ?? null, rs: r.rs ?? null, reg: r.reg ?? null, dist: r.regDist ?? null,
+    br: r.breadth ?? null, stopPct: r.entry ? +((Math.abs(r.entry - r.stop) / r.entry) * 100).toFixed(2) : null,
+    R: r.R,
+  }));
+  return [
+    "You are the post-trade analyst for a rules-based crypto bot. Every trade below LOST.",
+    "For each, pick the SINGLE most likely cause from this fixed list (reply with the id):",
+    AUTOPSY_CAUSES.join(" | "),
+    "Field key: det=detector, q=setup quality, rs=field rank signed with the trade (0 laggard..1 leader),",
+    "reg=BTC regime, dist=BTC % from its 200D, br=share of coins above their 200D, R=result in R.",
+    'Reply ONLY a JSON array, no prose: [{"i":<index>,"c":"<cause-id>","w":"<why, max 12 words>"}]',
+    "TRADES:", JSON.stringify(rows),
+  ].join("\n");
+}
+
+// Tolerant of everything a model can do to JSON: prose around it, fences, bad ids.
+function parseAutopsy(text, count) {
+  if (!text) return [];
+  const m = String(text).match(/\[[\s\S]*\]/);
+  if (!m) return [];
+  let arr;
+  try { arr = JSON.parse(m[0]); } catch { return []; }
+  if (!Array.isArray(arr)) return [];
+  const out = [];
+  for (const x of arr) {
+    if (!x || typeof x !== "object") continue;
+    const i = Number(x.i);
+    if (!Number.isInteger(i) || i < 0 || i >= count) continue;
+    const c = AUTOPSY_CAUSES.includes(x.c) ? x.c : "unknown";
+    out.push({ i, c, w: String(x.w || "").slice(0, 90) });
+  }
+  return out;
+}
+
+// The spend meter is the contract: the brain can never cost more than the cap says, and what it
+// did cost is committed to the repo in the state file where it can be audited like everything else.
+function brainBudget(slot, now, usage) {
+  const day = new Date(now).toISOString().slice(0, 10);
+  if (slot.spendDay !== day) { slot.spendDay = day; slot.spendUsd = 0; slot.calls = 0; }
+  if (usage) {
+    const inUsd = (usage.input_tokens || 0) / 1e6 * num("BRAIN_IN_USD_PER_M", 1);
+    const outUsd = (usage.output_tokens || 0) / 1e6 * num("BRAIN_OUT_USD_PER_M", 5);
+    slot.spendUsd = +((slot.spendUsd || 0) + inUsd + outUsd).toFixed(4);
+    slot.calls = (slot.calls || 0) + 1;
+  }
+  return (slot.spendUsd || 0) < num("BRAIN_DAILY_USD", 0.25);
+}
+
+async function brainCall(prompt) {
+  const key = env("ANTHROPIC_API_KEY", "");
+  if (!key) return null;
+  const ctrl = new AbortController();
+  const to = setTimeout(() => ctrl.abort(), 30000);
+  try {
+    const r = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST", signal: ctrl.signal,
+      headers: { "x-api-key": key, "anthropic-version": "2023-06-01", "content-type": "application/json" },
+      body: JSON.stringify({
+        model: env("BRAIN_MODEL", "claude-haiku-4-5"), max_tokens: 700,
+        messages: [{ role: "user", content: prompt }],
+      }),
+    });
+    const j = await r.json();
+    if (!r.ok) { console.error("brain call refused:", (j && j.error && j.error.message) || r.status); return null; }
+    return { text: (j.content && j.content[0] && j.content[0].text) || "", usage: j.usage || {} };
+  } catch (e) { console.error("brain call failed (harmless, labels only):", e && e.message); return null; }
+  finally { clearTimeout(to); }
+}
+
+// Cause → veto candidate. IMPORTANT: only losses are autopsied, so "this cause's trades lose"
+// is true by construction and proves nothing. What a label CAN prove is persistence: a failure
+// mode that keeps recurring across time is structural; one that clustered in a single bad week
+// was weather. So the bar is: a real sample overall, AND the cause appears in BOTH halves of the
+// autopsied timeline. A candidate is a NAMED, RECURRING failure mode — the veto itself must then
+// be written as a mechanical rule and earn its place through a shadow arm like everything else.
+// Advisory output only — the order path is not in this function's reach.
+function vetoCandidates(records) {
+  const done = records.filter(r => r.arm === "baseline" && r.R !== null && r.autopsy).sort((a, b) => a.at - b.at);
+  if (!done.length) return [];
+  const midAt = done[Math.floor(done.length / 2)].at;        // the autopsied timeline's midpoint
+  const byCause = new Map();
+  for (const r of done) {
+    if (!byCause.has(r.autopsy)) byCause.set(r.autopsy, []);
+    byCause.get(r.autopsy).push(r);
+  }
+  const meanOf = a => a.length ? +(a.reduce((x, r) => x + r.R, 0) / a.length).toFixed(3) : null;
+  const minEach = Math.max(2, Math.floor(VETO_MIN_N() / 3));
+  const out = [];
+  for (const [cause, rs] of byCause) {
+    if (cause === "unknown") continue;                       // "I don't know" is never a rule
+    const early = rs.filter(r => r.at < midAt).length, late = rs.length - early;
+    const candidate = rs.length >= VETO_MIN_N() && early >= minEach && late >= minEach;
+    out.push({ cause, n: rs.length, early, late, meanR: meanOf(rs), candidate });
+  }
+  return out.sort((a, b) => b.n - a.n);
+}
+
 // Bull or bear, from BTC against its own 200-day average. One number, no parameters to fit, and
 // the same definition every trader in the market can see — which is the point: a regime line only
 // anyone can compute is a regime line nobody else is reacting to.
@@ -2379,6 +2514,40 @@ export default async function cipherAgent() {
           skipped: `stable insights now: ${stable.map(r => `${r.feature}=${r.bucket} ${r.meanR}R over ${r.n}`).join("; ")}. Still advisory — nothing is filtered.` });
       }
     }
+
+    // ── THE BRAIN'S EYES: loser autopsy (2026-08-19) ─────────────────────────────────────────
+    // One batched call, only when there are new graded losses, hard daily cap, labels only.
+    try {
+      const bSlot = shadowSlot(SHADOW, "brain_autopsy");
+      const fresh = src.filter(r => r.arm === "baseline" && r.R !== null && r.R <= AUTOPSY_MAX_R() && !r.autopsy)
+                       .sort((a, b) => a.at - b.at).slice(0, AUTOPSY_BATCH());
+      if (!env("ANTHROPIC_API_KEY", "")) {
+        if (fresh.length) console.log(`brain autopsy: ${fresh.length} unread loss(es) waiting — no ANTHROPIC_API_KEY secret set, brain is off`);
+      } else if (fresh.length && brainBudget(bSlot, Date.now(), null)) {
+        const res = await brainCall(buildAutopsyPrompt(fresh));
+        if (res) {
+          const withinBudget = brainBudget(bSlot, Date.now(), res.usage);
+          const labels = parseAutopsy(res.text, fresh.length);
+          for (const { i, c, w } of labels) { fresh[i].autopsy = c; fresh[i].autopsyWhy = w; }
+          console.log(`brain autopsy: read ${labels.length}/${fresh.length} losses · $${(bSlot.spendUsd || 0).toFixed(3)} of $${num("BRAIN_DAILY_USD", 0.25)} today${withinBudget ? "" : " — cap reached, brain rests until tomorrow"}`);
+        }
+      } else if (fresh.length) {
+        console.log(`brain autopsy: ${fresh.length} unread loss(es) held — daily cap $${num("BRAIN_DAILY_USD", 0.25)} already spent`);
+      }
+      // report the failure modes whether or not the brain ran this cycle
+      const vc = vetoCandidates(src);
+      if (vc.length) {
+        console.log("brain vetoes: " + vc.map(v => `${v.cause} ${v.meanR}R (${v.n}${v.candidate ? " CANDIDATE" : ""})`).join(" · "));
+        const sig = vc.filter(v => v.candidate).map(v => v.cause).sort().join(",");
+        if (bSlot.lastVerdict !== sig) {
+          bSlot.lastVerdict = sig;
+          bSlot.history.push({ at: Date.now(), changed: "evidence", candidates: vc.filter(v => v.candidate) });
+          if (sig) await pushLog({ shadow: "brain_autopsy", result: "EVIDENCE",
+            skipped: `recurring failure modes: ${vc.filter(v => v.candidate).map(v => `${v.cause} (${v.n} trades, ${v.meanR}R)`).join("; ")}. Advisory only — a veto must be written as a mechanical rule and win a shadow arm before it can block anything.` });
+        }
+      }
+    } catch (e) { console.error("brain autopsy failed (harmless, labels only):", e && e.message); }
+
     await saveShadow(SHADOW);
   } catch (e) { console.error("shadow pass failed (harmless, no orders involved):", e && e.message); }
 
