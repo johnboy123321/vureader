@@ -912,6 +912,23 @@ function findPositions(o, depth = 0) {
   return null;
 }
 
+// The same accountPositions response carries the account object — balance, margin. Capturing it
+// here means the circuit breaker can watch real equity without a single extra API call.
+function findAccount(o, depth = 0) {
+  if (!o || typeof o !== "object" || depth > 5) return null;
+  if (o.accountBalanceRv != null || o.accountBalanceEv != null) return o;
+  for (const k of Object.keys(o)) { const hit = findAccount(o[k], depth + 1); if (hit) return hit; }
+  return null;
+}
+let LAST_ACCOUNT = null;
+function equityNow() {
+  if (!LAST_ACCOUNT) return null;
+  const v = Number(LAST_ACCOUNT.accountBalanceRv ?? NaN);
+  if (Number.isFinite(v) && v > 0) return v;
+  const e = Number(LAST_ACCOUNT.accountBalanceEv ?? NaN);          // scaled integer variant
+  return Number.isFinite(e) && e > 0 ? e / 1e8 : null;
+}
+
 // null = "I could not read the book". [] = "the book is genuinely empty". Never conflate them:
 // a non-200, or a 200 whose body contains no positions array at all, is a FAILED read, and the
 // caller must be able to tell. Returning [] on a 502 is what let opposing legs stack up.
@@ -920,6 +937,7 @@ async function execPositions() {
     ? await phemexCall("GET", "/g-accounts/accountPositions", "currency=USDT", null)
     : await relay("/positions");
   if (r.status !== 200) { console.error("positions read: HTTP " + r.status); return null; }
+  try { LAST_ACCOUNT = findAccount(r.data); } catch { LAST_ACCOUNT = null; }
   const pos = findPositions(r.data);
   if (!Array.isArray(pos)) { console.error("positions read: no positions array in the response"); return null; }
   return pos;
@@ -1352,6 +1370,76 @@ async function resolveHedges(positions) {
   return out;
 }
 
+// ═══════════════ CIRCUIT BREAKER (2026-08-19) ═══════════════
+// The one real gap every outside review agreed on: the bot had a manual KILL switch and
+// trade-COUNT caps, but nothing watched the MONEY. A bug, a regime the rules don't understand,
+// or plain variance can bleed an account one correctly-sized loss at a time, and every loss
+// individually looks fine. Three trips, all deterministic, none of them clever:
+//
+//   · the account drops DAY_DD_PCT from where the day started   → no new entries until tomorrow
+//   · it drops WEEK_DD_PCT from where the week started          → no new entries until next week
+//   · STREAK_N consecutive losing resolutions                   → pause STREAK_PAUSE_H hours;
+//     the market is doing something the rules don't understand — stop asking it the same question
+//
+// A tripped breaker blocks NEW entries only. Exits, stops, entry-expiry cancels and de-hedging
+// all keep running — everything that reduces risk stays on; only the thing that adds risk stops.
+// It never auto-reverses, never resizes, never touches an open position. Deliberately dumb.
+const BREAKER_KEY = "cipher_breaker";
+const DAY_MS = 864e5, WEEK_MS = 7 * 864e5;
+const dayKeyOf = (now) => new Date(now).toISOString().slice(0, 10);
+const weekKeyOf = (now) => Math.floor((now + 3 * DAY_MS) / WEEK_MS);   // epoch was a Thursday; +3d puts the boundary on Monday 00:00 UTC
+const nextDayStart = (now) => (Math.floor(now / DAY_MS) + 1) * DAY_MS;
+const nextWeekStart = (now) => (weekKeyOf(now) + 1) * WEEK_MS - 3 * DAY_MS;
+
+// Pure, so every trip condition is testable without a venue or a clock.
+//   st       — persisted state { dayKey, dayEq, weekKey, weekEq, streak, pausedUntil, pausedWhy }
+//   now      — ms
+//   equity   — current account balance, or null when the venue didn't show one (never trips blind)
+//   resolvedHows — "how" strings from this run's resolutions, for the streak
+function breakerStep(st, { now, equity, resolvedHows = [] }, cfg) {
+  st = st || {};
+  const c = cfg || {
+    dayDD: num("BREAKER_DAY_DD_PCT", 5) / 100,
+    weekDD: num("BREAKER_WEEK_DD_PCT", 10) / 100,
+    streakN: num("BREAKER_STREAK_N", 3),
+    streakPauseH: num("BREAKER_STREAK_PAUSE_H", 12),
+  };
+  const trips = [];
+  // anchors roll with the calendar — a new day/week starts a fresh measurement from HERE
+  const dk = dayKeyOf(now), wk = weekKeyOf(now);
+  if (st.dayKey !== dk) { st.dayKey = dk; st.dayEq = equity ?? st.dayEq ?? null; }
+  else if (st.dayEq == null && equity != null) st.dayEq = equity;
+  if (st.weekKey !== wk) { st.weekKey = wk; st.weekEq = equity ?? st.weekEq ?? null; }
+  else if (st.weekEq == null && equity != null) st.weekEq = equity;
+  // an expired pause clears itself
+  if (st.pausedUntil && now >= st.pausedUntil) { st.pausedUntil = 0; st.pausedWhy = ""; }
+  // consecutive losses — a win resets, a loss counts, "closed"/unknown changes nothing
+  for (const how of resolvedHows) {
+    if (how === "stop" || how === "closed at a loss") st.streak = (st.streak || 0) + 1;
+    else if (how === "target" || how === "closed in profit") st.streak = 0;
+    if ((st.streak || 0) >= c.streakN && !(st.pausedUntil > now)) {
+      st.pausedUntil = now + c.streakPauseH * 3600e3;
+      st.pausedWhy = `${c.streakN} consecutive losing trades — pausing new entries ${c.streakPauseH}h to stop re-asking a market that keeps saying no`;
+      st.streak = 0;
+      trips.push("streak");
+    }
+  }
+  // drawdown — only when the venue actually showed us a balance
+  if (equity != null) {
+    if (st.dayEq > 0 && (st.dayEq - equity) / st.dayEq >= c.dayDD && !(st.pausedUntil > now)) {
+      st.pausedUntil = nextDayStart(now);
+      st.pausedWhy = `down ${(((st.dayEq - equity) / st.dayEq) * 100).toFixed(1)}% today (${equity.toFixed(2)} from ${st.dayEq.toFixed(2)}) — no new entries until tomorrow`;
+      trips.push("dayDD");
+    }
+    if (st.weekEq > 0 && (st.weekEq - equity) / st.weekEq >= c.weekDD && !(trips.length && st.pausedUntil >= nextWeekStart(now))) {
+      st.pausedUntil = Math.max(st.pausedUntil || 0, nextWeekStart(now));
+      st.pausedWhy = `down ${(((st.weekEq - equity) / st.weekEq) * 100).toFixed(1)}% this week — no new entries until Monday`;
+      trips.push("weekDD");
+    }
+  }
+  return { st, trips, paused: (st.pausedUntil || 0) > now };
+}
+
 // ═══════════════ THE SHADOW FRAMEWORK (2026-08-16) ═══════════════
 // John's brief: "build something different… nothing gets control until it has earned it."
 //
@@ -1553,6 +1641,53 @@ function smaAt(candles, n) {
   let s = 0;
   for (let i = candles.length - n; i < candles.length; i++) s += candles[i].c;
   return s / n;
+}
+
+// ═══════════════ INSIGHT SCANNER (2026-08-19) ═══════════════
+// John: "I want the brain to really see the market, really scan and learn and check for new
+// insight from the indicators." The honest version of that is not more oscillators — it is
+// sweeping every feature the bot ALREADY stamps on its decisions and asking, continuously, which
+// of them actually separates winners from losers in live forward history.
+//
+// The features are PRE-REGISTERED here, in code — fixed buckets, chosen before looking. That is
+// the whole defence against fishing: ~20 buckets are watched every run, so at a 1-in-20 false
+// positive rate roughly one will look good by chance, and the both-halves gate exists precisely
+// to kill those. A bucket is reported as an INSIGHT only when it has a real sample AND holds the
+// same sign in both halves of its own history — the same bar the regime and rank boxes must clear.
+// It measures. It filters nothing. Anything that looks real graduates to a proper shadow arm.
+const INSIGHT_MIN_N = 30;
+const INSIGHT_FEATURES = [
+  ["direction",  r => r.dir === "short" ? "short" : "long"],
+  ["timeframe",  r => r.tf || "1D"],
+  ["detector",   r => (r.note || "?").split(" ")[0].toLowerCase()],
+  ["quality",    r => r.quality == null ? null : r.quality < 5 ? "q<5" : r.quality < 6 ? "q5-6" : "q6+"],
+  ["breadth",    r => r.breadth == null ? null : r.breadth < 0.4 ? "few above 200D" : r.breadth <= 0.6 ? "mixed field" : "most above 200D"],
+  ["btc-extension", r => r.regDist == null ? null : r.regDist < -10 ? "btc <-10% of 200D" : r.regDist < 0 ? "btc -10..0%" : r.regDist <= 10 ? "btc 0..+10%" : "btc >+10%"],
+];
+
+function insightScan(records) {
+  const done = records.filter(r => r.arm === "baseline" && r.R !== null);
+  const meanOf = a => a.length ? +(a.reduce((x, r) => x + r.R, 0) / a.length).toFixed(3) : null;
+  const rows = [];
+  for (const [feature, of] of INSIGHT_FEATURES) {
+    const buckets = new Map();
+    for (const r of done) {
+      const b = of(r);
+      if (b == null) continue;
+      if (!buckets.has(b)) buckets.set(b, []);
+      buckets.get(b).push(r);
+    }
+    for (const [bucket, rs] of buckets) {
+      const sorted = [...rs].sort((a, b) => a.at - b.at);
+      const half = Math.floor(sorted.length / 2);
+      const first = meanOf(sorted.slice(0, half)), second = meanOf(sorted.slice(half));
+      const m = meanOf(sorted);
+      const stable = sorted.length >= INSIGHT_MIN_N && first !== null && second !== null &&
+                     Math.sign(first) === Math.sign(second) && Math.sign(first) !== 0;
+      rows.push({ feature, bucket, n: sorted.length, meanR: m, firstHalf: first, secondHalf: second, stable });
+    }
+  }
+  return rows.sort((a, b) => b.n - a.n);
 }
 
 // Bull or bear, from BTC against its own 200-day average. One number, no parameters to fit, and
@@ -1857,6 +1992,25 @@ export default async function cipherAgent() {
       if (hf.found) console.log(`hedges found on ${hf.found} coin(s) — ${hf.closed} smaller leg(s) closed${hf.failed ? `, ${hf.failed} failed` : ""}`);
     } catch (e) { console.error("de-hedge pass failed (harmless, reduce-only):", e && e.message); }
   }
+
+  // ── CIRCUIT BREAKER: check the money before asking for more risk ──────────────────────────
+  let BREAKER = { paused: false, st: {} };
+  try {
+    const bst = await getJSON(BREAKER_KEY, {});
+    const eq = canSeeBook ? equityNow() : null;
+    const wasPaused = (bst.pausedUntil || 0) > Date.now();
+    BREAKER = breakerStep(bst, { now: Date.now(), equity: eq });
+    await setJSON(BREAKER_KEY, BREAKER.st);
+    if (BREAKER.trips.length) {
+      console.log(`CIRCUIT BREAKER TRIPPED (${BREAKER.trips.join("+")}): ${BREAKER.st.pausedWhy}`);
+      await pushLog({ result: "BREAKER", skipped: BREAKER.st.pausedWhy });
+    } else if (BREAKER.paused) {
+      console.log(`circuit breaker holding: ${BREAKER.st.pausedWhy} (until ${new Date(BREAKER.st.pausedUntil).toISOString()})`);
+    } else if (wasPaused) {
+      console.log("circuit breaker released — new entries allowed again");
+    }
+    if (eq == null && canSeeBook) console.log("breaker: no account balance in the positions response — drawdown arms inactive this run, streak arm still live");
+  } catch (e) { console.error("breaker check failed (fails open for exits, closed for entries is handled per-trade):", e && e.message); }
   // Positions are read ONCE per run, so trades opened during this run must be counted too —
   // otherwise a single pass can stack far past CORR_MAX before the next run notices. Found when
   // the ported detectors made one run place 10 orders (2026-08-11).
@@ -1986,6 +2140,11 @@ export default async function cipherAgent() {
     lastPrice[coin] = sig.price;
     const bad = planValid(t);
     if (bad) { await pushLog({ ...t, skipped: "REFUSED — " + bad }); continue; }
+
+    // The breaker blocks NEW entries only — everything above (scan, shadow records) and every
+    // risk-reducing pass (exits, expiry, de-hedge) has already run. The coin is not burned for
+    // the day: the signal was fine, the account state was not.
+    if (BREAKER.paused) { await pushLog({ ...t, skipped: "CIRCUIT BREAKER — " + (BREAKER.st.pausedWhy || "paused") }); continue; }
 
     const built = buildOrder(t);
     if (built.err) { await pushLog({ ...t, skipped: built.err }); continue; }
@@ -2197,6 +2356,29 @@ export default async function cipherAgent() {
           skipped: `rank boxes now stable: ${sv.trustworthy.map(t => `${t.box} ${t.sign} ${t.meanR}R over ${t.n}`).join("; ")}. Still advisory — nothing is filtered.` });
       }
     }
+    // ── INSIGHT SCAN ─────────────────────────────────────────────────────────────────────────
+    // Every pre-registered feature, swept over every graded live decision, every run. Insights
+    // are reported when stable in both halves; a change in the stable set is logged so it can be
+    // seen from the app. Measures only — an insight earns a shadow arm, never a filter, from here.
+    const ins = insightScan(src);
+    const stable = ins.filter(r => r.stable);
+    const gathering = ins.filter(r => !r.stable && r.n < INSIGHT_MIN_N).length;
+    if (stable.length) {
+      for (const r of stable) {
+        console.log(`insight: ${r.feature}=${r.bucket} ${r.meanR >= 0 ? "+" : ""}${r.meanR}R over ${r.n}, holds in both halves (${r.firstHalf} then ${r.secondHalf})`);
+      }
+    }
+    console.log(`insight scan: ${ins.length} buckets watched · ${stable.length} stable · ${gathering} still gathering toward n=${INSIGHT_MIN_N}`);
+    {
+      const slot = shadowSlot(SHADOW, "insight_scan");
+      const sig = stable.map(r => `${r.feature}=${r.bucket}:${r.meanR >= 0 ? "+" : "-"}`).sort().join(",");
+      if (slot.lastVerdict !== sig) {
+        slot.lastVerdict = sig;
+        slot.history.push({ at: Date.now(), changed: "evidence", stable });
+        if (stable.length) await pushLog({ shadow: "insight_scan", result: "EVIDENCE",
+          skipped: `stable insights now: ${stable.map(r => `${r.feature}=${r.bucket} ${r.meanR}R over ${r.n}`).join("; ")}. Still advisory — nothing is filtered.` });
+      }
+    }
     await saveShadow(SHADOW);
   } catch (e) { console.error("shadow pass failed (harmless, no orders involved):", e && e.message); }
 
@@ -2226,6 +2408,16 @@ export default async function cipherAgent() {
     if (queue.length) await setJSON(PRIORITY_KEY, queue);
     await setJSON(OPEN_KEY, nowOpen);
     if (resolved.length) console.log(`resolved: ${resolved.map(r => r.coin + " " + r.how).join(", ")}`);
+    // feed this run's outcomes to the breaker's streak arm — a trip here pauses the NEXT run
+    if (resolved.length) {
+      const bst = await getJSON(BREAKER_KEY, {});
+      const b = breakerStep(bst, { now: Date.now(), equity: null, resolvedHows: resolved.map(r => r.how) });
+      await setJSON(BREAKER_KEY, b.st);
+      if (b.trips.includes("streak")) {
+        console.log(`CIRCUIT BREAKER TRIPPED (streak): ${b.st.pausedWhy}`);
+        await pushLog({ result: "BREAKER", skipped: b.st.pausedWhy });
+      }
+    }
   } catch (e) { console.error("resolution pass failed (no orders involved):", e && e.message); }
 
   await setJSON(BOOKMAP_KEY, bookMap);
