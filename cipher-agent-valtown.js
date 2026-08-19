@@ -1815,6 +1815,10 @@ function accumStep(state, daily, cfg = {}) {
     // The core also RATCHETS: when total units make a new high the core rises with them, so
     // accumulated coins are progressively locked away rather than re-risked forever.
     corePct = num("ACCUM_CORE_PCT", 0.60),
+    // cfg wins over env so the pure core stays testable without touching the environment
+    trigger = env("ACCUM_TRIGGER", "pump3"),
+    pumpPct = null,
+    mfGate = String(env("ACCUM_MF_GATE", "1")) === "1",
   } = cfg;
   const st = {
     units: 1, cash: 0, open: [], sells: 0, fills: 0, lastDay: null, startedAt: null, lastFillT: 0,
@@ -1848,14 +1852,40 @@ function accumStep(state, daily, cfg = {}) {
     }
   }
 
-  // 2) the red dot, with the money-flow gate that cut the trending-market damage in the replay
+  // 2) THE SELL TRIGGER (2026-08-19) ─────────────────────────────────────────────────────────
+  // John: "if BTC jumps 3% or more in a candle, what chance it comes down? Probably quite high."
+  // Measured on 14.5 years, and he is right about the hit rate — it rises monotonically with the
+  // size of the pump: any day 81.6% comes back 2%, after a +2% day 84.3%, +3% 85.4%, +5% 87.6%.
+  //
+  // Tested end to end it also BEATS the red dot in the regimes where this strategy works at all
+  // (2025-26: +11.6% vs +5.7%; 2022: +12.2% vs +5.7%). Worth knowing why they differ: a red dot
+  // fires AFTER momentum has rolled over, while "just pumped" IS momentum surging — they are
+  // alternatives, not a stack, and stacking them produced one sell in fourteen years.
+  //
+  // Neither escapes the regime problem: both lose in sustained rallies. This is a better trigger,
+  // not a solved strategy.
+  const trig = trigger;
   const { wt1, wt2 } = waveTrend(daily);
   const mf = vmcMoneyFlow(daily);
   const n = daily.length - 1;
-  const d0 = wt1[n] - wt2[n], d1 = wt1[n - 1] - wt2[n - 1];
-  const redDot = Number.isFinite(wt2[n]) && Number.isFinite(wt2[n - 1]) && d1 >= 0 && d0 < 0;
-  if (!redDot) return { st, events };
-  if (!(Number.isFinite(mf[n]) && mf[n] < 0)) { events.push({ kind: "skip", why: "money flow not negative" }); return { st, events }; }
+  let fired = false, how = "";
+  if (trig === "reddot") {
+    const d0 = wt1[n] - wt2[n], dPrev = wt1[n - 1] - wt2[n - 1];
+    fired = Number.isFinite(wt2[n]) && Number.isFinite(wt2[n - 1]) && dPrev >= 0 && d0 < 0;
+    how = "VuManChu red dot";
+  } else {
+    const pct = pumpPct != null ? pumpPct
+              : num("ACCUM_PUMP_PCT", trig === "pump5" ? 0.05 : trig === "pump2" ? 0.02 : 0.03);
+    const move = daily[n].c / daily[n - 1].c - 1;
+    fired = move >= pct;
+    how = `day closed +${(move * 100).toFixed(1)}% (trigger ${(pct * 100).toFixed(0)}%)`;
+  }
+  if (!fired) return { st, events };
+  if (mfGate && !(Number.isFinite(mf[n]) && mf[n] < 0)) {
+    events.push({ kind: "skip", why: `${how}, but money flow is not negative` });
+    return { st, events };
+  }
+  st.lastTrigger = how;
 
   const ladders = new Set(st.open.map(r => r.sinceDay)).size;
   if (ladders >= maxConcurrent) { events.push({ kind: "skip", why: `${ladders} ladders already resting` }); return { st, events }; }
@@ -1877,7 +1907,8 @@ function accumStep(state, daily, cfg = {}) {
   st.units -= sellUnits; st.cash += proceeds; st.sells++;
   const per = proceeds / levels.length, perUnits = sellUnits / levels.length;
   for (const z of levels) st.open.push({ px: z.px, src: z.src, usdt: per, soldUnits: perUnits, sellPx: bar.c, sinceDay: day });
-  events.push({ kind: "sell", px: bar.c, units: +sellUnits.toFixed(8), rungs: levels.map(z => `${z.src}@${formatPrice(z.px)}`) });
+  events.push({ kind: "sell", px: bar.c, units: +sellUnits.toFixed(8), how: st.lastTrigger || "",
+                rungs: levels.map(z => `${z.src}@${formatPrice(z.px)}`) });
   return { st, events };
 }
 
@@ -2992,7 +3023,7 @@ export default async function cipherAgent() {
                 }
               } catch (err) { execNote = "spot path errored (no order sent): " + (err && err.message); }
               await pushLog({ coin, result: "ACCUM SELL",
-                skipped: `sold 20% of the stack at ${formatPrice(e.px)} on a red dot with money flow negative; buy-backs laddered at ${e.rungs.join(", ")}. ${execNote}` });
+                skipped: `sold 20% of the tradeable stack at ${formatPrice(e.px)} — ${e.how || "signal"}, money flow negative; buy-backs laddered at ${e.rungs.join(", ")}. ${execNote}` });
             }
             if (e.kind === "fill") await pushLog({ coin, result: "ACCUM BUY",
               skipped: `laddered buy filled at the ${e.src} level ${formatPrice(e.px)} — ${e.delta >= 0 ? "+" : ""}${e.delta.toFixed(6)} ${coin} on that slice.${e.viaDaily ? " (caught by the daily safety net)" : ""}` });
@@ -3004,6 +3035,7 @@ export default async function cipherAgent() {
           const resting = state.open.map(r => `${r.src}@${formatPrice(r.px)}`).join(", ") || "none";
           console.log(`accumulator (${coin} SPOT, core ${(state.coreUnits||0).toFixed(5)}, ${String(env("ACCUM_EXEC", "dry")) === "armed" ? "ARMED" : "measure only"}): ${units.toFixed(5)} units vs buy-and-hold 1.00000 — ${((units - 1) * 100 >= 0 ? "+" : "")}${((units - 1) * 100).toFixed(2)}% since ${since} · ${state.sells} sells, ${state.fills} fills · resting: ${resting}`);
           state.unitsNow = +units.toFixed(6); state.pxNow = px;
+          state.trigger = env("ACCUM_TRIGGER", "pump3");
           if (PF) state.spot = { ready: PF.ready, symbol: PF.symbol, hasProduct: !!PF.product,
                                  spotSymbols: PF.spotSymbolCount || 0, walletStatus: PF.walletStatus ?? null,
                                  balances: PF.balances || [], err: PF.walletErr || PF.productsErr || null,

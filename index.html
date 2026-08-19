@@ -9984,6 +9984,7 @@ document.addEventListener('click', function(e){
        + (a.cash>0?'<span>cash idle <b>'+Number(a.cash).toFixed(2)+' USDT</b></span>':'')
        + (a.coreUnits?'<span>core (never sold) <b>'+Number(a.coreUnits).toFixed(5)+'</b></span>':'')
        + (a.coreUnits?'<span>tradeable <b>'+Math.max(0,(Number(a.units)||0)-Number(a.coreUnits)).toFixed(5)+'</b></span>':'')
+       + (a.trigger?'<span>trigger <b>'+esc(a.trigger)+'</b></span>':'')
        + '</div>';
     h += '<div class="bot-why" style="color:var(--dim);">Buy-and-hold always ends on exactly 1.00000 — that is the line this has to beat. Since '+esc(a.startedAt||'—')+'.</div>';
     // Can it actually trade? The bot checks the venue itself each run and records the verdict.
