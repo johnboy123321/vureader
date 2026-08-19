@@ -86,7 +86,10 @@ console.log('\n3. A sell only happens with a red dot AND negative money flow AND
   const skipped = events.find(e => e.kind === 'skip');
   ok('it either sold or said exactly why not', !!sold || !!skipped, JSON.stringify(events));
   if (sold) {
-    ok('it sold 20% of the stack', Math.abs(sold.units - 0.2) < 1e-9, sold.units);
+    // Since the core landed (2026-08-19) a slice is 20% of the TRADEABLE inventory, not of the
+    // whole stack: 1.0 units with a 60% core leaves 0.4 tradeable, so a slice is 0.08.
+    ok('it sold 20% of the TRADEABLE inventory', Math.abs(sold.units - 0.08) < 1e-9, sold.units);
+    ok('which is strictly less than 20% of everything — the core is protected', sold.units < 0.2);
     ok('units went down and cash went up', st.units < 1 && st.cash > 0);
     ok('total units are ~unchanged at the moment of sale (minus fees)',
        Math.abs(M.accumUnits(st, bars[n].c) - 1) < 0.001, M.accumUnits(st, bars[n].c));
@@ -227,6 +230,46 @@ console.log('\n12. The spot preflight is read-only');
   const call = src.slice(src.indexOf('Read-only preflight'), src.indexOf('const bars = await fetchCandles(coin, "1D", 260)'));
   ok('it can be switched off', /ACCUM_PREFLIGHT/.test(call));
   ok('and it runs before anything else in the accumulator', call.length > 100);
+}
+console.log('\n13. The CORE — a floor no signal can sell through');
+{
+  const bars = redDotSeries();
+  // 60% core by default: from 1.0 units only 0.4 is tradeable, so a 20% slice is 0.08 not 0.2
+  const a = M.accumStep(null, bars);
+  const sold = a.events.find(e=>e.kind==='sell');
+  if (sold) {
+    ok('core is set on the first pass', a.st.coreUnits > 0, a.st.coreUnits);
+    ok('core is 60% of the starting stack', Math.abs(a.st.coreUnits - 0.6) < 1e-9, a.st.coreUnits);
+    ok('it sells 20% of the TRADEABLE part, not of everything', Math.abs(sold.units - 0.08) < 1e-9, sold.units);
+    ok('units never fall below the core', a.st.units >= a.st.coreUnits - 1e-9, a.st.units+' vs '+a.st.coreUnits);
+  } else { ok('(no sell produced — skipped)', true); }
+
+  // a stack already at the floor may not sell at all, however strong the signal
+  const atFloor = { units:0.6, cash:0, open:[], sells:0, fills:0, lastDay:null, startedAt:'2026-01-01',
+                    startUnits:1, coreUnits:0.6, highWater:1, lastFillT:0 };
+  const r = M.accumStep(atFloor, bars);
+  ok('at the floor it refuses to sell', !r.events.some(e=>e.kind==='sell'));
+  ok('and says why in plain words', /core floor/.test((r.events.find(e=>e.kind==='skip')||{}).why||''),
+     JSON.stringify(r.events));
+  ok('the units are untouched', r.st.units === 0.6);
+}
+console.log('\n14. The core RATCHETS up as units accumulate');
+{
+  const bars = redDotSeries();
+  const px = bars[bars.length-1].c;
+  // a stack that has grown to 1.5 units should lock 60% of the NEW high, not of the original
+  const grown = { units:1.5, cash:0, open:[], sells:0, fills:0, lastDay:null, startedAt:'2026-01-01',
+                  startUnits:1, coreUnits:0.6, highWater:1, lastFillT:0 };
+  const r = M.accumStep(grown, bars);
+  ok('high water rises to the new total', Math.abs(r.st.highWater - 1.5) < 1e-9, r.st.highWater);
+  ok('core ratchets to 60% of the new high', Math.abs(r.st.coreUnits - 0.9) < 1e-9, r.st.coreUnits);
+  ok('the core never goes DOWN again', r.st.coreUnits >= 0.6);
+  // cash waiting to be redeployed must not fake a new high
+  const inCash = { units:0.7, cash:0.5*px, open:[{px:1,src:'swingLow',usdt:0.5*px,soldUnits:0.5,sellPx:px,sinceDay:'d'}],
+                   sells:1, fills:0, lastDay:null, startedAt:'2026-01-01', startUnits:1, coreUnits:0.6, highWater:1.2, lastFillT:0 };
+  const r2 = M.accumStep(inCash, bars);
+  ok('a slice sitting in cash still counts toward the total', r2.st.highWater >= 1.2 - 1e-9, r2.st.highWater);
+  ok('core is configurable', /num\("ACCUM_CORE_PCT", 0\.60\)/.test(src));
 }
 fs.unlinkSync(out);
 console.log(`\n${pass} passed, ${fail} failed`);

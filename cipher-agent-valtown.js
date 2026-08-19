@@ -1800,9 +1800,25 @@ function accumFillPass(state, intraday, cfg = {}) {
 // PURE: one closed daily bar in, new state + a list of what happened out. No I/O, no clock, so
 // every rule here is testable without a venue — the same discipline as breakerStep.
 function accumStep(state, daily, cfg = {}) {
-  const { slicePct = 0.20, feeBps = 10, maxConcurrent = 4, maxCashPct = 0.5, maxRungs = 4 } = cfg;
+  const {
+    slicePct = 0.20, feeBps = 10, maxConcurrent = 4, maxCashPct = 0.5, maxRungs = 4,
+    // ── THE CORE (2026-08-19) ───────────────────────────────────────────────────────────────
+    // The measured failure mode of this idea is not bad trades — every completed cycle GAINED
+    // units. It is STRANDING: a slice sold that never gets bought back, whose cash is then worth
+    // ever fewer coins. Over 14.5 years that cost 0.39 BTC against 0.11 BTC of total wins.
+    //
+    // A core changes the SHAPE of that loss. A fixed fraction of the stack is simply not for
+    // sale, so no sequence of signals, however wrong, can convert the position to cash. It turns
+    // an unbounded loss into a bounded one — the only honest way to let a strategy with a fat
+    // left tail run long enough to prove itself.
+    //
+    // The core also RATCHETS: when total units make a new high the core rises with them, so
+    // accumulated coins are progressively locked away rather than re-risked forever.
+    corePct = num("ACCUM_CORE_PCT", 0.60),
+  } = cfg;
   const st = {
     units: 1, cash: 0, open: [], sells: 0, fills: 0, lastDay: null, startedAt: null, lastFillT: 0,
+    startUnits: 1, coreUnits: null, highWater: null,
     ...(state || {}),
   };
   const events = [];
@@ -1811,7 +1827,13 @@ function accumStep(state, daily, cfg = {}) {
   const day = new Date(bar.t).toISOString().slice(0, 10);
   if (st.lastDay === day) return { st, events };            // one SELL decision per closed daily bar
   st.lastDay = day;
-  if (!st.startedAt) { st.startedAt = day; st.startPx = bar.c; }
+  if (!st.startedAt) { st.startedAt = day; st.startPx = bar.c; st.startUnits = st.units; }
+
+  // The core, and its ratchet. Total units counts cash at the current price, so a slice that is
+  // temporarily in cash cannot fake a new high while it waits to be bought back.
+  const totalNow = st.units + (st.cash || 0) / bar.c;
+  st.highWater = Math.max(st.highWater || st.startUnits || 1, totalNow);
+  st.coreUnits = Math.max(st.coreUnits || 0, (st.startUnits || 1) * corePct, st.highWater * corePct);
 
   // 1) a safety net only: accumFillPass does the real work every 15 minutes, but if the intraday
   //    fetch failed for a while the daily low still tells us a rung must have filled.
@@ -1844,7 +1866,13 @@ function accumStep(state, daily, cfg = {}) {
   const levels = accumLevels(daily, bar.c, maxRungs);
   if (!levels.length) { events.push({ kind: "skip", why: "no level below to buy back at" }); return { st, events }; }
 
-  const sellUnits = st.units * slicePct;
+  // Only inventory ABOVE the core may be traded. Whatever the signals say, the core is not for sale.
+  const tradeable = Math.max(0, st.units - st.coreUnits);
+  const sellUnits = tradeable * slicePct;
+  if (!(sellUnits > 0)) {
+    events.push({ kind: "skip", why: `core floor — ${st.coreUnits.toFixed(5)} of ${st.units.toFixed(5)} units is core and not for sale` });
+    return { st, events };
+  }
   const proceeds = sellUnits * bar.c * (1 - feeBps / 1e4);
   st.units -= sellUnits; st.cash += proceeds; st.sells++;
   const per = proceeds / levels.length, perUnits = sellUnits / levels.length;
@@ -2974,7 +3002,7 @@ export default async function cipherAgent() {
         if (units != null) {
           const since = state.startedAt || "today";
           const resting = state.open.map(r => `${r.src}@${formatPrice(r.px)}`).join(", ") || "none";
-          console.log(`accumulator (${coin} SPOT, ${String(env("ACCUM_EXEC", "dry")) === "armed" ? "ARMED" : "measure only"}): ${units.toFixed(5)} units vs buy-and-hold 1.00000 — ${((units - 1) * 100 >= 0 ? "+" : "")}${((units - 1) * 100).toFixed(2)}% since ${since} · ${state.sells} sells, ${state.fills} fills · resting: ${resting}`);
+          console.log(`accumulator (${coin} SPOT, core ${(state.coreUnits||0).toFixed(5)}, ${String(env("ACCUM_EXEC", "dry")) === "armed" ? "ARMED" : "measure only"}): ${units.toFixed(5)} units vs buy-and-hold 1.00000 — ${((units - 1) * 100 >= 0 ? "+" : "")}${((units - 1) * 100).toFixed(2)}% since ${since} · ${state.sells} sells, ${state.fills} fills · resting: ${resting}`);
           state.unitsNow = +units.toFixed(6); state.pxNow = px;
           if (PF) state.spot = { ready: PF.ready, symbol: PF.symbol, hasProduct: !!PF.product,
                                  spotSymbols: PF.spotSymbolCount || 0, walletStatus: PF.walletStatus ?? null,
