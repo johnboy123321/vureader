@@ -2886,8 +2886,38 @@ async function runAccumulator() {
             // So an arm that cannot possibly execute is refused up front and said out loud.
             const capUsdt = num("ACCUM_FLIP_MAX_USDT", 1500);
             const armedExec = String(env("ACCUM_EXEC", "armed")) === "armed";
+            let outOfSync = false;
+            // ── THE WALLET IS THE ARBITER (2026-08-19) ──────────────────────────────────────
+            // Found live: the book said 0.00767931 BTC while the spot wallet held 0.00000031.
+            // Every run then fired a sell for coins that were not there, Phemex refused it, the
+            // rollback undid it, and the next run did the same — a loop that would have run all
+            // night writing failures into the log and learning nothing.
+            //
+            // A book that disagrees with the wallet is not a trading problem to push through,
+            // it is a RECONCILIATION problem, and the only safe move is to stop and say so.
+            // Silence here would be the worst outcome: a strategy that looks armed, is not
+            // trading, and never explains why.
+            const minOrder = num("ACCUM_MIN_ORDER_USDT", 10);
+            const wBase = PF && Number.isFinite(PF.baseBalance) ? PF.baseBalance : null;
+            const wQuote = PF && Number.isFinite(PF.quoteBalance) ? PF.quoteBalance : null;
+            const bookUnits = Number((lf && lf.tf === flipTf ? lf.units : state.units)) || 0;
+            const bookCash = Number((lf && lf.tf === flipTf ? lf.cash : state.cash)) || 0;
+            const shortOfCoins = wBase != null && bookUnits * px >= minOrder && wBase * px < minOrder;
+            const shortOfCash = wQuote != null && bookCash >= minOrder && wQuote < minOrder;
+            if (armedExec && (shortOfCoins || shortOfCash)) {
+              const detail = shortOfCoins
+                ? `the strategy's book holds ${bookUnits.toFixed(8)} ${coin} but the SPOT wallet has ${wBase.toFixed(8)} — about ${(wBase * px).toFixed(2)} USDT, under the ${minOrder} minimum`
+                : `the book holds ${bookCash.toFixed(2)} USDT but the SPOT wallet has ${wQuote.toFixed(2)}`;
+              state.liveFlip = { tf: null, want: flipTf, blocked: true,
+                why: `${detail}. Nothing can be traded until the two agree — check whether the balance was moved off the spot wallet, then re-arm to reseed from what is actually there.` };
+              console.log(`live flip ${flipTf}: STOOD DOWN — ${state.liveFlip.why}`);
+              await pushLog({ coin, result: "FLIP OUT OF SYNC", skipped: state.liveFlip.why });
+              outOfSync = true;
+            }
             const stackUsdt = ((Number(state.units) || 0) * px) + (Number(state.cash) || 0);
-            if (armedExec && stackUsdt > capUsdt) {
+            if (outOfSync) {
+              // already reported above; nothing else may run this pass
+            } else if (armedExec && stackUsdt > capUsdt) {
               state.liveFlip = { tf: null, want: flipTf, blocked: true,
                 why: `the whole stack is ${stackUsdt.toFixed(0)} USDT but ACCUM_FLIP_MAX_USDT is ${capUsdt} — a flip sells it all in one order, so it would be refused. Raise the cap above ${Math.ceil(stackUsdt / 50) * 50} to arm this.` };
               console.log(`live flip ${flipTf}: NOT armed — ${state.liveFlip.why}`);

@@ -377,6 +377,23 @@ console.log('\n  FLOORING IS ARITHMETICALLY SAFE');
   ok('rounding would NOT have held', Math.round(awkward * 10 ** scale) / 10 ** scale > awkward);
 }
 
+console.log('\n  THE WALLET IS THE ARBITER, NOT THE BOOK');
+{
+  // Found live 2026-08-19: the book said 0.00767931 BTC, the spot wallet held 0.00000031. Every
+  // run fired a sell for coins that were not there, Phemex refused, the rollback undid it, and
+  // the next run repeated it. A loop that writes failures forever and learns nothing.
+  ok('a book/wallet divergence is detected', /const shortOfCoins = wBase != null/.test(src));
+  ok('and the cash side too', /const shortOfCash = wQuote != null/.test(src));
+  ok('the threshold is the venue minimum, not zero',
+     /wBase \* px < minOrder/.test(src) && /wQuote < minOrder/.test(src));
+  ok('it stands the arm down rather than retrying', /outOfSync = true;/.test(src));
+  ok('and nothing else runs that pass', /if \(outOfSync\) \{/.test(src));
+  ok('the reason names both figures', /but the SPOT wallet has/.test(src));
+  ok('it is reported to the decision log, not just the console', /result: "FLIP OUT OF SYNC"/.test(src));
+  ok('it tells the user how to recover', /re-arm to reseed from what is actually there/.test(src));
+  ok('a dry run is not blocked by it', /armedExec && \(shortOfCoins \|\| shortOfCash\)/.test(src));
+}
+
 fs.unlinkSync(out);
 console.log(`\n  ${pass} passed, ${fail} failed\n`);
 process.exit(fail ? 1 : 0);
