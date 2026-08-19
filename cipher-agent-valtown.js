@@ -1968,12 +1968,17 @@ function buildSpotOrder(sym, side, { price, baseQty, quoteQty }, products) {
     priceEp: Math.round(price * 10 ** p.priceScale),
     clOrdID: ("accum" + sym + Date.now()).replace(/[^a-zA-Z0-9]/g, "").slice(0, 30),
   };
+  // qtyType is REQUIRED and tells the venue which of the two quantity fields to read. Missing it
+  // was a real defect, caught 2026-08-19 by reading Phemex's own spot docs rather than trusting
+  // the shape I had inferred. A sell is sized in the coin; a buy is sized in the money.
   if (side === "Sell") {
     if (!(baseQty > 0)) return { err: "sell needs a base quantity" };
+    order.qtyType = "ByBase";
     order.baseQtyEv = Math.round(baseQty * 10 ** p.baseValueScale);
     if (!(order.baseQtyEv > 0)) return { err: "base quantity rounds to zero at this scale" };
   } else {
     if (!(quoteQty > 0)) return { err: "buy needs a quote amount" };
+    order.qtyType = "ByQuote";
     order.quoteQtyEv = Math.round(quoteQty * 10 ** p.quoteValueScale);
     if (!(order.quoteQtyEv > 0)) return { err: "quote amount rounds to zero at this scale" };
   }
@@ -1996,7 +2001,11 @@ async function spotPreflight(coin) {
     out.spotSymbolCount = prods ? Object.keys(prods).length : 0;
   } catch (e) { out.productsErr = String(e && e.message || e).slice(0, 120); }
   try {
-    const w = await phemexCall("GET", "/spot/wallets", "", null);
+    // /spot/wallets takes a currency parameter; ask for the two that matter to this strategy.
+    const w = await phemexCall("GET", "/spot/wallets", "currency=USDT", null);
+    let w2 = null;
+    try { w2 = await phemexCall("GET", "/spot/wallets", `currency=${String(coin).toUpperCase()}`, null); } catch {}
+    if (w2 && w2.status === 200 && w2.data) out.baseWallet = JSON.stringify(w2.data).slice(0, 200);
     out.walletStatus = w.status;
     const rows = (w.data && (w.data.data || w.data.result)) || [];
     if (Array.isArray(rows)) {

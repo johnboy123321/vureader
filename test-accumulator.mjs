@@ -183,8 +183,11 @@ console.log('\n9. SPOT orders — the right product, and never a guessed scale')
   ok('uses the s-prefixed SPOT symbol, not the perp', sell.order.symbol === 'sBTCUSDT');
   ok('price is scaled to an integer', sell.order.priceEp === Math.round(64000 * 1e8));
   ok('a SELL carries base quantity (the BTC)', sell.order.baseQtyEv === Math.round(0.05 * 1e8) && sell.order.quoteQtyEv === undefined);
+  // qtyType tells the venue WHICH quantity field to read. Missing it is a silent rejection.
+  ok('a SELL is typed ByBase', sell.order.qtyType === 'ByBase');
   const buy = M.buildSpotOrder('BTC', 'Buy', { price: 60000, quoteQty: 500 }, prods);
   ok('a BUY carries quote amount (the USDT)', buy.order.quoteQtyEv === Math.round(500 * 1e8) && buy.order.baseQtyEv === undefined);
+  ok('a BUY is typed ByQuote', buy.order.qtyType === 'ByQuote');
   ok('unknown symbol is REFUSED, not guessed', !!M.buildSpotOrder('DOGE','Sell',{price:1,baseQty:1},prods).err);
   ok('missing scales are REFUSED', !!M.buildSpotOrder('BTC','Sell',{price:1,baseQty:1},{ sBTCUSDT:{ priceScale:8 } }).err);
   ok('a size that rounds to zero is refused', !!M.buildSpotOrder('BTC','Sell',{price:64000,baseQty:1e-12},prods).err);
