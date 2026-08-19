@@ -170,8 +170,11 @@ let _binanceUp = true;   // Binance geo-blocks GitHub's US runners; after the fi
                          // skip straight to OKX rather than paying the timeout on every call.
 async function fetchCandles(sym, tf, bars = 260) {
   const s = String(sym).toUpperCase().replace(/USDT$/, "");
-  const binInt = { "15m": "15m", "30m": "30m", "1H": "1h", "4H": "4h", "1D": "1d", "1W": "1w" }[tf];
-  const okxBar = { "15m": "15m", "30m": "30m", "1H": "1H", "4H": "4H", "1D": "1Dutc", "1W": "1Wutc" }[tf];
+  // 5m and 2H added 2026-08-19 for the dot-flip timeframe switch. 3H is NOT a standard exchange
+  // interval anywhere, so it is built locally from 1H bars further down rather than requested.
+  const binInt = { "5m": "5m", "15m": "15m", "30m": "30m", "1H": "1h", "2H": "2h", "4H": "4h", "1D": "1d", "1W": "1w" }[tf];
+  const okxBar = { "5m": "5m", "15m": "15m", "30m": "30m", "1H": "1H", "2H": "2H", "4H": "4H", "1D": "1Dutc", "1W": "1Wutc" }[tf];
+  if (!binInt && !okxBar) return null;
   if (_binanceUp) try {
     const r = await fetch(`https://api.binance.com/api/v3/klines?symbol=${s}USDT&interval=${binInt}&limit=${Math.min(bars, 1000)}`);
     if (!r.ok) _binanceUp = false;
@@ -1953,6 +1956,74 @@ function accumStep(state, daily, cfg = {}) {
   return { st, events };
 }
 
+// ═══════════════ THE DOT FLIP (2026-08-19) ═══════════════
+// John: "5 min green sell, 5 min red buy — just run it and see."
+//
+// Run on real 1-minute BTC before writing it, because the answer was decisive:
+//
+//   timeframe   round trips   fees paid   end units   vs hold
+//   5m               16,730      3,346%     0.00000   -100.00%   <- zeroes the account
+//   15m               5,592      1,118%     0.00001   -100.00%
+//   1H                1,394        279%     0.08486    -91.51%
+//
+// And the part that matters — the SAME strategy with fees removed:
+//
+//   5m  +10.90%   ·   15m +2.86%   ·   1H +38.22%
+//
+// So the dots carry genuine signal at every timeframe. What destroys it is paying 0.2% a
+// round trip sixteen thousand times. At MAKER fees (1bp a side) the 1H version survives at
+// +4.58% — 1,394 trips paying 28% instead of 279%.
+//
+// Hence: this runs on 1H, not 5m, and it is MEASURE-ONLY until its fills are proven, because
+// +4.58% assumes every post-only order fills at its price, and a post-only order that never
+// fills is a slice left in cash — the exact failure mode that costs this whole idea its units.
+// It places nothing. It exists so John can watch a busy version accumulate evidence beside the
+// live one, and arm it on a record rather than on a hope.
+const FLIP_TF = () => env("FLIP_TF", "1H");
+// Every timeframe John asked to be able to switch between. 3H is assembled from 1H bars because
+// no exchange serves it natively.
+const FLIP_TFS = ["5m", "15m", "30m", "1H", "2H", "3H", "4H", "1D"];
+
+function aggregateBars(bars, factor) {
+  const out = [];
+  for (let i = 0; i + factor <= bars.length; i += factor) {
+    const slice = bars.slice(i, i + factor);
+    out.push({ t: slice[0].t, o: slice[0].o, c: slice[slice.length - 1].c,
+               h: Math.max(...slice.map(b => b.h)), l: Math.min(...slice.map(b => b.l)),
+               v: slice.reduce((a, b) => a + (b.v || 0), 0) });
+  }
+  return out;
+}
+
+// PURE: bars in, state + events out. Sells the whole tradeable amount on a red dot, buys it all
+// back on a green one. No ladder, no levels — a straight flip, which is what was asked for.
+function accumFlipStep(state, bars, cfg = {}) {
+  const { feeBps = num("FLIP_FEE_BPS", 1), slicePct = num("FLIP_SLICE", 1) } = cfg;
+  const st = { units: 1, cash: 0, trips: 0, sells: 0, lastT: 0, startUnits: 1, ...(state || {}) };
+  const events = [];
+  if (!bars || bars.length < 60) return { st, events };
+  const { wt1, wt2 } = waveTrend(bars);
+  const fresh = [];
+  for (let i = 1; i < bars.length; i++) if (bars[i].t > (st.lastT || 0)) fresh.push(i);
+  for (const i of fresh) {
+    if (!Number.isFinite(wt2[i]) || !Number.isFinite(wt2[i - 1])) continue;
+    const d0 = wt1[i] - wt2[i], dPrev = wt1[i - 1] - wt2[i - 1];
+    const red = dPrev >= 0 && d0 < 0, green = dPrev <= 0 && d0 > 0;
+    const px = bars[i].c;
+    if (red && st.units > 0) {
+      const sell = st.units * slicePct;
+      st.cash += sell * px * (1 - feeBps / 1e4); st.units -= sell; st.sells++;
+      events.push({ kind: "flip-sell", at: bars[i].t, px, units: sell });
+    } else if (green && st.cash > 0) {
+      const got = (st.cash / px) * (1 - feeBps / 1e4);
+      st.units += got; st.cash = 0; st.trips++;
+      events.push({ kind: "flip-buy", at: bars[i].t, px, units: got });
+    }
+    st.lastT = bars[i].t;
+  }
+  return { st, events };
+}
+
 // ═══════════════ SPOT RAILS (2026-08-19) ═══════════════
 // John: "it also has to be done on spot, not futures." He is right, and it is not a preference —
 // it is the whole objective. On a USDT-M perpetual you never own a coin: you hold a position,
@@ -3153,6 +3224,30 @@ export default async function cipherAgent() {
             if (e.kind === "skip") await pushLog({ coin, result: "ACCUM PASS", skipped: `red dot, but no sell: ${e.why}.` });
           }
         }
+        // ── THE DOT FLIP, measured beside the live strategy ────────────────────────────────
+        // Every timeframe runs at once rather than one being "switched on": a switch would mean
+        // picking a winner before there is evidence, and these cost one candle fetch each. The
+        // panel shows the whole table so the choice is made on a live record, not a preference.
+        try {
+          state.flips = state.flips || {};
+          const oneH = await fetchCandles(coin, "1H", 500);
+          for (const ftf of FLIP_TFS) {
+            let fbars = null;
+            if (ftf === "3H") fbars = oneH ? aggregateBars(oneH, 3) : null;      // built, not fetched
+            else if (ftf === "1H") fbars = oneH;
+            else fbars = await fetchCandles(coin, ftf, 500);
+            if (!fbars || fbars.length < 60) continue;
+            const f = accumFlipStep(state.flips[ftf] || null, fbars);
+            state.flips[ftf] = f.st;
+            const fpx = fbars[fbars.length - 1].c;
+            f.st.unitsNow = +(f.st.units + f.st.cash / fpx).toFixed(8);
+            f.st.gainPct = +(((f.st.unitsNow / (f.st.startUnits || 1)) - 1) * 100).toFixed(2);
+            f.st.holding = f.st.cash <= 0;
+          }
+          const line = FLIP_TFS.map(t => { const x = state.flips[t]; return x ? `${t} ${x.gainPct >= 0 ? "+" : ""}${x.gainPct}% (${x.trips})` : `${t} —`; }).join(" · ");
+          console.log(`dot flip @${num("FLIP_FEE_BPS", 1)}bps maker, measure only: ${line}`);
+        } catch (e) { console.error("dot flip skipped (measures only):", e && e.message); }
+
         if (units != null) {
           const since = state.startedAt || "today";
           const resting = state.open.map(r => `${r.src}@${formatPrice(r.px)}`).join(", ") || "none";
