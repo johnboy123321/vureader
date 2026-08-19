@@ -61,5 +61,52 @@ console.log('\n5. Junk state does not crash the panel');
 fn({ cipher_accum: { units:null, cash:null, open:null, pxNow:0 } }, null);
 ok('renders something rather than throwing', typeof html === 'string' && html.length > 0);
 
+
+// ── THE TIMEFRAME TOGGLES (2026-08-19) ──────────────────────────────────────────────────────
+console.log('\n6. The toggles render whatever the state says');
+{
+  const flips = { '5m':{gainPct:-2.28,trips:30,holding:true}, '15m':{gainPct:-2.26,trips:30,holding:true},
+                  '30m':{gainPct:-1.19,trips:25,holding:true}, '1H':{gainPct:0.86,trips:28,holding:true},
+                  '2H':{gainPct:-1.37,trips:31,holding:true}, '3H':{gainPct:-3.3,trips:11,holding:true},
+                  '4H':{gainPct:-12.44,trips:30,holding:false}, '1D':{gainPct:32.97,trips:30,holding:true} };
+  const base = { units:0.00767931, cash:0, open:[], sells:0, fills:0, pxNow:65000, startUnits:0.00767931, flips };
+
+  fn({ cipher_accum: base }, []);
+  ok('all eight timeframes get a button', ['5m','15m','30m','1H','2H','3H','4H','1D']
+     .every(t => html.includes('setFlipTf(\''+t+'\')')));
+  ok('there is an OFF button too', /setFlipTf\('off'\)/.test(html));
+  ok('with nothing armed it says the ladder holds the coins', /pump ladder holds the coins/.test(html));
+  ok('the best paper arm is starred', /1D ★/.test(html));
+
+  fn({ cipher_accum: { ...base, liveFlip:{ tf:'1H', holding:true, gainPct:0.42, sells:2, trips:1 } } }, []);
+  ok('an armed timeframe is announced', /1H is live on the real balance/.test(html));
+  ok('the armed row is dotted, not starred', /1H ●/.test(html));
+  ok('the star still marks the best paper arm separately', /1D ★/.test(html));
+  ok('it says which way round it is sitting', /waiting for a red dot/.test(html));
+  ok('it says the ladder is stood down', /pump ladder is stood down/.test(html));
+
+  fn({ cipher_accum: { ...base, liveFlip:{ tf:'4H', holding:false, gainPct:-1.1, sells:3, trips:2 } } }, []);
+  ok('sitting in cash is described as such', /sitting in cash, waiting for a green dot/.test(html));
+
+  fn({ cipher_accum: { ...base, liveFlip:{ tf:null, want:'1H', blocked:true, why:'the whole stack is 499 USDT but ACCUM_MAX_USDT is 200' } } }, []);
+  ok('a blocked arm is shown as requested-but-not-armed', /requested but NOT armed/.test(html));
+  ok('and the reason is quoted verbatim', /ACCUM_MAX_USDT is 200/.test(html));
+  ok('a blocked arm does not claim to be live', !/is live on the real balance/.test(html));
+
+  fn({ cipher_accum: { ...base, flips:null } }, []);
+  ok('the toggles still render before any flip data exists', /setFlipTf\('1H'\)/.test(html));
+  ok('and it says it is waiting for the bot', /Waiting for the bot/.test(html));
+}
+
+console.log('\n7. The paper record is labelled honestly');
+{
+  const flips = { '1H':{gainPct:0.86,trips:28,holding:true} };
+  fn({ cipher_accum: { units:0.0077, cash:0, open:[], sells:0, fills:0, pxNow:65000, startUnits:0.0077, flips,
+                       liveFlip:{ tf:'1H', holding:true, gainPct:0.1, sells:1, trips:0 } } }, []);
+  ok('the 1bp maker assumption is called optimistic', /optimistic/.test(html));
+  ok('the live arm is said to book at the real fee', /real 10bps/.test(html));
+  ok('and the reader is warned the two numbers will not agree', /will not agree/.test(html));
+}
+
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail?1:0);

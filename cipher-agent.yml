@@ -1,0 +1,149 @@
+# ═══════════════════════════════════════════════════════════════════════════════
+#  CIPHER AGENT — the 24/7 bot, running on GitHub's machines
+#
+#  Upload this file to your repo at:  .github/workflows/cipher-agent.yml
+#  (the folders matter — GitHub only looks in .github/workflows/)
+#
+#  It runs cipher-agent-valtown.js every 15 minutes, then commits the updated
+#  agent-state.json back so the next run remembers the rotation cursor, what it
+#  has already fired today, and the decision log.
+#
+#  SECRETS — set these in the repo: Settings → Secrets and variables → Actions
+#    RELAY_URL      your Phemex relay val URL
+#    RELAY_TOKEN    the same exec token the app uses
+#    PHEMEX_KEY     testnet API key   ← only needed for EXEC_DIRECT
+#    PHEMEX_SECRET  testnet API secret ← only needed for EXEC_DIRECT
+#    ANTHROPIC_API_KEY  ← optional: turns on the server-side brain (loser autopsy).
+#                         Without it the brain is silently off and everything else runs.
+#  Secrets are encrypted and are NOT visible to anyone browsing the repo.
+#
+#  EXEC_DIRECT=1 makes the agent sign its own orders and talk to Phemex directly,
+#  cutting out the Val Town relay — the hop that was answering ~83% of order POSTs
+#  with a Cloudflare HTML 502. The relay stays exactly as it is for the browser app.
+#  Set it to 0 to go back to the old route; with no key/secret set it falls back
+#  to the relay on its own.
+#
+#  SETTINGS below (env:) are safe to edit in the open — no secrets there.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+name: Cipher Agent
+
+on:
+  schedule:
+    # Every 15 minutes. GitHub runs these on a best-effort basis, so expect the
+    # occasional late run under load — harmless for 4H/Daily setups.
+    - cron: "*/15 * * * *"
+  workflow_dispatch: {}      # gives you a "Run workflow" button for testing
+
+# Stop two runs from overlapping and both firing the same signal.
+concurrency:
+  group: cipher-agent
+  cancel-in-progress: false
+
+permissions:
+  contents: write            # needed to commit the state file back
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      MODE: dry              # ← dry = logs what it would do. Change to: armed
+      RISK_GBP: "10"
+      MIN_SCORE: "6"
+      DAY_CAP: "25"
+      CORR_MAX: "6"
+      BATCH: "20"            # coins per run; the cursor rotates through the top 100
+      UNIVERSE: "100"
+      MAX_ATTEMPTS: "3"      # failed sends per coin+direction per day, then it rests
+      EXEC_DIRECT: "1"       # 1 = sign here and call Phemex direct · 0 = go via the relay
+      MAX_NOTIONAL_USDT: "2000"   # the relay's cap, re-enforced here now the relay is bypassed
+      RELAY_URL: ${{ secrets.RELAY_URL }}
+      RELAY_TOKEN: ${{ secrets.RELAY_TOKEN }}
+      PHEMEX_KEY: ${{ secrets.PHEMEX_KEY }}
+      PHEMEX_SECRET: ${{ secrets.PHEMEX_SECRET }}
+      # ── the server-side brain (2026-08-19) — runs 24/7 with the laptop closed ──
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      BRAIN_MODEL: "claude-haiku-4-5"   # small and cheap on purpose — it labels, it does not predict
+      BRAIN_DAILY_USD: "0.25"           # hard daily spend cap; the meter is in agent-state.json
+      AUTOPSY_BATCH: "8"                # losses per call, one call per run at most
+      # ── the accumulator (2026-08-19) — units of BTC, not pounds. SPOT, never futures. ──
+      ACCUM: "1"                        # 1 = run it · 0 = off entirely
+      ACCUM_COIN: "BTC"
+      ACCUM_EXEC: "armed"               # armed = places real SPOT orders · dry = log only.
+                                        # NOTE: the deployed workflow currently carries no ACCUM_*
+                                        # vars, so the CODE DEFAULTS govern. Upload this file to
+                                        # .github/workflows/ if you want to steer it from here.
+      ACCUM_MAX_USDT: "200"             # hard cap on any single spot order. A no-core slice is
+                                        # ~20% of the stack (~$100 now, more if BTC rises), so 100
+                                        # would have blocked the first trade.
+      ACCUM_PREFLIGHT: "1"              # read-only check that spot is usable; look for it in the log
+      ACCUM_REVIEW_DAYS: "7"            # how often the brain may comment on it
+      ACCUM_TRIGGER: "pump1"            # pumpN = an N% up-day. pump1 ~48 trades/yr, pump3 ~15/yr.
+                                        # Started at pump1 to prove the plumbing; pump3 is the
+                                        # stronger signal once it is proven. Also: reddot.
+                                        # Measured 2026-08-19: selling into a pump beat the red dot
+                                        # roughly 2:1 in ranging and falling markets (2025-26
+                                        # +11.6% vs +5.7%). Both still lose in sustained rallies.
+      ACCUM_MF_GATE: "1"                # also require VuManChu money flow to be negative
+      ACCUM_CORE_PCT: "0"               # 0 = NO protected core, the whole stack is tradeable.
+                                        # John's call 2026-08-19, taken with the numbers in view:
+                                        # full dose both ways (2025-26 +14.5% vs +5.7% at a 60%
+                                        # core, but full-history −27.8% vs −11.1%). Small stake
+                                        # on purpose. Raise this to put the floor back.
+      ACCUM_MIN_ORDER_USDT: "10"        # venue minimum; the ladder fits its rung count to this
+      # ── the dot-flip timeframe toggles (2026-08-19) ──
+      # All eight timeframes always run as PAPER arms. This says which ONE of them, if any, the
+      # real spot balance follows: off | 5m | 15m | 30m | 1H | 2H | 3H | 4H | 1D.
+      # This is the FALLBACK only — the app panel sets it live through the relay, and the relay
+      # value wins whenever the relay is reachable. Leave it "off" so an unreachable relay can
+      # never arm a flip by accident; silence is not an instruction.
+      ACCUM_FLIP_TF: "off"
+      ACCUM_FLIP_MAX_USDT: "1500"       # the flip's own cap, and it must sit ABOVE the whole
+                                        # stack (~$500 today). A flip sells everything in one
+                                        # order by construction, so a cap below the stack does
+                                        # not shrink the trade — it silently skips it while the
+                                        # strategy's book records a sell that never happened.
+                                        # ACCUM_MAX_USDT (200) still bounds the LADDER's slices.
+      # ── circuit breaker (2026-08-19) ──
+      BREAKER_DAY_DD_PCT: "5"           # equity down 5% today → no new entries until tomorrow
+      BREAKER_WEEK_DD_PCT: "10"         # down 10% this week → paused until Monday
+      BREAKER_STREAK_N: "3"             # consecutive losing resolutions before a pause
+      BREAKER_STREAK_PAUSE_H: "12"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      # Binance geo-blocks GitHub's US runners, which cost us a day of confusion in August.
+      # Check the same question about Phemex BEFORE the run rather than reading it backwards
+      # out of a log of failures. Public endpoint, no key, never fails the build.
+      - name: Phemex reachability preflight
+        run: |
+          code=$(curl -s -o /tmp/phemex.json -w '%{http_code}' --max-time 15 \
+            "https://testnet-api.phemex.com/md/v2/orderbook?symbol=BTCUSDT" || echo 000)
+          echo "phemex testnet public md → HTTP $code"
+          head -c 300 /tmp/phemex.json || true; echo
+          if [ "$code" != "200" ]; then
+            echo "::warning::Phemex testnet unreachable from this runner (HTTP $code) — direct exec will fail here; set EXEC_DIRECT=0 to fall back to the relay"
+          fi
+
+      - name: Run the agent
+        run: node cipher-agent-valtown.js
+
+      - name: Save state back to the repo
+        run: |
+          if [[ -n "$(git status --porcelain agent-state.json)" ]]; then
+            git config user.name  "cipher-agent"
+            git config user.email "cipher-agent@users.noreply.github.com"
+            git add agent-state.json
+            git commit -m "agent state $(date -u '+%Y-%m-%d %H:%M UTC')"
+            # Another run may have pushed while we worked — rebase rather than fail.
+            git pull --rebase --autostash origin "${GITHUB_REF_NAME}" || true
+            git push
+          else
+            echo "no state change this run"
+          fi

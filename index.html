@@ -10033,17 +10033,45 @@ document.addEventListener('click', function(e){
         +  '</div>';
     }
 
-    // ── DOT FLIP: every timeframe at once ────────────────────────────────────────────────────
-    // Sell the lot on a red dot, buy it all back on a green one. Shown for 5m through 1D together
-    // rather than one being switched on, because the point is to SEE which timeframe survives its
-    // own trading costs. Measure-only: it places nothing.
+    // ── DOT FLIP: eight paper arms, and the toggles that promote one to real money ────────────
+    // Sell the lot on a red dot, buy it all back on a green one. All eight timeframes always run
+    // as PAPER arms so the comparison never goes dark — including for whichever one is live.
+    // The toggles pick which single arm the real spot balance follows; OFF hands the coins back
+    // to the pump ladder, which is the default and how this worked before the toggles existed.
+    const ORDER=['5m','15m','30m','1H','2H','3H','4H','1D'];
+    const lfv = a.liveFlip || {};
+    const liveTf = lfv.tf || null;
+
+    h += '<div style="font-size:11px;font-weight:700;color:var(--muted);margin:12px 0 6px;">DOT FLIP — WHICH TIMEFRAME TRADES THE REAL COINS</div>';
+    h += '<div style="display:flex;flex-wrap:wrap;gap:4px;margin-bottom:6px;">';
+    h += '<button class="flip-tf" data-tf="off" onclick="setFlipTf(\'off\')" style="flex:0 0 auto;padding:5px 10px;font-size:11px;border:1px solid '+(liveTf?'var(--line)':'var(--fg)')+';background:none;color:'+(liveTf?'var(--dim)':'var(--fg)')+';font-weight:'+(liveTf?'400':'700')+';border-radius:3px;">OFF</button>';
+    for(const t of ORDER){
+      const on = liveTf===t;
+      h += '<button class="flip-tf" data-tf="'+esc(t)+'" onclick="setFlipTf(\''+esc(t)+'\')" style="flex:0 0 auto;padding:5px 10px;font-size:11px;border:1px solid '+(on?'#8bd':'var(--line)')+';background:none;color:'+(on?'#8bd':'var(--dim)')+';font-weight:'+(on?'700':'400')+';border-radius:3px;">'+esc(t)+'</button>';
+    }
+    h += '</div>';
+    h += '<div id="flip-msg" style="font-size:11px;color:var(--dim);min-height:14px;margin-bottom:4px;"></div>';
+
+    // What the toggle is actually doing right now, in the bot's own words. A control that shows
+    // only what you asked for, rather than what took effect, is the most misleading kind.
+    if(lfv.blocked){
+      h += '<div class="bot-why" style="color:#e8c07a;">'+esc(lfv.want||'')+' requested but NOT armed — '+esc(lfv.why||'')+'</div>';
+    } else if(liveTf){
+      const lg = Number(lfv.gainPct)||0;
+      h += '<div class="bot-why" style="color:var(--muted);"><b style="color:#8bd;">'+esc(liveTf)+' is live on the real balance.</b> '
+        + (lfv.holding?'Holding coins, waiting for a red dot to sell.':'Sold — sitting in cash, waiting for a green dot to buy back.')
+        + ' '+esc(lfv.sells||0)+' sells, '+esc(lfv.trips||0)+' round trips since arming, '
+        + '<span style="color:'+(lg>0?'#9c9':lg<0?'#e88':'var(--muted)')+';font-weight:700;">'+(lg>=0?'+':'')+lg.toFixed(2)+'%</span> against holding.'
+        + ' The pump ladder is stood down.</div>';
+    } else {
+      h += '<div class="bot-why" style="color:var(--dim);">Off — the pump ladder holds the coins. Tap a timeframe to hand them to the dot flip on that chart instead.</div>';
+    }
+
     if(!a.flips || !Object.keys(a.flips).length){
-      h += '<div style="font-size:11px;font-weight:700;color:var(--muted);margin:12px 0 6px;">DOT FLIP — GREEN BUYS, RED SELLS</div>'
-        +  '<div class="bot-why" style="color:var(--dim);">Waiting for the bot\'s next run to populate 5m through 1D. It runs every 30–40 minutes.</div>';
+      h += '<div class="bot-why" style="color:var(--dim);">Waiting for the bot\'s next run to populate 5m through 1D. It runs every 30–40 minutes.</div>';
     }
     if(a.flips && Object.keys(a.flips).length){
-      const ORDER=['5m','15m','30m','1H','2H','3H','4H','1D'];
-      h += '<div style="font-size:11px;font-weight:700;color:var(--muted);margin:12px 0 6px;">DOT FLIP — GREEN BUYS, RED SELLS (measured, places nothing)</div>';
+      h += '<div style="font-size:11px;font-weight:700;color:var(--muted);margin:12px 0 6px;">THE PAPER RECORD (all eight, always running)</div>';
       h += '<div style="display:flex;font-size:10px;color:var(--dim);padding:0 0 4px;"><span style="width:52px;">TF</span><span style="width:78px;text-align:right;">vs hold</span><span style="width:72px;text-align:right;">round trips</span><span style="flex:1;text-align:right;">state</span></div>';
       let best=null;
       for(const t of ORDER){ const x=a.flips[t]; if(!x) continue; if(best===null||Number(x.gainPct)>Number(a.flips[best].gainPct)) best=t; }
@@ -10051,14 +10079,15 @@ document.addEventListener('click', function(e){
         const x=a.flips[t]; if(!x) continue;
         const g=Number(x.gainPct)||0;
         const c=g>0?'#9c9':g<0?'#e88':'var(--muted)';
-        h += '<div style="display:flex;font-size:12px;border-bottom:1px solid var(--line);padding:5px 0;align-items:baseline;">'
-          + '<span style="width:52px;font-weight:700;'+(t===best?'color:#8bd;':'')+'">'+esc(t)+(t===best?' ★':'')+'</span>'
+        const on=liveTf===t;
+        h += '<div style="display:flex;font-size:12px;border-bottom:1px solid var(--line);padding:5px 0;align-items:baseline;'+(on?'background:rgba(136,187,221,0.07);':'')+'">'
+          + '<span style="width:52px;font-weight:700;'+(on?'color:#8bd;':(t===best?'color:#8bd;':''))+'">'+esc(t)+(on?' ●':(t===best?' ★':''))+'</span>'
           + '<span style="width:78px;text-align:right;color:'+c+';font-weight:700;">'+(g>=0?'+':'')+g.toFixed(2)+'%</span>'
           + '<span style="width:72px;text-align:right;color:var(--dim);">'+esc(x.trips||0)+'</span>'
           + '<span style="flex:1;text-align:right;color:var(--dim);font-size:11px;">'+(x.holding?'holding':'in cash')+'</span>'
           + '</div>';
       }
-      h += '<div class="bot-why" style="color:var(--dim);">Costed at 1bp a side (maker). On real 2025-26 data the same flip at TAKER fees loses everything below about 1H — 5m pays 3,346% of the account in fees. The signal is real at every timeframe; the costs are what decide it.</div>';
+      h += '<div class="bot-why" style="color:var(--dim);">★ best paper arm · ● live on real money. The paper arms are costed at 1bp a side (maker), which is optimistic — it assumes every post-only order fills at its price. On real 2025-26 data the same flip at TAKER fees loses everything below about 1H; 5m pays 3,346% of the account in fees. The signal is real at every timeframe; the costs are what decide it. The live arm books at the real 10bps, so its number and the paper number for the same timeframe will not agree — that gap is the cost of being real.</div>';
     }
 
     const ev = (log||[]).filter(e=>String(e.result||'').startsWith('ACCUM')).slice(0,8);
@@ -10126,6 +10155,49 @@ document.addEventListener('click', function(e){
     }catch(e){ el.innerHTML = '<div style="font-size:11px;color:var(--dim);">state unavailable: ' + esc(String(e && e.message || e)) + '</div>'; }
   }
   window.loadAccum = loadAccum;
+
+  // ── THE TIMEFRAME TOGGLES (2026-08-19) ───────────────────────────────────────────────────
+  // These do not change anything in this browser. They write one field to the relay, which the
+  // server bot reads at the top of its next run — the same channel the OFF/DRY/ARMED switch has
+  // always used. So the panel must report the RELAY's answer, never the button that was tapped:
+  // a rejected value snapping back with no explanation is the worst thing a control can do.
+  //
+  // Arming asks first, because handing the real balance to a different strategy is a deliberate
+  // act. Turning it OFF never asks — you should never have to get past a dialogue to stand a
+  // strategy down.
+  async function setFlipTf(tf){
+    const msg = document.getElementById('flip-msg');
+    const say = (t,bad)=>{ if(msg){ msg.textContent=t||''; msg.style.color = bad?'#e88':'var(--dim)'; } };
+    if(tf !== 'off'){
+      const warn = 'Hand the real spot balance to the ' + tf + ' dot flip?\n\n'
+        + 'It will sell the WHOLE stack on every red dot and buy it all back on the green, on its own, until you switch it off.\n\n'
+        + 'The pump ladder stands down while it runs. Nothing is placed at the moment you arm it — it waits for the first dot after now.';
+      if(!confirm(warn)) return;
+    }
+    say('saving…');
+    try{
+      const r = await srvFetch('/config', { accumFlipTf: tf });
+      if(r.status !== 200 || !r.data || !r.data.config){
+        say((r.data && r.data.error) || ('save failed (' + r.status + ')'), true);
+        return;
+      }
+      const got = r.data.config.accumFlipTf || 'off';
+      say(got === 'off'
+        ? 'Off — the pump ladder keeps the coins. Takes effect on the bot\'s next run.'
+        : got + ' armed. It takes effect on the bot\'s next run (every 30–40 min), and the panel below will show it as live once that run lands.');
+      // Repaint the buttons from what the relay actually holds, not from what was tapped. The
+      // agent-state read is deliberately NOT refreshed here: it will not know about this until
+      // the bot has run, and showing it as live before then would be a lie.
+      document.querySelectorAll('.flip-tf').forEach(b=>{
+        const on = b.getAttribute('data-tf') === got;
+        b.style.borderColor = on ? (got==='off'?'var(--fg)':'#8bd') : 'var(--line)';
+        b.style.color       = on ? (got==='off'?'var(--fg)':'#8bd') : 'var(--dim)';
+        b.style.fontWeight  = on ? '700' : '400';
+      });
+    }catch(e){ say(String(e && e.message || e), true); }
+  }
+  window.setFlipTf = setFlipTf;
+
   window.toggleAccum = function(){
     const p = document.getElementById('accum-panel-shell'); if(!p) return;
     p.classList.toggle('show');

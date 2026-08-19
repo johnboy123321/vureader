@@ -64,6 +64,12 @@ const CFG = {
   // structure = rest a limit at the zone the move came from and let price come back
   entryMode: () => String(env("ENTRY_MODE", "immediate")).toLowerCase(),
   entryExpiryH: () => num("ENTRY_EXPIRY_H", 8),
+  // ── WHICH TIMEFRAME THE REAL COINS FOLLOW (2026-08-19) ────────────────────────────────────
+  // "off" = the pump ladder keeps the stack, which is how this has always worked and stays the
+  // default. Any of the eight timeframes = the dot flip on that timeframe trades the real spot
+  // balance instead, and the ladder stands down. Set from the app panel via the relay; the env
+  // var is the fallback for when the relay cannot be reached.
+  accumFlipTf: () => String(env("ACCUM_FLIP_TF", "off")),
 };
 // The relay's own default list, duplicated here so direct mode enforces the SAME gate. If these
 // two ever need to differ, that must be a deliberate decision, not drift.
@@ -1098,6 +1104,16 @@ function applyLiveConfig(c) {
   setNum("corrMax", c.corrMax, 1, 12);
   setNum("dayCap", c.dayCap, 1, 50);
   setNum("maxNotional", c.maxNotional, 100, 5000);
+  // The accumulator's live timeframe. Validated AGAIN here even though the relay validates on the
+  // way in: this value decides which strategy holds real coins, and "the other end checked it" is
+  // not a thing worth betting a balance on. Anything unrecognised leaves the env value alone,
+  // which means the ladder — the conservative direction to fail in.
+  if (c.accumFlipTf !== undefined && c.accumFlipTf !== null && c.accumFlipTf !== "") {
+    const want = String(c.accumFlipTf).toLowerCase();
+    const hit = want === "off" ? "off" : FLIP_TFS.find(t => t.toLowerCase() === want);
+    if (hit) { CFG.accumFlipTf = () => hit; applied.push("accumFlipTf=" + hit); }
+    else console.log(`live config: ignoring accumFlipTf=${c.accumFlipTf}`);
+  }
   // KILL from the panel stops the agent placing at all. The relay enforces it independently on
   // the order path, so this is the polite half of the switch, not the whole of it.
   if (c.kill === true) { CFG.mode = () => "off"; applied.push("KILL=on"); }
@@ -1844,6 +1860,13 @@ function accumStep(state, daily, cfg = {}) {
     pumpPct = null,
     mfGate = String(env("ACCUM_MF_GATE", "1")) === "1",
     minOrderUsdt = num("ACCUM_MIN_ORDER_USDT", 10),
+    // ── STOOD DOWN (2026-08-19) ─────────────────────────────────────────────────────────────
+    // Set when a dot-flip timeframe has been promoted to the real balance. The ladder places no
+    // NEW sells while that is true, but its existing rungs keep being filled — abandoning a
+    // resting rung would strand its cash, which is the exact failure this whole strategy is
+    // built to avoid. It stops starting things; it does not stop finishing them.
+    paused = false,
+    pausedWhy = "",
   } = cfg;
   const st = {
     units: 1, cash: 0, open: [], sells: 0, fills: 0, lastDay: null, startedAt: null, lastFillT: 0,
@@ -1875,6 +1898,12 @@ function accumStep(state, daily, cfg = {}) {
       events.push({ kind: "fill", px: r.px, src: r.src, units: +got.toFixed(8),
                     delta: +(got - r.soldUnits).toFixed(8), viaDaily: true });
     }
+  }
+
+  // 1b) …and if a dot-flip timeframe owns the coins, that is as far as the ladder goes today.
+  if (paused) {
+    events.push({ kind: "skip", why: pausedWhy || "the dot flip holds the coins" });
+    return { st, events };
   }
 
   // 2) THE SELL TRIGGER (2026-08-19) ─────────────────────────────────────────────────────────
@@ -2012,16 +2041,71 @@ function accumFlipStep(state, bars, cfg = {}) {
     const px = bars[i].c;
     if (red && st.units > 0) {
       const sell = st.units * slicePct;
-      st.cash += sell * px * (1 - feeBps / 1e4); st.units -= sell; st.sells++;
-      events.push({ kind: "flip-sell", at: bars[i].t, px, units: sell });
+      const proceeds = sell * px * (1 - feeBps / 1e4);
+      st.cash += proceeds; st.units -= sell; st.sells++;
+      // `cash` rides along because the live arm sizes a real order from it: a spot BUY is sized
+      // in the money, not the coin, so the proceeds of the sell are what the buy-back spends.
+      events.push({ kind: "flip-sell", at: bars[i].t, px, units: sell, cash: proceeds });
     } else if (green && st.cash > 0) {
-      const got = (st.cash / px) * (1 - feeBps / 1e4);
+      const spent = st.cash;
+      const got = (spent / px) * (1 - feeBps / 1e4);
       st.units += got; st.cash = 0; st.trips++;
-      events.push({ kind: "flip-buy", at: bars[i].t, px, units: got });
+      events.push({ kind: "flip-buy", at: bars[i].t, px, units: got, cash: spent });
     }
     st.lastT = bars[i].t;
   }
   return { st, events };
+}
+
+// ═══════════ THE LIVE FLIP ARM (2026-08-19) ═══════════
+// John, having seen the eight paper arms: "I want toggles to switch to those timeframes."
+//
+// So one arm — and only ever one — may be promoted from paper to the real spot balance. This is
+// the promotion, and everything difficult about it is in the seams rather than the strategy:
+//
+//  1. NO REPLAY. accumFlipStep acts on every bar newer than `lastT`. A freshly armed timeframe
+//     has no lastT, and the bar fetch is 500 deep — so an unguarded arm would replay two months
+//     of dots as live orders inside one run. Arming therefore plants the cursor on the newest
+//     closed bar and places NOTHING; the first real order waits for the first dot after that.
+//  2. SWITCHING IS ALSO ARMING. Moving 1H → 4H is not a continuation, it is a new strategy on
+//     the same coins, so it resets the cursor and the record the same way a fresh arm does.
+//  3. ONE BOOK OWNS THE COINS. The ladder and the flip cannot both hold the stack. The caller
+//     stands the ladder down before this runs, and refuses to arm at all while ladder rungs are
+//     still resting — two books claiming one balance is how you sell the same coin twice.
+//
+// The bookkeeping fee is the REAL one (10bps taker), not the 1bp the paper arms assume. Those
+// arms exist to rank timeframes under an optimistic assumption; this one has to be honest, and
+// its record is the only one that gets to claim anything about live performance.
+const LIVE_FLIP_KEY = "cipher_accum_liveflip";
+
+function liveFlipStep(state, bars, tf, cfg = {}) {
+  const { feeBps = num("ACCUM_FEE_BPS", 10), seedUnits = null, seedCash = 0 } = cfg;
+  const st = {
+    tf: null, units: 0, cash: 0, trips: 0, sells: 0, lastT: 0,
+    startUnits: 0, startedAt: null, armedAt: null,
+    ...(state || {}),
+  };
+  const events = [];
+  if (!bars || bars.length < 60) return { st, events, why: "not enough bars to arm" };
+  const last = bars[bars.length - 1];
+
+  if (st.tf !== tf) {
+    const prev = st.tf;
+    st.tf = tf;
+    st.lastT = last.t;                 // ← the whole no-replay guarantee is this line
+    st.trips = 0; st.sells = 0;
+    st.armedAt = new Date().toISOString();
+    st.startedAt = st.armedAt;
+    if (seedUnits != null) { st.units = seedUnits; st.cash = seedCash || 0; }
+    // The benchmark this arm is judged against: what it started with, held and never traded.
+    st.startUnits = st.units + (st.cash || 0) / last.c;
+    events.push({ kind: "flip-armed", tf, prev, at: last.t, px: last.c,
+                  units: st.units, cash: st.cash });
+    return { st, events };
+  }
+
+  const r = accumFlipStep(st, bars, { feeBps, slicePct: 1 });
+  return { st: r.st, events: r.events };
 }
 
 // ═══════════════ SPOT RAILS (2026-08-19) ═══════════════
@@ -2169,7 +2253,7 @@ async function spotPreflight(coin) {
 // The only function that can put a spot order on the wire. Three independent brakes, all of which
 // must be off: ACCUM_EXEC must be "armed", the global KILL must be clear, and the notional must
 // sit under ACCUM_MAX_USDT. Anything else returns a dry-run result that says what it would have done.
-async function sendSpotOrder(order, notionalUsdt) {
+async function sendSpotOrder(order, notionalUsdt, opts = {}) {
   // ── ARMED ON JOHN'S INSTRUCTION, 2026-08-19 ────────────────────────────────────────────────
   // Default flipped from "dry" to "armed" after he funded the spot wallet with 0.007682 BTC and
   // asked for it live. Note WHY the default had to change rather than the workflow file: the
@@ -2184,8 +2268,14 @@ async function sendSpotOrder(order, notionalUsdt) {
   //
   // Three brakes remain and all still apply: the app's KILL switch, this cap, and the fact that
   // PHEMEX_BASE is hard-locked to testnet. Set ACCUM_EXEC=dry to stand it down.
+  // ── TWO CAPS, BECAUSE THERE ARE TWO STRATEGIES (2026-08-19) ────────────────────────────────
+  // The ladder sells a 20% slice, so 200 bounds it to comfortably under half the account and is
+  // a real brake. The dot flip sells the WHOLE stack by construction — capping it below the
+  // stack does not make it smaller, it makes it BROKEN: the order is silently skipped while the
+  // strategy's book records a sell that never happened. A cap that turns a live strategy into a
+  // fiction is worse than no cap, so the flip gets its own, set above the stack on purpose.
   const armed = String(env("ACCUM_EXEC", "armed")) === "armed";
-  const cap = num("ACCUM_MAX_USDT", 200);
+  const cap = opts.cap != null ? opts.cap : num("ACCUM_MAX_USDT", 200);
   if (CFG.kill()) return { dry: true, why: "KILL switch is on", order };
   if (!(notionalUsdt <= cap)) return { dry: true, why: `notional ${notionalUsdt.toFixed(2)} over the ACCUM_MAX_USDT cap ${cap}`, order };
   if (!armed) return { dry: true, why: "ACCUM_EXEC is not armed", order };
@@ -3194,7 +3284,20 @@ export default async function cipherAgent() {
         } catch (e) { console.error("accumulator intraday fills skipped:", e && e.message); }
 
         // 2) THE DAILY DECISION — the red dot only exists on a closed daily bar.
-        const d = accumStep(state, bars);
+        // Which book owns the coins this run? "off" (the default) means the ladder, exactly as
+        // before. A timeframe means the dot flip — but only once the ladder's resting rungs have
+        // all filled, because until then the ladder still has cash out against those coins and
+        // handing the same balance to a second strategy would sell it twice.
+        const flipWant = String((CFG.accumFlipTf && CFG.accumFlipTf()) || "off");
+        const flipTf = flipWant.toLowerCase() === "off" ? null
+                     : (FLIP_TFS.find(t => t.toLowerCase() === flipWant.toLowerCase()) || null);
+        if (flipWant.toLowerCase() !== "off" && !flipTf) console.log(`accumulator: unknown flip timeframe "${flipWant}" — ladder keeps the coins`);
+        const flipBlocked = flipTf && state.open && state.open.length > 0;
+        const flipOwns = !!flipTf && !flipBlocked;
+
+        const d = accumStep(state, bars, flipOwns
+          ? { paused: true, pausedWhy: `the ${flipTf} dot flip holds the coins — ladder stood down` }
+          : {});
         state = d.st; all.push(...d.events);
 
         const px = bars[bars.length - 1].c;
@@ -3224,19 +3327,23 @@ export default async function cipherAgent() {
             if (e.kind === "skip") await pushLog({ coin, result: "ACCUM PASS", skipped: `red dot, but no sell: ${e.why}.` });
           }
         }
-        // ── THE DOT FLIP, measured beside the live strategy ────────────────────────────────
-        // Every timeframe runs at once rather than one being "switched on": a switch would mean
-        // picking a winner before there is evidence, and these cost one candle fetch each. The
-        // panel shows the whole table so the choice is made on a live record, not a preference.
+        // ── THE DOT FLIP ──────────────────────────────────────────────────────────────────
+        // All eight timeframes always run as PAPER arms, whatever is armed, so the table the
+        // choice gets made from never goes dark — including for the timeframe currently live.
+        // Exactly one of them may additionally be promoted to the real balance (see the toggles
+        // in the app panel and liveFlipStep above); the paper arm and the live arm are kept in
+        // separate books so neither can flatter or corrupt the other.
         try {
           state.flips = state.flips || {};
           const oneH = await fetchCandles(coin, "1H", 500);
+          const flipBars = {};
           for (const ftf of FLIP_TFS) {
             let fbars = null;
             if (ftf === "3H") fbars = oneH ? aggregateBars(oneH, 3) : null;      // built, not fetched
             else if (ftf === "1H") fbars = oneH;
             else fbars = await fetchCandles(coin, ftf, 500);
             if (!fbars || fbars.length < 60) continue;
+            flipBars[ftf] = fbars;                       // reused by the live arm — no second fetch
             const f = accumFlipStep(state.flips[ftf] || null, fbars);
             state.flips[ftf] = f.st;
             const fpx = fbars[fbars.length - 1].c;
@@ -3245,8 +3352,122 @@ export default async function cipherAgent() {
             f.st.holding = f.st.cash <= 0;
           }
           const line = FLIP_TFS.map(t => { const x = state.flips[t]; return x ? `${t} ${x.gainPct >= 0 ? "+" : ""}${x.gainPct}% (${x.trips})` : `${t} —`; }).join(" · ");
-          console.log(`dot flip @${num("FLIP_FEE_BPS", 1)}bps maker, measure only: ${line}`);
-        } catch (e) { console.error("dot flip skipped (measures only):", e && e.message); }
+          console.log(`dot flip @${num("FLIP_FEE_BPS", 1)}bps maker, paper: ${line}`);
+
+          // ── AND THE ONE THAT IS REAL ───────────────────────────────────────────────────────
+          let lf = await getJSON(LIVE_FLIP_KEY, null);
+          if (flipBlocked) {
+            state.liveFlip = { tf: null, want: flipTf, blocked: true,
+              why: `waiting for ${state.open.length} resting ladder rung${state.open.length === 1 ? "" : "s"} to fill before the flip can take the coins` };
+            console.log(`live flip ${flipTf}: NOT armed — ${state.liveFlip.why}`);
+          } else if (flipTf && flipBars[flipTf]) {
+            const wasTf = lf && lf.tf;
+            // ── THE CAP HAS TO BE CHECKED *BEFORE* ARMING, NOT AT THE ORDER ─────────────────
+            // The flip sells the WHOLE stack in one order, and sendSpotOrder answers an
+            // over-cap notional with {dry:true} — no order, no error. The internal book would
+            // record a sell that never happened and every number after it would be fiction,
+            // with the wallet still holding coins the strategy thinks it converted to cash.
+            // So an arm that cannot possibly execute is refused up front and said out loud.
+            const capUsdt = num("ACCUM_FLIP_MAX_USDT", 1500);
+            const armedExec = String(env("ACCUM_EXEC", "armed")) === "armed";
+            const stackUsdt = ((Number(state.units) || 0) * px) + (Number(state.cash) || 0);
+            if (armedExec && stackUsdt > capUsdt) {
+              state.liveFlip = { tf: null, want: flipTf, blocked: true,
+                why: `the whole stack is ${stackUsdt.toFixed(0)} USDT but ACCUM_FLIP_MAX_USDT is ${capUsdt} — a flip sells it all in one order, so it would be refused. Raise the cap above ${Math.ceil(stackUsdt / 50) * 50} to arm this.` };
+              console.log(`live flip ${flipTf}: NOT armed — ${state.liveFlip.why}`);
+              await pushLog({ coin, result: "FLIP BLOCKED", skipped: state.liveFlip.why });
+            } else {
+            const lfBefore = lf ? JSON.parse(JSON.stringify(lf)) : null;
+            let placeFailed = null;
+            // Seed from the ladder's book on handover. The ladder has nothing resting (checked
+            // above), so its units and cash ARE the whole balance.
+            const seedUnits = wasTf === flipTf ? null : (Number(state.units) || 0);
+            const seedCash = wasTf === flipTf ? 0 : (Number(state.cash) || 0);
+            const r = liveFlipStep(lf, flipBars[flipTf], flipTf, { seedUnits, seedCash });
+            lf = r.st;
+            for (const e of r.events) {
+              if (e.kind === "flip-armed") {
+                await pushLog({ coin, result: "FLIP ARMED",
+                  skipped: `${flipTf} dot flip is now live on the real balance${e.prev ? ` (switched from ${e.prev})` : ""} — ${e.units.toFixed(8)} ${coin}${e.cash > 0 ? ` + ${e.cash.toFixed(2)} USDT` : ""} at ${formatPrice(e.px)}. No order placed on arming: it waits for the first dot AFTER this bar. The pump ladder is stood down.` });
+                continue;
+              }
+              const isSell = e.kind === "flip-sell";
+              let execNote = "Measure only — no order placed.";
+              try {
+                const prods = await spotProducts();
+                const built = isSell
+                  ? buildSpotOrder(coin, "Sell", { price: e.px, baseQty: e.units }, prods)
+                  : buildSpotOrder(coin, "Buy", { price: e.px, quoteQty: e.cash }, prods);
+                if (built.err) {
+                  execNote = `Spot order NOT built: ${built.err}`;
+                  if (armedExec) placeFailed = built.err;
+                } else {
+                  const notional = isSell ? e.units * e.px : e.cash;
+                  const sr = await sendSpotOrder(built.order, notional, { cap: capUsdt });
+                  execNote = sr.ok ? `SPOT ${isSell ? "SELL" : "BUY"} PLACED (${built.order.clOrdID})`
+                           : sr.dry ? `dry run — would have sent a SPOT ${isSell ? "sell" : "buy"} (${sr.why})`
+                                    : `spot ${isSell ? "sell" : "buy"} refused: ${sr.error}`;
+                  // Armed and NOT placed is the one outcome the book must never absorb. A dry
+                  // note here means a brake fired (kill, cap) while we believed we were live.
+                  if (armedExec && !sr.ok) placeFailed = sr.dry ? sr.why : sr.error;
+                }
+              } catch (err) {
+                execNote = "spot path errored (no order sent): " + (err && err.message);
+                if (armedExec) placeFailed = String(err && err.message || err);
+              }
+              await pushLog({ coin, result: isSell ? "FLIP SELL" : "FLIP BUY",
+                skipped: isSell
+                  ? `${flipTf} red dot — sold the whole stack, ${e.units.toFixed(8)} ${coin} at ${formatPrice(e.px)}. Waiting for the green dot to buy it back. ${execNote}`
+                  : `${flipTf} green dot — bought back with ${e.cash.toFixed(2)} USDT at ${formatPrice(e.px)}, ${e.units.toFixed(8)} ${coin}. ${execNote}` });
+            }
+            // ── THE BOOK FOLLOWS THE WALLET, NOT THE OTHER WAY ROUND ───────────────────────
+            // If we were armed and an order did not reach the venue, the position on Phemex is
+            // unchanged — so the strategy's book must be unchanged too. Rolling back to the
+            // pre-step snapshot also rewinds `lastT`, which means the same dot is retried next
+            // run: right for a transient failure, and loud enough in the log to be caught if it
+            // is not. The alternative — carrying on from a sell that never happened — silently
+            // corrupts every number downstream and is not recoverable without a manual audit.
+            if (placeFailed) {
+              lf = lfBefore || { tf: null, units: 0, cash: 0, trips: 0, sells: 0, lastT: 0, startUnits: 0 };
+              console.error(`live flip ${flipTf}: ORDER DID NOT PLACE (${placeFailed}) — book rolled back, the dot will be retried next run`);
+              await pushLog({ coin, result: "FLIP UNPLACED",
+                skipped: `a ${flipTf} flip order did not reach the venue (${placeFailed}). The strategy's book has been rolled back to match the wallet — nothing was bought or sold. It will retry on the next run.` });
+            }
+            const lpx = flipBars[flipTf][flipBars[flipTf].length - 1].c;
+            lf.unitsNow = +(lf.units + (lf.cash || 0) / lpx).toFixed(8);
+            lf.gainPct = +(((lf.unitsNow / (lf.startUnits || lf.unitsNow || 1)) - 1) * 100).toFixed(2);
+            lf.holding = (lf.cash || 0) <= 0;
+            await setJSON(LIVE_FLIP_KEY, lf);
+            // ONE TRUTH about what is actually held. While the flip owns the coins the ladder's
+            // own book would otherwise sit frozen at the handover figures, and every downstream
+            // reader — the panel, the console line, the benchmark — would quietly report a
+            // position that no longer exists. Mirroring keeps state.units meaning what it says.
+            // startUnits is deliberately NOT touched: the benchmark is still the balance this
+            // whole exercise began with, whichever strategy is currently driving.
+            state.units = lf.units; state.cash = lf.cash || 0;
+            state.liveFlip = { tf: lf.tf, blocked: false, armedAt: lf.armedAt, units: lf.units,
+                               cash: lf.cash, unitsNow: lf.unitsNow, startUnits: lf.startUnits,
+                               gainPct: lf.gainPct, holding: lf.holding, trips: lf.trips, sells: lf.sells };
+            console.log(`live flip ${lf.tf} (REAL): ${lf.unitsNow} units vs ${lf.startUnits} at arming — ${lf.gainPct >= 0 ? "+" : ""}${lf.gainPct}% · ${lf.sells} sells, ${lf.trips} round trips · ${lf.holding ? "holding coins" : "in cash, waiting for green"}`);
+            }
+          } else {
+            // Toggled back to off — HAND THE COINS BACK. The flip may well be sitting in cash
+            // mid-cycle, so the ladder must resume from what is actually held rather than from
+            // the figures it was frozen at on handover; otherwise it would size its next sell
+            // against coins that are currently USDT. The arm's record is kept, not deleted:
+            // switching away should not erase what it did.
+            if (lf && lf.tf) {
+              state.units = Number(lf.units) || 0;
+              state.cash = Number(lf.cash) || 0;
+              console.log(`live flip stood down from ${lf.tf} — ladder resumes with ${state.units.toFixed(8)} ${coin}` +
+                          (state.cash > 0 ? ` + ${state.cash.toFixed(2)} USDT still to be bought back` : ""));
+              await pushLog({ coin, result: "FLIP OFF",
+                skipped: `${lf.tf} dot flip switched off after ${lf.trips} round trip${lf.trips === 1 ? "" : "s"} — the pump ladder has the coins again: ${state.units.toFixed(8)} ${coin}${state.cash > 0 ? ` plus ${state.cash.toFixed(2)} USDT still in cash` : ""}.` });
+              lf.tf = null; await setJSON(LIVE_FLIP_KEY, lf);
+            }
+            state.liveFlip = { tf: null, blocked: false, why: "off — the pump ladder holds the coins" };
+          }
+        } catch (e) { console.error("dot flip skipped:", e && e.message); }
 
         if (units != null) {
           const since = state.startedAt || "today";

@@ -103,7 +103,17 @@ async function blobStore() {
   if (!_blob) ({ blob: _blob } = await import("https://esm.town/v/std/blob"));
   return _blob;
 }
-const CONFIG_DEFAULTS = { mode: "dry", riskGbp: 10, corrMax: 6, dayCap: 25, maxNotional: 2000, kill: false };
+// ── THE ACCUMULATOR'S LIVE TIMEFRAME (2026-08-19) ────────────────────────────────────────────
+// John: "I want toggles to switch to those timeframes." The accumulator runs a VuManChu dot flip
+// on eight timeframes as paper arms; this setting says which ONE of them, if any, the real spot
+// balance follows. "off" means the pump ladder keeps the coins, which is the behaviour that
+// existed before this field and remains the default.
+//
+// It is whitelisted here rather than passed through, because this endpoint is the only thing
+// standing between a typo in a browser and a strategy switch on live money. An unrecognised
+// timeframe must be a 400, not a silently stored string the agent later fails to match.
+const ACCUM_FLIP_TFS = ["off", "5m", "15m", "30m", "1H", "2H", "3H", "4H", "1D"];
+const CONFIG_DEFAULTS = { mode: "dry", riskGbp: 10, corrMax: 6, dayCap: 25, maxNotional: 2000, kill: false, accumFlipTf: "off" };
 async function readConfig() {
   try {
     const v = await (await blobStore()).getJSON(CONFIG_KEY);
@@ -126,6 +136,14 @@ function validateConfig(patch) {
     else out.mode = m;
   }
   if (patch.kill !== undefined) out.kill = !!patch.kill;
+  // Case-insensitive in, canonical out — the panel sends "1h", the agent matches on "1H", and
+  // the two must not disagree about whether a timeframe is set.
+  if (patch.accumFlipTf !== undefined) {
+    const t = String(patch.accumFlipTf).toLowerCase();
+    const hit = ACCUM_FLIP_TFS.find((x) => x.toLowerCase() === t);
+    if (!hit) errs.push("accumFlipTf must be one of " + ACCUM_FLIP_TFS.join(", "));
+    else out.accumFlipTf = hit;
+  }
   num("riskGbp", 1, 100);
   num("corrMax", 1, 12);
   num("dayCap", 1, 50);
