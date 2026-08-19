@@ -797,6 +797,20 @@ async function hmacHex(secret, msg) {
 }
 
 // Byte-identical signing to phemex-relay-valtown.js: path + query + expiry + rawBody.
+// Public GET — no key, no signature. Used for the spot product table (price/quantity scales),
+// which must be read from the venue rather than assumed. Same hard-locked testnet base URL.
+async function phemexPublic(path, query) {
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(), PHEMEX_TIMEOUT_MS);
+  try {
+    const res = await fetch(PHEMEX_BASE + path + (query ? "?" + query : ""), { signal: ac.signal });
+    const raw = await res.text();
+    let data = null;
+    try { data = JSON.parse(raw); } catch { data = { parseError: true, raw: raw.slice(0, 300) }; }
+    return { status: res.status, data };
+  } finally { clearTimeout(timer); }
+}
+
 async function phemexCall(method, path, query, bodyObj) {
   const expiry = Math.floor(Date.now() / 1000) + 60;
   const bodyStr = bodyObj ? JSON.stringify(bodyObj) : "";
@@ -1643,6 +1657,74 @@ function smaAt(candles, n) {
   return s / n;
 }
 
+// Bull or bear, from BTC against its own 200-day average. One number, no parameters to fit, and
+// the same definition every trader in the market can see — which is the point: a regime line only
+// anyone can compute is a regime line nobody else is reacting to.
+async function regimeSnapshot() {
+  if (_regimeCache) return _regimeCache;
+  let label = null, distPct = null;
+  try {
+    const d = await fetchCandles("BTC", "1D", 260);
+    const ma = smaAt(d, REGIME_MA);
+    if (ma && d.length) {
+      const px = d[d.length - 1].c;
+      label = px > ma ? "bull" : "bear";
+      distPct = +(((px - ma) / ma) * 100).toFixed(1);
+    }
+  } catch { /* no regime this run — records simply carry null and are excluded from the boxes */ }
+  _regimeCache = { label, distPct, breadth: null };
+  return _regimeCache;
+}
+
+// Breadth costs nothing: the scan already pulled every coin's daily candles, so count how many
+// closed above their own 200D line while we were there. A second opinion on the same question.
+function regimeBreadthTally(reg, dailyBars) {
+  if (!reg || !dailyBars) return;
+  const ma = smaAt(dailyBars, REGIME_MA);
+  if (!ma) return;
+  reg._bUp = (reg._bUp || 0) + (dailyBars[dailyBars.length - 1].c > ma ? 1 : 0);
+  reg._bN = (reg._bN || 0) + 1;
+  reg.breadth = +(reg._bUp / reg._bN).toFixed(2);
+}
+
+// ── the 2x2, and the stability test that decides whether to believe it ────────────────────────
+function regimeBoxes(records) {
+  const box = {};
+  for (const key of ["long|bull", "long|bear", "short|bull", "short|bear"]) box[key] = [];
+  for (const r of records) {
+    if (r.arm !== "baseline" || r.R === null || !r.reg) continue;
+    const k = (r.dir === "short" ? "short" : "long") + "|" + r.reg;
+    if (box[k]) box[k].push(r);
+  }
+  const out = {};
+  for (const [k, rs] of Object.entries(box)) {
+    const sorted = [...rs].sort((a, b) => a.at - b.at);
+    const half = Math.floor(sorted.length / 2);
+    const meanOf = (a) => a.length ? +(a.reduce((x, r) => x + r.R, 0) / a.length).toFixed(3) : null;
+    out[k] = {
+      n: sorted.length,
+      meanR: meanOf(sorted),
+      firstHalf: meanOf(sorted.slice(0, half)),
+      secondHalf: meanOf(sorted.slice(half)),
+    };
+  }
+  return out;
+}
+
+// A box is only "trustworthy" if it has a real sample AND both halves of that sample agree on the
+// sign. This is the whole lesson of 2026-08-17 written down as a gate: full-sample means lie.
+function regimeVerdict(records) {
+  const boxes = regimeBoxes(records);
+  const trustworthy = [];
+  for (const [k, b] of Object.entries(boxes)) {
+    if (b.n < REGIME_MIN_PER_BOX * 2) continue;                 // need enough to split in half
+    if (b.firstHalf === null || b.secondHalf === null) continue;
+    const agree = (b.firstHalf > 0) === (b.secondHalf > 0);
+    if (agree) trustworthy.push({ box: k, ...b, sign: b.meanR > 0 ? "pays" : "costs" });
+  }
+  return { boxes, trustworthy, ready: trustworthy.length > 0 };
+}
+
 // ═══════════════ THE ACCUMULATOR (2026-08-19) ═══════════════
 // A SECOND, SEPARATE OBJECTIVE. Everything else in this file is trying to make £. This is trying
 // to end the year holding more BTC than it started with — units, not money. John's spec:
@@ -1685,23 +1767,54 @@ function accumLevels(daily, sellPx, maxRungs = 4, maxAwayPct = 0.12, minGapPct =
   return out;
 }
 
+// ── FILLS RUN ON EVERY PASS, NOT ONCE A DAY (2026-08-19) ─────────────────────────────────────
+// The decision to SELL belongs to the closed daily bar — that is where the red dot lives. But a
+// buy-back rung is a resting order, and a resting order does not wait politely for 00:00 UTC. If
+// price wicks down through a level at 03:00 and bounces, that rung filled, and a once-a-day check
+// would either miss it or book it at the wrong moment. John: "it needs to work 24/7 to capture
+// all the moves." So fills are checked on every 15-minute run, against every intraday bar that
+// has closed since the last check — no bar is skipped and none is counted twice.
+// PURE: bars in, state + events out. No I/O, no clock.
+function accumFillPass(state, intraday, cfg = {}) {
+  const { feeBps = 10 } = cfg;
+  const st = { units: 1, cash: 0, open: [], sells: 0, fills: 0, lastFillT: 0, ...(state || {}) };
+  const events = [];
+  if (!intraday || !intraday.length || !st.open.length) return { st, events };
+  const fresh = intraday.filter(b => b.t > (st.lastFillT || 0)).sort((a, b) => a.t - b.t);
+  for (const b of fresh) {
+    for (let k = st.open.length - 1; k >= 0; k--) {
+      const r = st.open[k];
+      if (b.l <= r.px) {
+        const got = (r.usdt / r.px) * (1 - feeBps / 1e4);
+        st.units += got; st.cash -= r.usdt; st.fills++;
+        st.open.splice(k, 1);
+        events.push({ kind: "fill", px: r.px, src: r.src, at: b.t, units: +got.toFixed(8),
+                      delta: +(got - r.soldUnits).toFixed(8) });
+      }
+    }
+    st.lastFillT = b.t;
+  }
+  return { st, events };
+}
+
 // PURE: one closed daily bar in, new state + a list of what happened out. No I/O, no clock, so
 // every rule here is testable without a venue — the same discipline as breakerStep.
 function accumStep(state, daily, cfg = {}) {
   const { slicePct = 0.20, feeBps = 10, maxConcurrent = 4, maxCashPct = 0.5, maxRungs = 4 } = cfg;
   const st = {
-    units: 1, cash: 0, open: [], sells: 0, fills: 0, lastDay: null, startedAt: null,
+    units: 1, cash: 0, open: [], sells: 0, fills: 0, lastDay: null, startedAt: null, lastFillT: 0,
     ...(state || {}),
   };
   const events = [];
   if (!daily || daily.length < 60) return { st, events };
   const bar = daily[daily.length - 1];
   const day = new Date(bar.t).toISOString().slice(0, 10);
-  if (st.lastDay === day) return { st, events };            // one action per closed daily bar
+  if (st.lastDay === day) return { st, events };            // one SELL decision per closed daily bar
   st.lastDay = day;
   if (!st.startedAt) { st.startedAt = day; st.startPx = bar.c; }
 
-  // 1) fills first — a rung fills when the day traded down through it
+  // 1) a safety net only: accumFillPass does the real work every 15 minutes, but if the intraday
+  //    fetch failed for a while the daily low still tells us a rung must have filled.
   for (let k = st.open.length - 1; k >= 0; k--) {
     const r = st.open[k];
     if (bar.l <= r.px) {
@@ -1709,7 +1822,7 @@ function accumStep(state, daily, cfg = {}) {
       st.units += got; st.cash -= r.usdt; st.fills++;
       st.open.splice(k, 1);
       events.push({ kind: "fill", px: r.px, src: r.src, units: +got.toFixed(8),
-                    delta: +(got - r.soldUnits).toFixed(8) });
+                    delta: +(got - r.soldUnits).toFixed(8), viaDaily: true });
     }
   }
 
@@ -1738,6 +1851,90 @@ function accumStep(state, daily, cfg = {}) {
   for (const z of levels) st.open.push({ px: z.px, src: z.src, usdt: per, soldUnits: perUnits, sellPx: bar.c, sinceDay: day });
   events.push({ kind: "sell", px: bar.c, units: +sellUnits.toFixed(8), rungs: levels.map(z => `${z.src}@${formatPrice(z.px)}`) });
   return { st, events };
+}
+
+// ═══════════════ SPOT RAILS (2026-08-19) ═══════════════
+// John: "it also has to be done on spot, not futures." He is right, and it is not a preference —
+// it is the whole objective. On a USDT-M perpetual you never own a coin: you hold a position,
+// you pay funding to keep it, and "more BTC" is not a thing that can happen. Accumulating UNITS
+// only means anything on spot, where the coin is actually yours.
+//
+// Everything else in this file talks to /g-orders (USDT-M). Spot is a different product on the
+// same venue: symbols carry an "s" prefix (sBTCUSDT), and prices and quantities go over the wire
+// as SCALED INTEGERS whose scale factors come from /public/products. Getting a scale wrong sends
+// an order a thousand times too big, so nothing here guesses: if the scales have not been read
+// from the venue, the order is refused.
+//
+// IMPORTANT, stated plainly: this code has NOT been exercised against the live venue — Phemex is
+// unreachable from the machine it was written on. It is DRY by default (ACCUM_EXEC=dry) and logs
+// the exact payload it would send. The first armed run must be watched.
+const SPOT_KEY = "cipher_spot_products";
+let _spotProducts = null;
+
+// Read the product table once and remember the scales. Public endpoint, no key needed.
+async function spotProducts() {
+  if (_spotProducts) return _spotProducts;
+  try {
+    const r = await phemexPublic("/public/products");
+    const list = (r && r.data && (r.data.products || r.data.data?.products)) || [];
+    const map = {};
+    for (const p of list) {
+      if (!p || !p.symbol || !String(p.symbol).startsWith("s")) continue;   // spot symbols only
+      map[p.symbol] = {
+        baseCurrency: p.baseCurrency, quoteCurrency: p.quoteCurrency,
+        priceScale: Number(p.priceScale ?? p.pricePrecision),
+        ratioScale: Number(p.ratioScale),
+        baseTickSize: p.baseTickSize, quoteTickSize: p.quoteTickSize,
+        baseValueScale: Number(p.baseValueScale), quoteValueScale: Number(p.quoteValueScale),
+      };
+    }
+    if (Object.keys(map).length) _spotProducts = map;
+    return _spotProducts;
+  } catch (e) { console.error("spot products read failed:", e && e.message); return null; }
+}
+
+// Build a spot order. Returns { order } or { err } — never a half-built order.
+//   side "Sell": we are selling BASE (BTC), so baseQtyEv carries the size
+//   side "Buy" : we are spending QUOTE (USDT), so quoteQtyEv carries the spend
+function buildSpotOrder(sym, side, { price, baseQty, quoteQty }, products) {
+  const symbol = "s" + String(sym).toUpperCase().replace(/^S/, "") + "USDT";
+  const p = products && products[symbol];
+  if (!p) return { err: `no spot product data for ${symbol} — refusing to guess the scales` };
+  if (!(Number.isFinite(p.baseValueScale) && Number.isFinite(p.quoteValueScale) && Number.isFinite(p.priceScale)))
+    return { err: `incomplete scales for ${symbol} — refusing to send` };
+  if (side !== "Buy" && side !== "Sell") return { err: "side must be Buy or Sell" };
+  if (!(price > 0)) return { err: "spot order needs a price" };
+  const order = {
+    symbol, side, ordType: "Limit", timeInForce: "GoodTillCancel",
+    priceEp: Math.round(price * 10 ** p.priceScale),
+    clOrdID: ("accum" + sym + Date.now()).replace(/[^a-zA-Z0-9]/g, "").slice(0, 30),
+  };
+  if (side === "Sell") {
+    if (!(baseQty > 0)) return { err: "sell needs a base quantity" };
+    order.baseQtyEv = Math.round(baseQty * 10 ** p.baseValueScale);
+    if (!(order.baseQtyEv > 0)) return { err: "base quantity rounds to zero at this scale" };
+  } else {
+    if (!(quoteQty > 0)) return { err: "buy needs a quote amount" };
+    order.quoteQtyEv = Math.round(quoteQty * 10 ** p.quoteValueScale);
+    if (!(order.quoteQtyEv > 0)) return { err: "quote amount rounds to zero at this scale" };
+  }
+  return { order };
+}
+
+// The only function that can put a spot order on the wire. Three independent brakes, all of which
+// must be off: ACCUM_EXEC must be "armed", the global KILL must be clear, and the notional must
+// sit under ACCUM_MAX_USDT. Anything else returns a dry-run result that says what it would have done.
+async function sendSpotOrder(order, notionalUsdt) {
+  const armed = String(env("ACCUM_EXEC", "dry")) === "armed";
+  const cap = num("ACCUM_MAX_USDT", 100);
+  if (CFG.kill()) return { dry: true, why: "KILL switch is on", order };
+  if (!(notionalUsdt <= cap)) return { dry: true, why: `notional ${notionalUsdt.toFixed(2)} over the ACCUM_MAX_USDT cap ${cap}`, order };
+  if (!armed) return { dry: true, why: "ACCUM_EXEC is not armed", order };
+  const r = await phemexCall("POST", "/spot/orders", "", order);
+  const code = r.data && r.data.code;
+  if (r.status !== 200) return { ok: false, status: r.status, error: `spot http ${r.status}`, sent: order, phemex: r.data };
+  if (code !== 0 && code !== undefined) return { ok: false, status: 422, error: `phemex ${code}: ${(r.data && r.data.msg) || "rejected"}`, sent: order, phemex: r.data };
+  return { ok: true, sent: order, phemex: r.data };
 }
 
 // Units held right now, counting cash at the current price — the only number that matters, and
@@ -1901,6 +2098,58 @@ async function brainCall(prompt) {
   finally { clearTimeout(to); }
 }
 
+// ── THE BRAIN OVERSEEING THE ACCUMULATOR (2026-08-19) ────────────────────────────────────────
+// John: "the brain needs to be able to oversee it, see it and tweak it if it sees obvious
+// improvements." The first half is easy and safe — show it the record and let it name what it
+// sees. The second half is where every trading system quietly destroys itself, so the rule here
+// is explicit and enforced by the code: THE BRAIN CANNOT CHANGE A SETTING. It returns a written
+// observation and, at most, a NAMED suggestion. A suggestion is logged for John and would have to
+// win a shadow arm before it could ever alter behaviour — the same bar every other idea in this
+// system has had to clear. Anything else is a language model tuning a live strategy on a sample
+// of a dozen trades, which is precisely how you overfit an account to zero.
+function buildAccumReviewPrompt(st, px, backtest) {
+  const rungs = (st.open || []).map(r => `${r.src}@${r.px}`).join(", ") || "none";
+  const units = (st.units || 0) + (st.cash || 0) / (px || 1);
+  return [
+    "You are reviewing a BTC accumulation strategy. Its ONLY goal is to end up holding more BTC.",
+    "Buy-and-hold always ends with exactly 1.0000 units — that is the benchmark it must beat.",
+    "",
+    "How it works: on a daily VuManChu red dot with negative money flow it sells 20% of the stack,",
+    "then places buy-back orders at real levels below (swing lows, order blocks, fair value gaps).",
+    "It gains units when a rung fills lower; it LOSES units when price runs away and cash is left",
+    "stranded — that is the known failure mode and it dwarfs the wins.",
+    "",
+    `Backtest on 14.5 years: ${backtest}`,
+    "",
+    "LIVE RECORD SO FAR:",
+    `  units now ${units.toFixed(5)} vs benchmark 1.00000`,
+    `  sells ${st.sells || 0} · rung fills ${st.fills || 0} · rungs still resting: ${rungs}`,
+    `  cash waiting to be redeployed: ${(st.cash || 0).toFixed(2)} USDT · BTC price ${px}`,
+    `  running since ${st.startedAt || "just started"}`,
+    "",
+    "Reply ONLY this JSON, no prose:",
+    '{"read":"<what the record shows, max 25 words>",',
+    ' "concern":"<the single biggest risk RIGHT NOW, max 20 words>",',
+    ' "suggestion":"<one specific testable change, or null if the sample is too small>",',
+    ' "sampleTooSmall":true|false}',
+  ].join("\n");
+}
+
+function parseAccumReview(text) {
+  if (!text) return null;
+  const m = String(text).match(/\{[\s\S]*\}/);
+  if (!m) return null;
+  try {
+    const o = JSON.parse(m[0]);
+    return {
+      read: String(o.read || "").slice(0, 200),
+      concern: String(o.concern || "").slice(0, 200),
+      suggestion: o.suggestion == null ? null : String(o.suggestion).slice(0, 240),
+      sampleTooSmall: !!o.sampleTooSmall,
+    };
+  } catch { return null; }
+}
+
 // Cause → veto candidate. IMPORTANT: only losses are autopsied, so "this cause's trades lose"
 // is true by construction and proves nothing. What a label CAN prove is persistence: a failure
 // mode that keeps recurring across time is structural; one that clustered in a single bad week
@@ -1927,74 +2176,6 @@ function vetoCandidates(records) {
     out.push({ cause, n: rs.length, early, late, meanR: meanOf(rs), candidate });
   }
   return out.sort((a, b) => b.n - a.n);
-}
-
-// Bull or bear, from BTC against its own 200-day average. One number, no parameters to fit, and
-// the same definition every trader in the market can see — which is the point: a regime line only
-// anyone can compute is a regime line nobody else is reacting to.
-async function regimeSnapshot() {
-  if (_regimeCache) return _regimeCache;
-  let label = null, distPct = null;
-  try {
-    const d = await fetchCandles("BTC", "1D", 260);
-    const ma = smaAt(d, REGIME_MA);
-    if (ma && d.length) {
-      const px = d[d.length - 1].c;
-      label = px > ma ? "bull" : "bear";
-      distPct = +(((px - ma) / ma) * 100).toFixed(1);
-    }
-  } catch { /* no regime this run — records simply carry null and are excluded from the boxes */ }
-  _regimeCache = { label, distPct, breadth: null };
-  return _regimeCache;
-}
-
-// Breadth costs nothing: the scan already pulled every coin's daily candles, so count how many
-// closed above their own 200D line while we were there. A second opinion on the same question.
-function regimeBreadthTally(reg, dailyBars) {
-  if (!reg || !dailyBars) return;
-  const ma = smaAt(dailyBars, REGIME_MA);
-  if (!ma) return;
-  reg._bUp = (reg._bUp || 0) + (dailyBars[dailyBars.length - 1].c > ma ? 1 : 0);
-  reg._bN = (reg._bN || 0) + 1;
-  reg.breadth = +(reg._bUp / reg._bN).toFixed(2);
-}
-
-// ── the 2x2, and the stability test that decides whether to believe it ────────────────────────
-function regimeBoxes(records) {
-  const box = {};
-  for (const key of ["long|bull", "long|bear", "short|bull", "short|bear"]) box[key] = [];
-  for (const r of records) {
-    if (r.arm !== "baseline" || r.R === null || !r.reg) continue;
-    const k = (r.dir === "short" ? "short" : "long") + "|" + r.reg;
-    if (box[k]) box[k].push(r);
-  }
-  const out = {};
-  for (const [k, rs] of Object.entries(box)) {
-    const sorted = [...rs].sort((a, b) => a.at - b.at);
-    const half = Math.floor(sorted.length / 2);
-    const meanOf = (a) => a.length ? +(a.reduce((x, r) => x + r.R, 0) / a.length).toFixed(3) : null;
-    out[k] = {
-      n: sorted.length,
-      meanR: meanOf(sorted),
-      firstHalf: meanOf(sorted.slice(0, half)),
-      secondHalf: meanOf(sorted.slice(half)),
-    };
-  }
-  return out;
-}
-
-// A box is only "trustworthy" if it has a real sample AND both halves of that sample agree on the
-// sign. This is the whole lesson of 2026-08-17 written down as a gate: full-sample means lie.
-function regimeVerdict(records) {
-  const boxes = regimeBoxes(records);
-  const trustworthy = [];
-  for (const [k, b] of Object.entries(boxes)) {
-    if (b.n < REGIME_MIN_PER_BOX * 2) continue;                 // need enough to split in half
-    if (b.firstHalf === null || b.secondHalf === null) continue;
-    const agree = (b.firstHalf > 0) === (b.secondHalf > 0);
-    if (agree) trustworthy.push({ box: k, ...b, sign: b.meanR > 0 ? "pays" : "costs" });
-  }
-  return { boxes, trustworthy, ready: trustworthy.length > 0 };
 }
 
 const SHADOW_KEY = "cipher_shadow";
@@ -2701,22 +2882,82 @@ export default async function cipherAgent() {
       const coin = ACCUM_COIN();
       const bars = await fetchCandles(coin, "1D", 260);
       if (bars && bars.length >= 60) {
-        const prev = await getJSON(ACCUM_KEY, null);
-        const { st, events } = accumStep(prev, bars);
+        let state = await getJSON(ACCUM_KEY, null);
+        const all = [];
+
+        // 1) FILLS — every run, against every 15-minute bar closed since the last check, so a
+        //    3am wick through a rung is caught when it happens rather than at the daily close.
+        try {
+          const fine = await fetchCandles(coin, "15m", 200);
+          if (fine && fine.length) {
+            const f = accumFillPass(state, fine);
+            state = f.st; all.push(...f.events);
+          }
+        } catch (e) { console.error("accumulator intraday fills skipped:", e && e.message); }
+
+        // 2) THE DAILY DECISION — the red dot only exists on a closed daily bar.
+        const d = accumStep(state, bars);
+        state = d.st; all.push(...d.events);
+
         const px = bars[bars.length - 1].c;
-        const units = accumUnits(st, px);
-        if (events.length) {
-          await setJSON(ACCUM_KEY, st);
-          for (const e of events) {
-            if (e.kind === "sell") await pushLog({ coin, result: "ACCUM SELL",
-              skipped: `sold ${(0.2 * 100).toFixed(0)}% of the virtual stack at ${formatPrice(e.px)} on a red dot with money flow negative; buy-backs laddered at ${e.rungs.join(", ")}. Measure only — no order placed.` });
+        const units = accumUnits(state, px);
+        if (all.length) {
+          await setJSON(ACCUM_KEY, state);
+          for (const e of all) {
+            if (e.kind === "sell") {
+              // SPOT, never futures: you cannot accumulate coins on a perpetual. Dry unless armed.
+              let execNote = "Measure only — no order placed.";
+              try {
+                const prods = await spotProducts();
+                const built = buildSpotOrder(coin, "Sell", { price: e.px, baseQty: e.units }, prods);
+                if (built.err) execNote = `Spot order NOT built: ${built.err}`;
+                else {
+                  const r = await sendSpotOrder(built.order, e.units * e.px);
+                  execNote = r.ok ? `SPOT SELL PLACED (${built.order.clOrdID})`
+                          : r.dry ? `dry run — would have sent a SPOT sell (${r.why})`
+                                  : `spot sell refused: ${r.error}`;
+                }
+              } catch (err) { execNote = "spot path errored (no order sent): " + (err && err.message); }
+              await pushLog({ coin, result: "ACCUM SELL",
+                skipped: `sold 20% of the stack at ${formatPrice(e.px)} on a red dot with money flow negative; buy-backs laddered at ${e.rungs.join(", ")}. ${execNote}` });
+            }
             if (e.kind === "fill") await pushLog({ coin, result: "ACCUM BUY",
-              skipped: `laddered buy filled at the ${e.src} level ${formatPrice(e.px)} — ${e.delta >= 0 ? "+" : ""}${e.delta.toFixed(6)} ${coin} on that slice. Measure only.` });
+              skipped: `laddered buy filled at the ${e.src} level ${formatPrice(e.px)} — ${e.delta >= 0 ? "+" : ""}${e.delta.toFixed(6)} ${coin} on that slice.${e.viaDaily ? " (caught by the daily safety net)" : ""}` });
+            if (e.kind === "skip") await pushLog({ coin, result: "ACCUM PASS", skipped: `red dot, but no sell: ${e.why}.` });
           }
         }
         if (units != null) {
-          const since = st.startedAt || "today";
-          console.log(`accumulator (${coin}, measure only): ${units.toFixed(5)} units vs buy-and-hold 1.00000 — ${((units - 1) * 100 >= 0 ? "+" : "")}${((units - 1) * 100).toFixed(2)}% since ${since} · ${st.sells} sells, ${st.fills} fills, ${st.open.length} rungs resting`);
+          const since = state.startedAt || "today";
+          const resting = state.open.map(r => `${r.src}@${formatPrice(r.px)}`).join(", ") || "none";
+          console.log(`accumulator (${coin} SPOT, ${String(env("ACCUM_EXEC", "dry")) === "armed" ? "ARMED" : "measure only"}): ${units.toFixed(5)} units vs buy-and-hold 1.00000 — ${((units - 1) * 100 >= 0 ? "+" : "")}${((units - 1) * 100).toFixed(2)}% since ${since} · ${state.sells} sells, ${state.fills} fills · resting: ${resting}`);
+          state.unitsNow = +units.toFixed(6); state.pxNow = px;
+
+          // ── brain oversight: weekly, cheap, and it cannot change anything ──────────────────
+          // Only when something has actually happened (a sell or a fill), at most once every
+          // ACCUM_REVIEW_DAYS, sharing the same daily spend cap as the autopsy.
+          try {
+            const bSlot = shadowSlot(await loadShadow(), "brain_autopsy");
+            const days = num("ACCUM_REVIEW_DAYS", 7);
+            const due = !state.lastReview || (Date.now() - state.lastReview) > days * 864e5;
+            if (env("ANTHROPIC_API_KEY", "") && due && (state.sells || 0) + (state.fills || 0) > 0
+                && brainBudget(bSlot, Date.now(), null)) {
+              const res = await brainCall(buildAccumReviewPrompt(state, px,
+                "gains units in ranging/falling markets, loses them in sustained rallies; full history -27.8%, since Jan 2024 +14.9%"));
+              if (res) {
+                brainBudget(bSlot, Date.now(), res.usage);
+                const rv = parseAccumReview(res.text);
+                state.lastReview = Date.now();
+                if (rv) {
+                  state.lastReviewText = rv;
+                  console.log(`accumulator review: ${rv.read}${rv.concern ? " · concern: " + rv.concern : ""}`);
+                  await pushLog({ coin, result: "ACCUM REVIEW",
+                    skipped: `${rv.read}${rv.concern ? ` Concern: ${rv.concern}.` : ""}${rv.suggestion && !rv.sampleTooSmall ? ` Suggestion (advisory only, would have to win a shadow arm before anything changes): ${rv.suggestion}` : " No suggestion — sample too small."}` });
+                }
+              }
+            }
+          } catch (e) { console.error("accumulator review skipped (harmless, changes nothing):", e && e.message); }
+
+          await setJSON(ACCUM_KEY, state);
         }
       }
     } catch (e) { console.error("accumulator failed (harmless, measures only):", e && e.message); }

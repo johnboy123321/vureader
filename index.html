@@ -1457,6 +1457,9 @@ body.layout-edit #layout-bar { display:flex; flex-wrap:wrap; justify-content:cen
       </div>
     </div>
 
+    <div style="font-size:11px;font-weight:700;color:var(--muted);margin-bottom:6px;">ACCUMULATOR — MORE BTC, NOT MORE £</div>
+    <div id="accum-panel" style="margin-bottom:16px;"><div style="font-size:11px;color:var(--dim);">Loading…</div></div>
+
     <div style="font-size:11px;font-weight:700;color:var(--muted);margin-bottom:6px;">SERVER DECISIONS (24/7 AGENT)</div>
     <div id="srv-log" style="margin-bottom:16px;"><div style="font-size:11px;color:var(--dim);">Loading…</div></div>
     <div style="display:flex;align-items:center;gap:8px;margin-bottom:10px;">
@@ -9940,6 +9943,76 @@ document.addEventListener('click', function(e){
   // ── What the server bot has actually been doing ──
   // The agent commits its state file to the repo each run, and the repo is public, so this is a
   // plain read with no auth. Cache-busted because raw.githubusercontent caches hard.
+  // ── THE ACCUMULATOR PANEL (2026-08-19) ──────────────────────────────────────────────────────
+  // A different scoreboard from everything else in this app. The bot's other panels are counted
+  // in pounds; this one is counted in COINS, and its benchmark is not a profit target — it is the
+  // flat 1.00000 units you would hold by doing nothing at all. Anything under that line means the
+  // strategy has cost you Bitcoin, however clever the individual trades looked.
+  // Reads the same agent-state.json the server panel already fetched — no extra network call.
+  function renderAccum(st, log){
+    const el = document.getElementById('accum-panel'); if(!el) return;
+    const a = st.cipher_accum;
+    if(!a){ el.innerHTML = '<div style="font-size:11px;color:var(--dim);">Not started. It acts on the first daily VuManChu red dot with money flow negative — roughly 35 red dots a year on BTC, and the money-flow gate turns most of them down.</div>'; return; }
+    const px = Number(a.pxNow)||0;
+    const units = (Number(a.units)||0) + (px ? (Number(a.cash)||0)/px : 0);
+    const gain = units - 1;
+    const col = gain > 0.0001 ? '#9c9' : gain < -0.0001 ? '#e88' : 'var(--muted)';
+    const resting = Array.isArray(a.open) ? a.open : [];
+    const waiting = resting.length > 0;
+    const state = waiting ? 'SOLD — WAITING TO BUY BACK' : 'FULLY HOLDING';
+    const stateCol = waiting ? '#e8c07a' : '#8bd';
+
+    let h = '<div class="bot-row" style="cursor:default">';
+    h += '<div class="bot-row-top"><span class="bot-badge" style="color:'+stateCol+';border-color:'+stateCol+'55">'+state+'</span>'
+       + '<span style="margin-left:auto;color:'+col+';font-weight:700;">'+units.toFixed(5)+' BTC</span></div>';
+    h += '<div class="bot-nums" style="margin-top:6px;">'
+       + '<span>vs buy-and-hold <b style="color:'+col+'">'+(gain>=0?'+':'')+(gain*100).toFixed(2)+'%</b></span>'
+       + '<span>benchmark <b>1.00000</b></span>'
+       + '<span>sells <b>'+(a.sells||0)+'</b></span>'
+       + '<span>buy-backs <b>'+(a.fills||0)+'</b></span>'
+       + (a.cash>0?'<span>cash idle <b>'+Number(a.cash).toFixed(2)+' USDT</b></span>':'')
+       + '</div>';
+    h += '<div class="bot-why" style="color:var(--dim);">Buy-and-hold always ends on exactly 1.00000 — that is the line this has to beat. Since '+esc(a.startedAt||'—')+'.</div>';
+    h += '</div>';
+
+    if(waiting){
+      h += '<div style="font-size:11px;font-weight:700;color:var(--muted);margin:12px 0 6px;">BUY-BACK ORDERS RESTING</div>';
+      h += resting.slice().sort((x,y)=>Number(y.px)-Number(x.px)).map(r=>{
+        const away = px ? ((px - Number(r.px))/px*100) : null;
+        return '<div style="border-bottom:1px solid var(--line);padding:6px 0;font-size:12px;display:flex;gap:8px;align-items:baseline;">'
+          + '<span style="color:#8bd;font-weight:700;">'+esc(r.src||'level')+'</span>'
+          + '<span><b>'+fnum(r.px)+'</b></span>'
+          + (away!=null?'<span style="color:var(--dim);font-size:11px;">'+away.toFixed(2)+'% below spot</span>':'')
+          + '<span style="margin-left:auto;color:var(--dim);font-size:11px;">'+Number(r.usdt||0).toFixed(2)+' USDT waiting</span>'
+          + '</div>';
+      }).join('');
+    }
+
+    if(a.lastReviewText){
+      const rv = a.lastReviewText;
+      h += '<div style="font-size:11px;font-weight:700;color:var(--muted);margin:12px 0 6px;">BRAIN REVIEW</div>'
+        +  '<div class="bot-why" style="color:var(--muted);">'+esc(rv.read||'')
+        +  (rv.concern?' <span style="color:#e8c07a;">Concern: '+esc(rv.concern)+'</span>':'')
+        +  (rv.suggestion && !rv.sampleTooSmall?'<br><span style="color:var(--dim);">Suggestion (advisory — it must win a shadow arm before anything changes): '+esc(rv.suggestion)+'</span>':'')
+        +  '</div>';
+    }
+
+    const ev = (log||[]).filter(e=>String(e.result||'').startsWith('ACCUM')).slice(0,8);
+    if(ev.length){
+      h += '<div style="font-size:11px;font-weight:700;color:var(--muted);margin:12px 0 6px;">RECENT ACTIVITY</div>';
+      h += ev.map(e=>{
+        const when = new Date(e.at).toLocaleString(undefined,{month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'});
+        const kind = String(e.result).replace('ACCUM ','');
+        const c = kind==='BUY'?'#9c9':kind==='SELL'?'#e8c07a':'#999';
+        return '<div style="border-bottom:1px solid var(--line);padding:6px 0;font-size:12px;">'
+          + '<div style="display:flex;justify-content:space-between;gap:8px;"><span style="color:'+c+';font-weight:700;">'+esc(kind)+'</span>'
+          + '<span style="color:var(--dim);font-size:11px;">'+esc(when)+'</span></div>'
+          + '<div style="color:var(--dim);font-size:11px;margin-top:2px;line-height:1.45;">'+esc(String(e.skipped||'').slice(0,240))+'</div></div>';
+      }).join('');
+    }
+    el.innerHTML = h;
+  }
+
   async function loadServerLog(){
     const el = document.getElementById('srv-log'); if(!el) return;
     try{
@@ -9947,6 +10020,7 @@ document.addEventListener('click', function(e){
       if(!res.ok){ el.innerHTML = '<div style="font-size:11px;color:var(--dim);">could not read the server log (' + res.status + ')</div>'; return; }
       const st = JSON.parse(await res.text());
       const hb = st.cipher_heartbeat, log = Array.isArray(st.cipher_log) ? st.cipher_log : [];
+      try{ renderAccum(st, log); }catch(err){ }
       let h = '';
       if(hb){
         const age = Math.round((Date.now() - new Date(hb.at).getTime())/60000);

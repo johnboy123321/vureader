@@ -6,7 +6,7 @@ import { pathToFileURL } from 'node:url';
 const src = fs.readFileSync('cipher-agent-valtown.js','utf8');
 const out = path.join(process.cwd(), '.accum-under-test.mjs');
 fs.writeFileSync(out, src.replace(/\n\/\/ ── Node \/ GitHub Actions entry point[\s\S]*$/, '\n') +
-  '\nexport { accumStep, accumLevels, accumUnits, waveTrend, vmcMoneyFlow };\n');
+  '\nexport { accumStep, accumFillPass, accumLevels, accumUnits, waveTrend, vmcMoneyFlow, buildSpotOrder, buildAccumReviewPrompt, parseAccumReview };\n');
 const M = await import(pathToFileURL(out).href);
 let pass=0, fail=0;
 const ok=(n,c,x)=>{c?(pass++,console.log('  ok   '+n)):(fail++,console.log('  FAIL '+n+(x!==undefined?' → '+x:'')));};
@@ -131,17 +131,89 @@ console.log('\n6. Levels are real levels, found only from history given');
   ok('none stacked on top of each other', lv.every((z,i) => lv.every((o,j) => i===j || Math.abs(o.px-z.px)/px >= 0.002)));
   ok('an empty history yields no levels rather than throwing', M.accumLevels(bars.slice(0,5), px, 4).length >= 0);
 }
-console.log('\n7. It is structurally incapable of trading');
+console.log('\n7. The DECISION core cannot trade (the spot rails are a separate, braked layer)');
 {
-  const block = src.slice(src.indexOf('THE ACCUMULATOR (2026-08-19)'), src.indexOf('INSIGHT SCANNER (2026-08-19)'));
-  ok('the module exists', block.length > 500);
-  ok('no order function appears in it', !/execOrder|directOrder|buildOrder|cancelOrder|closeOrderFor|rememberResting|phemexCall/.test(block));
+  // Scope matters: the decision core is what decides to sell and where to buy back. It must be
+  // pure. The spot rails BELOW it legitimately call the venue — that is their whole job — so they
+  // are tested separately in sections 9 and 10 rather than smuggled into this assertion.
+  const block = src.slice(src.indexOf('THE ACCUMULATOR (2026-08-19)'), src.indexOf('SPOT RAILS (2026-08-19)'));
+  ok('the decision core exists', block.length > 500);
+  ok('no order function anywhere in the decision core',
+     !/execOrder|directOrder|buildOrder|cancelOrder|closeOrderFor|rememberResting|phemexCall|sendSpotOrder/.test(block));
+  ok('and no venue I/O at all in it', !/fetch\(|phemexPublic/.test(block));
   const runBlock = src.slice(src.indexOf('THE ACCUMULATOR: a second objective'), src.indexOf('await setJSON(BOOKMAP_KEY'));
-  ok('the run-loop pass only fetches, steps and logs', !/execOrder|directOrder|buildOrder\(/.test(runBlock));
-  ok('it says "measure only" to the user', /Measure only/.test(runBlock));
+  ok('the run loop never touches the FUTURES order path', !/execOrder|directOrder|buildOrder\(/.test(runBlock));
+  ok('it reaches the venue only through the braked spot helper', /sendSpotOrder\(/.test(runBlock));
   ok('it can be switched off', /env\("ACCUM", "1"\)/.test(src));
   ok('the coin is configurable', /env\("ACCUM_COIN", "BTC"\)/.test(src));
   ok('failure cannot break the run', /accumulator failed \(harmless/.test(runBlock));
+}
+console.log('\n8. Intraday fills — every 15-min bar, none missed, none double-counted');
+{
+  const bars = redDotSeries();
+  const a = M.accumStep(null, bars);
+  if (!a.st.open.length) { ok('(no rungs to fill — skipped)', true); }
+  else {
+    const rung = a.st.open[0];
+    const DAYT = bars[bars.length-1].t;
+    const fine = [
+      { t: DAYT + 3600e3,  o: rung.px*1.05, h: rung.px*1.06, l: rung.px*1.02, c: rung.px*1.03 },
+      { t: DAYT + 7200e3,  o: rung.px*1.02, h: rung.px*1.02, l: rung.px*0.98, c: rung.px },   // wick through
+      { t: DAYT + 10800e3, o: rung.px, h: rung.px*1.04, l: rung.px, c: rung.px*1.04 },
+    ];
+    const f = M.accumFillPass(a.st, fine);
+    ok('the 3am wick filled the rung', f.events.some(e => e.kind === 'fill'), JSON.stringify(f.events));
+    ok('the fill is timestamped to the bar, not the day', f.events[0] && f.events[0].at === DAYT + 7200e3);
+    ok('lastFillT advanced to the newest bar', f.st.lastFillT === DAYT + 10800e3);
+    const again = M.accumFillPass(f.st, fine);
+    ok('re-running the same bars fills nothing twice', again.events.length === 0);
+    ok('units only counted once', again.st.units === f.st.units);
+    const noRungs = M.accumFillPass({ units:1, cash:0, open:[], lastFillT:0 }, fine);
+    ok('no resting rungs = no work, no crash', noRungs.events.length === 0);
+  }
+}
+console.log('\n9. SPOT orders — the right product, and never a guessed scale');
+{
+  const prods = { sBTCUSDT: { priceScale: 8, baseValueScale: 8, quoteValueScale: 8 } };
+  const sell = M.buildSpotOrder('BTC', 'Sell', { price: 64000, baseQty: 0.05 }, prods);
+  ok('builds a spot sell', !!sell.order, sell.err);
+  ok('uses the s-prefixed SPOT symbol, not the perp', sell.order.symbol === 'sBTCUSDT');
+  ok('price is scaled to an integer', sell.order.priceEp === Math.round(64000 * 1e8));
+  ok('a SELL carries base quantity (the BTC)', sell.order.baseQtyEv === Math.round(0.05 * 1e8) && sell.order.quoteQtyEv === undefined);
+  const buy = M.buildSpotOrder('BTC', 'Buy', { price: 60000, quoteQty: 500 }, prods);
+  ok('a BUY carries quote amount (the USDT)', buy.order.quoteQtyEv === Math.round(500 * 1e8) && buy.order.baseQtyEv === undefined);
+  ok('unknown symbol is REFUSED, not guessed', !!M.buildSpotOrder('DOGE','Sell',{price:1,baseQty:1},prods).err);
+  ok('missing scales are REFUSED', !!M.buildSpotOrder('BTC','Sell',{price:1,baseQty:1},{ sBTCUSDT:{ priceScale:8 } }).err);
+  ok('a size that rounds to zero is refused', !!M.buildSpotOrder('BTC','Sell',{price:64000,baseQty:1e-12},prods).err);
+  ok('no price is refused', !!M.buildSpotOrder('BTC','Sell',{baseQty:1},prods).err);
+  ok('the futures path is untouched by all this', /phemexCall\("POST", "\/g-orders"/.test(src));
+}
+console.log('\n10. Spot execution has three independent brakes');
+{
+  const fn = src.slice(src.indexOf('async function sendSpotOrder'), src.indexOf('// Units held right now'));
+  ok('KILL switch checked', /CFG\.kill\(\)/.test(fn));
+  ok('notional cap checked', /ACCUM_MAX_USDT/.test(fn));
+  ok('must be explicitly ARMED', /ACCUM_EXEC", "dry"\)\) === "armed"/.test(fn));
+  ok('all three are checked BEFORE the wire call', fn.indexOf('phemexCall') > fn.indexOf('armed'));
+  ok('the venue base URL is still hard-locked to testnet', /const PHEMEX_BASE = "https:\/\/testnet-api\.phemex\.com"/.test(src));
+}
+console.log('\n11. The brain may observe the accumulator, never change it');
+{
+  const p = M.buildAccumReviewPrompt({ units:0.8, cash:1000, open:[{src:'swingLow',px:60000}], sells:3, fills:7, startedAt:'2026-08-19' }, 64000, 'test');
+  ok('the prompt states the benchmark', /1\.0000/.test(p));
+  ok('it shows the live record', /sells 3/.test(p) && /rung fills 7/.test(p));
+  ok('it names the known failure mode', /stranded/.test(p));
+  ok('it demands JSON only', /Reply ONLY this JSON/.test(p));
+  const rv = M.parseAccumReview('sure! {"read":"early","concern":"cash idle","suggestion":"tighter rungs","sampleTooSmall":false} ok');
+  ok('parses through prose', rv && rv.read === 'early' && rv.suggestion === 'tighter rungs');
+  ok('garbage returns null, never throws', M.parseAccumReview('no json here') === null);
+  const block = src.slice(src.indexOf('THE BRAIN OVERSEEING THE ACCUMULATOR'), src.indexOf('// Cause → veto candidate.'));
+  ok('the review block cannot place an order', !/execOrder|sendSpotOrder|buildSpotOrder|phemexCall/.test(block));
+  ok('the review block cannot write a setting', !/setJSON|process\.env\s*\[/.test(block));
+  const runBlock = src.slice(src.indexOf('brain oversight: weekly'), src.indexOf('accumulator review skipped'));
+  ok('a suggestion is logged as advisory only', /would have to win a shadow arm/.test(runBlock));
+  ok('it is rate limited', /ACCUM_REVIEW_DAYS/.test(runBlock));
+  ok('and shares the daily spend cap', /brainBudget/.test(runBlock));
 }
 fs.unlinkSync(out);
 console.log(`\n${pass} passed, ${fail} failed`);
