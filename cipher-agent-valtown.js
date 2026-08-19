@@ -1819,6 +1819,7 @@ function accumStep(state, daily, cfg = {}) {
     trigger = env("ACCUM_TRIGGER", "pump3"),
     pumpPct = null,
     mfGate = String(env("ACCUM_MF_GATE", "1")) === "1",
+    minOrderUsdt = num("ACCUM_MIN_ORDER_USDT", 10),
   } = cfg;
   const st = {
     units: 1, cash: 0, open: [], sells: 0, fills: 0, lastDay: null, startedAt: null, lastFillT: 0,
@@ -1893,9 +1894,6 @@ function accumStep(state, daily, cfg = {}) {
   if (portfolio > 0 && (st.cash + st.units * slicePct * bar.c) / portfolio > maxCashPct) {
     events.push({ kind: "skip", why: "cash ceiling — too much of the stack would be waiting for a dip" }); return { st, events };
   }
-  const levels = accumLevels(daily, bar.c, maxRungs);
-  if (!levels.length) { events.push({ kind: "skip", why: "no level below to buy back at" }); return { st, events }; }
-
   // Only inventory ABOVE the core may be traded. Whatever the signals say, the core is not for sale.
   const tradeable = Math.max(0, st.units - st.coreUnits);
   const sellUnits = tradeable * slicePct;
@@ -1903,6 +1901,24 @@ function accumStep(state, daily, cfg = {}) {
     events.push({ kind: "skip", why: `core floor — ${st.coreUnits.toFixed(5)} of ${st.units.toFixed(5)} units is core and not for sale` });
     return { st, events };
   }
+
+  // ── FIT THE LADDER TO THE VENUE'S MINIMUM (2026-08-19) ─────────────────────────────────────
+  // A ladder is only a ladder if every rung is a placeable order. Phemex rejects spot orders under
+  // a minimum notional (typically ~10 USDT), and at John's funded size a 4-rung ladder came to
+  // $9.99 a rung — every one would have bounced. So the rung COUNT adapts to the money available
+  // rather than being a fixed 4, and if even a single rung cannot clear the minimum the trade is
+  // refused with a plain reason instead of being sent to be rejected.
+  const sliceValue = sellUnits * bar.c;
+  const minOrder = minOrderUsdt;
+  const affordable = Math.floor(sliceValue / minOrder);
+  if (affordable < 1) {
+    events.push({ kind: "skip", why: `slice is only ${sliceValue.toFixed(2)} USDT — below the ${minOrder} USDT minimum order, so there is nothing placeable` });
+    return { st, events };
+  }
+  const rungBudget = Math.min(maxRungs, affordable);
+  const levels = accumLevels(daily, bar.c, rungBudget);
+  if (!levels.length) { events.push({ kind: "skip", why: "no level below to buy back at" }); return { st, events }; }
+
   const proceeds = sellUnits * bar.c * (1 - feeBps / 1e4);
   st.units -= sellUnits; st.cash += proceeds; st.sells++;
   const per = proceeds / levels.length, perUnits = sellUnits / levels.length;
@@ -2022,12 +2038,33 @@ async function spotPreflight(coin) {
     if (w2 && w2.status === 200 && w2.data) out.baseWallet = JSON.stringify(w2.data).slice(0, 200);
     out.walletStatus = w.status;
     const rows = (w.data && (w.data.data || w.data.result)) || [];
-    if (Array.isArray(rows)) {
-      out.balances = rows
+    const all = Array.isArray(rows) ? [...rows] : [];
+    if (w2 && w2.status === 200) {
+      const r2 = (w2.data && (w2.data.data || w2.data.result)) || [];
+      if (Array.isArray(r2)) all.push(...r2);
+    }
+    if (all.length) {
+      out.balances = all
         .filter(r => r && (Number(r.balanceEv) > 0 || Number(r.balance) > 0))
         .map(r => `${r.currency || r.currencyCode || "?"}:${r.balanceEv ?? r.balance}`)
         .slice(0, 8);
-      out.walletRows = rows.length;
+      out.walletRows = all.length;
+      // The real, human-readable balance of the coin we trade. Wallet balances come back as
+      // scaled integers (balanceEv) using the SAME per-currency valueScale as orders do, so the
+      // scale has to be read, never assumed — the identical trap that broke the first preflight.
+      const want = String(coin).toUpperCase();
+      const row = all.find(r => String(r.currency || r.currencyCode || "").toUpperCase() === want);
+      const scale = out.product ? out.product.baseValueScale : NaN;
+      if (row && Number.isFinite(scale)) {
+        const ev = Number(row.balanceEv ?? row.balance);
+        if (Number.isFinite(ev)) out.baseBalance = ev / 10 ** scale;
+      }
+      const qrow = all.find(r => String(r.currency || r.currencyCode || "").toUpperCase() === "USDT");
+      const qscale = out.product ? out.product.quoteValueScale : NaN;
+      if (qrow && Number.isFinite(qscale)) {
+        const ev = Number(qrow.balanceEv ?? qrow.balance);
+        if (Number.isFinite(ev)) out.quoteBalance = ev / 10 ** qscale;
+      }
     } else out.walletShape = typeof rows;
   } catch (e) { out.walletErr = String(e && e.message || e).slice(0, 120); }
   return out;
@@ -3017,6 +3054,23 @@ export default async function cipherAgent() {
       const bars = await fetchCandles(coin, "1D", 260);
       if (bars && bars.length >= 60) {
         let state = await getJSON(ACCUM_KEY, null);
+        // ── SEED FROM THE REAL WALLET (2026-08-19) ─────────────────────────────────────────────
+        // Until the spot wallet was funded this held a virtual 1.0 unit so the maths could be
+        // watched. Now there is a real balance, so the strategy tracks THAT — otherwise the
+        // panel reports a fiction and the order sizes bear no relation to what is actually there.
+        // Seeded once; after that the strategy's own bookkeeping owns the number, because a
+        // mid-cycle wallet read would double-count a slice that is currently sitting in cash.
+        if (PF && Number.isFinite(PF.baseBalance) && PF.baseBalance > 0 && (!state || !state.seededReal)) {
+          const carried = state || {};
+          state = { ...carried, units: PF.baseBalance, cash: Number.isFinite(PF.quoteBalance) ? PF.quoteBalance : 0,
+                    startUnits: PF.baseBalance, coreUnits: null, highWater: PF.baseBalance,
+                    open: [], sells: carried.sells || 0, fills: carried.fills || 0,
+                    seededReal: true, seededAt: new Date().toISOString(), startedAt: carried.startedAt || null };
+          console.log(`accumulator seeded from the real spot wallet: ${PF.baseBalance} ${coin}` +
+                      (Number.isFinite(PF.quoteBalance) && PF.quoteBalance > 0 ? ` + ${PF.quoteBalance} USDT` : ""));
+          await pushLog({ coin, result: "ACCUM SEEDED",
+            skipped: `spot wallet funded — tracking the real balance of ${PF.baseBalance} ${coin} from here. Benchmark is that same number held and never traded.` });
+        }
         const all = [];
 
         // 1) FILLS — every run, against every 15-minute bar closed since the last check, so a
@@ -3070,6 +3124,8 @@ export default async function cipherAgent() {
                                  scales: PF.product ? `${PF.product.priceScale}/${PF.product.baseValueScale}/${PF.product.quoteValueScale}` : null,
                                  spotSymbols: PF.spotSymbolCount || 0, walletStatus: PF.walletStatus ?? null,
                                  balances: PF.balances || [], err: PF.walletErr || PF.productsErr || null,
+                                 baseBalance: Number.isFinite(PF.baseBalance) ? PF.baseBalance : null,
+                                 quoteBalance: Number.isFinite(PF.quoteBalance) ? PF.quoteBalance : null,
                                  exec: String(env("ACCUM_EXEC", "dry")), checkedAt: PF.checkedAt };
 
           // ── brain oversight: weekly, cheap, and it cannot change anything ──────────────────

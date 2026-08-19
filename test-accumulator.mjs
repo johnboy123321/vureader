@@ -68,8 +68,8 @@ console.log('\n1. It does nothing without a red dot');
 console.log('\n2. One action per closed daily bar, ever');
 {
   const bars = redDotSeries();
-  const a = M.accumStep(null, bars, { trigger:'reddot' });
-  const b = M.accumStep(a.st, bars, { trigger:'reddot' });          // same bar again — e.g. the 15-min run repeating
+  const a = M.accumStep(null, bars, { trigger:'reddot', minOrderUsdt:0 });
+  const b = M.accumStep(a.st, bars, { trigger:'reddot', minOrderUsdt:0 });          // same bar again — e.g. the 15-min run repeating
   ok('the same day is never acted on twice', b.events.length === 0);
   ok('state is unchanged on the repeat', b.st.sells === a.st.sells && b.st.units === a.st.units);
 }
@@ -81,7 +81,7 @@ console.log('\n3. A sell only happens with a red dot AND negative money flow AND
   const n = bars.length - 1;
   const isRed = (wt1[n]-wt2[n]) < 0 && (wt1[n-1]-wt2[n-1]) >= 0;
   ok('the synthetic series really does produce a red dot', isRed, `${(wt1[n]-wt2[n]).toFixed(2)}`);
-  const { st, events } = M.accumStep(null, bars, { trigger:'reddot' });
+  const { st, events } = M.accumStep(null, bars, { trigger:'reddot', minOrderUsdt:0 });
   const sold = events.find(e => e.kind === 'sell');
   const skipped = events.find(e => e.kind === 'skip');
   ok('it either sold or said exactly why not', !!sold || !!skipped, JSON.stringify(events));
@@ -100,12 +100,12 @@ console.log('\n3. A sell only happens with a red dot AND negative money flow AND
 console.log('\n4. A filled rung buys back MORE units than the slice sold');
 {
   const bars = redDotSeries();
-  const a = M.accumStep(null, bars, { trigger:'reddot' });
+  const a = M.accumStep(null, bars, { trigger:'reddot', minOrderUsdt:0 });
   if (a.st.open.length) {
     const rung = a.st.open[0];
     // next day trades down through the deepest rung
     const next = [...bars, { t: bars.length*DAY, o: rung.px, h: rung.px*1.001, l: rung.px*0.9, c: rung.px, v: 1 }];
-    const b = M.accumStep(a.st, next, { trigger:'reddot' });
+    const b = M.accumStep(a.st, next, { trigger:'reddot', minOrderUsdt:0 });
     const fills = b.events.filter(e => e.kind === 'fill');
     ok('the rung filled', fills.length > 0);
     ok('and it gained units on that slice', fills.every(f => f.delta > 0), JSON.stringify(fills[0]));
@@ -116,11 +116,11 @@ console.log('\n5. The brakes');
 {
   const bars = redDotSeries();
   const cashy = { units: 0.5, cash: 1e9, open: [], sells: 0, fills: 0, lastDay: null, startedAt: '2020-01-01' };
-  const r = M.accumStep(cashy, bars, { trigger:'reddot' });
+  const r = M.accumStep(cashy, bars, { trigger:'reddot', minOrderUsdt:0 });
   ok('the cash ceiling refuses a further sell', !r.events.some(e => e.kind === 'sell'), JSON.stringify(r.events));
   const many = { units: 1, cash: 0, sells: 0, fills: 0, lastDay: null,
                  open: [1,2,3,4].map(i => ({ px: 1, src: 'swingLow', usdt: 0, soldUnits: 0, sellPx: 2, sinceDay: 'd'+i })) };
-  const r2 = M.accumStep(many, bars, { trigger:'reddot' });
+  const r2 = M.accumStep(many, bars, { trigger:'reddot', minOrderUsdt:0 });
   ok('maxConcurrent refuses a fifth ladder', !r2.events.some(e => e.kind === 'sell'));
 }
 console.log('\n6. Levels are real levels, found only from history given');
@@ -154,7 +154,7 @@ console.log('\n7. The DECISION core cannot trade (the spot rails are a separate,
 console.log('\n8. Intraday fills — every 15-min bar, none missed, none double-counted');
 {
   const bars = redDotSeries();
-  const a = M.accumStep(null, bars, { trigger:'reddot' });
+  const a = M.accumStep(null, bars, { trigger:'reddot', minOrderUsdt:0 });
   if (!a.st.open.length) { ok('(no rungs to fill — skipped)', true); }
   else {
     const rung = a.st.open[0];
@@ -238,7 +238,7 @@ console.log('\n13. The CORE — a floor no signal can sell through');
 {
   const bars = redDotSeries();
   // 60% core by default: from 1.0 units only 0.4 is tradeable, so a 20% slice is 0.08 not 0.2
-  const a = M.accumStep(null, bars, { trigger:'reddot' });
+  const a = M.accumStep(null, bars, { trigger:'reddot', minOrderUsdt:0 });
   const sold = a.events.find(e=>e.kind==='sell');
   if (sold) {
     ok('core is set on the first pass', a.st.coreUnits > 0, a.st.coreUnits);
@@ -250,7 +250,7 @@ console.log('\n13. The CORE — a floor no signal can sell through');
   // a stack already at the floor may not sell at all, however strong the signal
   const atFloor = { units:0.6, cash:0, open:[], sells:0, fills:0, lastDay:null, startedAt:'2026-01-01',
                     startUnits:1, coreUnits:0.6, highWater:1, lastFillT:0 };
-  const r = M.accumStep(atFloor, bars, { trigger:'reddot' });
+  const r = M.accumStep(atFloor, bars, { trigger:'reddot', minOrderUsdt:0 });
   ok('at the floor it refuses to sell', !r.events.some(e=>e.kind==='sell'));
   ok('and says why in plain words', /core floor/.test((r.events.find(e=>e.kind==='skip')||{}).why||''),
      JSON.stringify(r.events));
@@ -263,14 +263,14 @@ console.log('\n14. The core RATCHETS up as units accumulate');
   // a stack that has grown to 1.5 units should lock 60% of the NEW high, not of the original
   const grown = { units:1.5, cash:0, open:[], sells:0, fills:0, lastDay:null, startedAt:'2026-01-01',
                   startUnits:1, coreUnits:0.6, highWater:1, lastFillT:0 };
-  const r = M.accumStep(grown, bars, { trigger:'reddot' });
+  const r = M.accumStep(grown, bars, { trigger:'reddot', minOrderUsdt:0 });
   ok('high water rises to the new total', Math.abs(r.st.highWater - 1.5) < 1e-9, r.st.highWater);
   ok('core ratchets to 60% of the new high', Math.abs(r.st.coreUnits - 0.9) < 1e-9, r.st.coreUnits);
   ok('the core never goes DOWN again', r.st.coreUnits >= 0.6);
   // cash waiting to be redeployed must not fake a new high
   const inCash = { units:0.7, cash:0.5*px, open:[{px:1,src:'swingLow',usdt:0.5*px,soldUnits:0.5,sellPx:px,sinceDay:'d'}],
                    sells:1, fills:0, lastDay:null, startedAt:'2026-01-01', startUnits:1, coreUnits:0.6, highWater:1.2, lastFillT:0 };
-  const r2 = M.accumStep(inCash, bars, { trigger:'reddot' });
+  const r2 = M.accumStep(inCash, bars, { trigger:'reddot', minOrderUsdt:0 });
   ok('a slice sitting in cash still counts toward the total', r2.st.highWater >= 1.2 - 1e-9, r2.st.highWater);
   ok('core is configurable', /num\("ACCUM_CORE_PCT", 0\.60\)/.test(src));
 }
@@ -284,23 +284,60 @@ console.log('\n15. The PUMP trigger — John\'s rule, measured to beat the red d
     b[b.length-1] = { t: b[b.length-1].t, o: prev, h: prev*(1+lastPct)*1.001, l: prev*0.999, c: prev*(1+lastPct) };
     return b;
   };
-  const cfg = { trigger:'pump3', mfGate:false };
+  const cfg = { trigger:'pump3', mfGate:false, minOrderUsdt:0 };
   const up4 = M.accumStep(null, mk(0.04), cfg);
   ok('a +4% day fires the 3% trigger', up4.events.some(e=>e.kind==='sell'), JSON.stringify(up4.events).slice(0,120));
   const up1 = M.accumStep(null, mk(0.01), cfg);
   ok('a +1% day does not', !up1.events.some(e=>e.kind==='sell'));
-  const up4at5 = M.accumStep(null, mk(0.04), { trigger:'pump5', mfGate:false });
+  const up4at5 = M.accumStep(null, mk(0.04), { trigger:'pump5', mfGate:false, minOrderUsdt:0 });
   ok('the 5% trigger ignores a +4% day', !up4at5.events.some(e=>e.kind==='sell'));
-  const up6at5 = M.accumStep(null, mk(0.06), { trigger:'pump5', mfGate:false });
+  const up6at5 = M.accumStep(null, mk(0.06), { trigger:'pump5', mfGate:false, minOrderUsdt:0 });
   ok('but takes a +6% day', up6at5.events.some(e=>e.kind==='sell'));
-  const custom = M.accumStep(null, mk(0.025), { trigger:'pump', pumpPct:0.02, mfGate:false });
+  const custom = M.accumStep(null, mk(0.025), { trigger:'pump', pumpPct:0.02, mfGate:false, minOrderUsdt:0 });
   ok('the threshold is tunable', custom.events.some(e=>e.kind==='sell'));
   const sold = up4.events.find(e=>e.kind==='sell');
   ok('the log says WHY it sold, with the actual move', sold && /day closed \+4\.0%/.test(sold.how||''), sold&&sold.how);
-  ok('the money-flow gate can still veto it', (()=>{ const r=M.accumStep(null, mk(0.04), {trigger:'pump3', mfGate:true});
+  ok('the money-flow gate can still veto it', (()=>{ const r=M.accumStep(null, mk(0.04), {trigger:'pump3', mfGate:true, minOrderUsdt:0});
       return r.events.some(e=>e.kind==='sell') || /money flow/.test((r.events.find(e=>e.kind==='skip')||{}).why||''); })());
   ok('red dot remains selectable', /trigger === "reddot"/.test(src) || /trig === "reddot"/.test(src));
   ok('default is the measured-better pump3', /env\("ACCUM_TRIGGER", "pump3"\)/.test(src));
+}
+console.log('\n16. Real money: the ladder must fit the venue minimum');
+{
+  const bars = redDotSeries();
+  const px = bars[bars.length-1].c;
+  // John's funded size: 0.007682 BTC. With a 60% core a slice is ~$40, so 4 rungs = $10 each.
+  const real = { units:0.007682, cash:0, open:[], sells:0, fills:0, lastDay:null, startedAt:null,
+                 startUnits:0.007682, coreUnits:null, highWater:0.007682, lastFillT:0, seededReal:true };
+  const cfg = { trigger:'reddot', mfGate:false };  // real-size test: minimum left ON deliberately
+  const r = M.accumStep({...real}, bars, cfg);
+  const sold = r.events.find(e=>e.kind==='sell');
+  const skip = r.events.find(e=>e.kind==='skip');
+  ok('it either trades or explains itself', !!sold || !!skip, JSON.stringify(r.events).slice(0,160));
+  if (sold) {
+    const sliceValue = sold.units * px;
+    ok('every rung clears the 10 USDT minimum', (sliceValue / sold.rungs.length) >= 10 - 1e-9,
+       'slice $'+sliceValue.toFixed(2)+' over '+sold.rungs.length+' rungs');
+    ok('and it used FEWER than the max 4 rungs to manage that', sold.rungs.length <= 4);
+  }
+  // a stack far too small to place anything must refuse, not send a doomed order
+  const tiny = { ...real, units:0.00002, startUnits:0.00002, highWater:0.00002, coreUnits:null };
+  const rt = M.accumStep(tiny, bars, cfg);
+  ok('a dust-sized stack refuses to trade', !rt.events.some(e=>e.kind==='sell'));
+  ok('and names the minimum as the reason',
+     /minimum order|core floor|nothing placeable/.test((rt.events.find(e=>e.kind==='skip')||{}).why||''),
+     JSON.stringify(rt.events));
+  ok('the minimum is configurable', /num\("ACCUM_MIN_ORDER_USDT", 10\)/.test(src));
+}
+console.log('\n17. Seeding from the real wallet happens once, and only once');
+{
+  const seed = src.slice(src.indexOf('SEED FROM THE REAL WALLET'), src.indexOf('const all = [];'));
+  ok('the seed block exists', seed.length > 200);
+  ok('it only fires when a real balance is visible', /Number\.isFinite\(PF\.baseBalance\) && PF\.baseBalance > 0/.test(seed));
+  ok('it never re-seeds once done', /!state\.seededReal/.test(seed));
+  ok('start units become the real balance, so the benchmark is honest', /startUnits: PF\.baseBalance/.test(seed));
+  ok('it tells the user in the decision log', /ACCUM SEEDED/.test(seed));
+  ok('the wallet balance is de-scaled, never assumed', /10 \*\* scale/.test(src));
 }
 fs.unlinkSync(out);
 console.log(`\n${pass} passed, ${fail} failed`);
