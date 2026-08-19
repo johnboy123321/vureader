@@ -69,25 +69,57 @@ console.log('\n  ARMING — a second run on the same bars does nothing');
   ok('cursor untouched', b.st.lastT === a.st.lastT);
 }
 
-console.log('\n  IT DOES TRADE ONCE NEW BARS ARRIVE');
+console.log('\n  IT TAKES A POSITION ONCE A NEW BAR CLOSES');
 {
-  // Arm on a prefix, then hand it the full series: only the bars after the cursor may act.
+  // The live arm does NOT replay dots — it asks "coins or cash?" of the newest closed bar and
+  // acts at that bar's price. So one run can produce at most one order, whatever happened in
+  // between. That is the only thing a bot waking every 30-40 minutes can honestly do.
   const armed = M.liveFlipStep(null, BARS.slice(0, 300), '1H', { seedUnits: 1 });
   const run = M.liveFlipStep(armed.st, BARS, '1H', {});
-  ok('acts on the bars that closed after arming', run.events.length > 0, run.events.length);
-  ok('every event is a flip sell or buy',
+  ok('at most one order per run', run.events.length <= 1, run.events.length);
+  ok('any event is a flip sell or buy',
      run.events.every(e => e.kind === 'flip-sell' || e.kind === 'flip-buy'),
-     JSON.stringify([...new Set(run.events.map(e => e.kind))]));
-  ok('no event predates the arming cursor',
-     run.events.every(e => e.at > armed.st.lastT));
+     JSON.stringify(run.events.map(e => e.kind)));
+  ok('it prices at the NEWEST bar, never a stale one',
+     run.events.every(e => e.at === BARS[BARS.length - 1].t && e.px === BARS[BARS.length - 1].c));
   ok('cursor advanced to the newest bar', run.st.lastT === BARS[BARS.length - 1].t);
-  const sells = run.events.filter(e => e.kind === 'flip-sell');
-  ok('a sell carries the proceeds a buy-back would spend',
-     sells.length === 0 || sells.every(e => e.cash > 0), JSON.stringify(sells[0] || {}));
-  ok('a sell sizes in coins, a buy sizes in money',
-     run.events.every(e => e.units > 0 && e.cash > 0));
+  ok('it records which side it wants to be on', run.st.want === true || run.st.want === false, run.st.want);
   ok('never holds coins and cash at once (it is a flip, not a ladder)',
      !(run.st.units > 0 && run.st.cash > 0), `${run.st.units} / ${run.st.cash}`);
+  const sells = run.events.filter(e => e.kind === 'flip-sell');
+  ok('a sell carries the proceeds a buy-back would spend',
+     sells.every(e => e.cash > 0));
+  ok('a sell empties the coin side completely', sells.length === 0 || run.st.units === 0);
+}
+
+console.log('\n  IT ONLY ACTS WHEN THE TARGET DISAGREES WITH WHAT IS HELD');
+{
+  // Find a bar where the strategy wants coins, and one where it wants cash, from the real
+  // indicator rather than by assertion.
+  const probe = M.liveFlipStep(null, BARS, '9Z', { seedUnits: 1 });   // arm to read `want`
+  const wants = probe.st.want;
+  const nextBars = BARS.concat([{ ...BARS[BARS.length - 1], t: BARS[BARS.length - 1].t + H }]);
+
+  // Already on the wanted side → nothing to do.
+  const aligned = wants
+    ? { tf: '9Z', units: 1, cash: 0, trips: 0, sells: 0, lastT: BARS[BARS.length - 1].t, startUnits: 1 }
+    : { tf: '9Z', units: 0, cash: 1000, trips: 0, sells: 0, lastT: BARS[BARS.length - 1].t, startUnits: 1 };
+  const noop = M.liveFlipStep(aligned, nextBars, '9Z', {});
+  ok('already on the right side places nothing', noop.events.length === 0,
+     JSON.stringify(noop.events.map(e => e.kind)));
+
+  // On the wrong side → exactly one order to correct it.
+  const wrong = wants
+    ? { tf: '9Z', units: 0, cash: 1000, trips: 0, sells: 0, lastT: BARS[BARS.length - 1].t, startUnits: 1 }
+    : { tf: '9Z', units: 1, cash: 0, trips: 0, sells: 0, lastT: BARS[BARS.length - 1].t, startUnits: 1 };
+  const fix = M.liveFlipStep(wrong, nextBars, '9Z', {});
+  ok('the wrong side is corrected with exactly one order', fix.events.length === 1,
+     JSON.stringify(fix.events.map(e => e.kind)));
+  ok('and it is the right direction',
+     fix.events[0] && fix.events[0].kind === (wants ? 'flip-buy' : 'flip-sell'),
+     fix.events[0] && fix.events[0].kind);
+  ok('the whole position moves, not a slice',
+     wants ? fix.st.cash === 0 : fix.st.units === 0);
 }
 
 console.log('\n  SWITCHING TIMEFRAME IS A FRESH ARM, NOT A CONTINUATION');

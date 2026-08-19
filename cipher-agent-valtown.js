@@ -2078,34 +2078,71 @@ function accumFlipStep(state, bars, cfg = {}) {
 // its record is the only one that gets to claim anything about live performance.
 const LIVE_FLIP_KEY = "cipher_accum_liveflip";
 
+// ── POSITION TARGET, NOT DOT REPLAY ──────────────────────────────────────────────────────────
+// The paper arms replay every dot as if each could be acted on the instant it printed. A bot that
+// wakes every 30–40 minutes cannot do that, and pretending otherwise is not a small inaccuracy —
+// it would place a LIMIT order at the close of a bar that may be half an hour old, which either
+// never fills (the slice strands in cash: the exact failure this strategy exists to avoid) or
+// fills at a price nothing like the one the book recorded.
+//
+// So the live arm asks a different, answerable question: given the newest closed bar, SHOULD this
+// be holding coins or holding cash? A red dot is wt1 crossing below wt2 and a green dot is the
+// cross back, so "hold coins while wt1 is above wt2" is the same position the dots describe —
+// just sampled when the bot is actually awake, and transacted at a price that is actually current.
+//
+// The consequence is worth stating plainly rather than burying: on fast timeframes this arm will
+// MISS moves the paper arm catches, because dots that open and close between two runs are
+// invisible to it. That gap is real and it grows as the timeframe shortens. It is also honest —
+// the paper 5m number was never achievable by this bot at any fee.
 function liveFlipStep(state, bars, tf, cfg = {}) {
   const { feeBps = num("ACCUM_FEE_BPS", 10), seedUnits = null, seedCash = 0 } = cfg;
   const st = {
     tf: null, units: 0, cash: 0, trips: 0, sells: 0, lastT: 0,
-    startUnits: 0, startedAt: null, armedAt: null,
+    startUnits: 0, startedAt: null, armedAt: null, want: null,
     ...(state || {}),
   };
   const events = [];
   if (!bars || bars.length < 60) return { st, events, why: "not enough bars to arm" };
   const last = bars[bars.length - 1];
+  const { wt1, wt2 } = waveTrend(bars);
+  const n = bars.length - 1;
+  if (!Number.isFinite(wt1[n]) || !Number.isFinite(wt2[n])) return { st, events, why: "indicator not ready" };
+  const wantCoins = wt1[n] > wt2[n];
 
   if (st.tf !== tf) {
     const prev = st.tf;
     st.tf = tf;
     st.lastT = last.t;                 // ← the whole no-replay guarantee is this line
     st.trips = 0; st.sells = 0;
+    st.want = wantCoins;
     st.armedAt = new Date().toISOString();
     st.startedAt = st.armedAt;
     if (seedUnits != null) { st.units = seedUnits; st.cash = seedCash || 0; }
     // The benchmark this arm is judged against: what it started with, held and never traded.
     st.startUnits = st.units + (st.cash || 0) / last.c;
     events.push({ kind: "flip-armed", tf, prev, at: last.t, px: last.c,
-                  units: st.units, cash: st.cash });
+                  units: st.units, cash: st.cash, want: wantCoins ? "coins" : "cash" });
     return { st, events };
   }
 
-  const r = accumFlipStep(st, bars, { feeBps, slicePct: 1 });
-  return { st: r.st, events: r.events };
+  if (!(last.t > (st.lastT || 0))) return { st, events };     // no new bar has closed
+  st.lastT = last.t;
+  st.want = wantCoins;
+  const px = last.c;
+
+  // At most ONE order per run, for the whole position, at the newest price we have.
+  if (!wantCoins && st.units > 0) {
+    const sell = st.units;
+    const proceeds = sell * px * (1 - feeBps / 1e4);
+    st.cash += proceeds; st.units = 0; st.sells++;
+    events.push({ kind: "flip-sell", at: last.t, px, units: sell, cash: proceeds });
+  } else if (wantCoins && st.cash > 0) {
+    const spent = st.cash;
+    const got = (spent / px) * (1 - feeBps / 1e4);
+    st.units += got; st.cash = 0; st.trips++;
+    events.push({ kind: "flip-buy", at: last.t, px, units: got, cash: spent });
+  }
+  return { st, events };
 }
 
 // ═══════════════ SPOT RAILS (2026-08-19) ═══════════════
