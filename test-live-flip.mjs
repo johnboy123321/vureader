@@ -122,6 +122,45 @@ console.log('\n  IT ONLY ACTS WHEN THE TARGET DISAGREES WITH WHAT IS HELD');
      wants ? fix.st.cash === 0 : fix.st.units === 0);
 }
 
+console.log('\n  DUST IS NOT A POSITION');
+{
+  // The first real arm came up with 0.00767931 BTC and 1.2 CENTS of leftover USDT. Left alone,
+  // the next green reading would have tried to buy with $0.012 — under the venue minimum, so
+  // refused, so rolled back, so retried every run forever.
+  const px = BARS[BARS.length - 1].c;
+  const nextBars = BARS.concat([{ ...BARS[BARS.length - 1], t: BARS[BARS.length - 1].t + H }]);
+  const probe = M.liveFlipStep(null, BARS, '9Y', { seedUnits: 1 });
+  const wants = probe.st.want;
+
+  const dusty = { tf: '9Y', units: 0.00767931, cash: 0.012, trips: 0, sells: 0,
+                  lastT: BARS[BARS.length - 1].t, startUnits: 0.00767931 };
+  const r = M.liveFlipStep(JSON.parse(JSON.stringify(dusty)), nextBars, '9Y', {});
+  const bought = r.events.filter(e => e.kind === 'flip-buy');
+  ok('it never tries to buy with dust', bought.length === 0, JSON.stringify(bought));
+  ok('the dust is left alone, not spent', r.st.cash === 0.012 || r.st.units === 0, r.st.cash);
+
+  // A stack worth less than one minimum order should not be sold into a refusal either.
+  const tiny = { tf: '9Y', units: 0.00001, cash: 0, trips: 0, sells: 0,
+                 lastT: BARS[BARS.length - 1].t, startUnits: 0.00001 };
+  const r2 = M.liveFlipStep(tiny, nextBars, '9Y', {});
+  ok('it never tries to sell a sub-minimum stack',
+     r2.events.filter(e => e.kind === 'flip-sell').length === 0,
+     `${(0.00001*px).toFixed(2)} USDT`);
+
+  // …but a real position still trades.
+  const real = wants
+    ? { tf: '9Y', units: 0, cash: 500, trips: 0, sells: 0, lastT: BARS[BARS.length-1].t, startUnits: 1 }
+    : { tf: '9Y', units: 1, cash: 0, trips: 0, sells: 0, lastT: BARS[BARS.length-1].t, startUnits: 1 };
+  const r3 = M.liveFlipStep(real, nextBars, '9Y', {});
+  ok('a position above the minimum still trades', r3.events.length === 1,
+     JSON.stringify(r3.events.map(e => e.kind)));
+
+  ok('the minimum is the venue minimum, not a magic number',
+     /minOrderUsdt = num\("ACCUM_MIN_ORDER_USDT", 10\)/.test(src));
+  ok('holding means the coins outweigh the cash, not that cash is zero',
+     /lf\.holding = \(lf\.units \|\| 0\) \* lpx > \(lf\.cash \|\| 0\)/.test(src));
+}
+
 console.log('\n  SWITCHING TIMEFRAME IS A FRESH ARM, NOT A CONTINUATION');
 {
   const armed = M.liveFlipStep(null, BARS.slice(0, 300), '1H', { seedUnits: 1 });

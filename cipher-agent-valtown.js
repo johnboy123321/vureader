@@ -2099,7 +2099,15 @@ const LIVE_FLIP_KEY = "cipher_accum_liveflip";
 // invisible to it. That gap is real and it grows as the timeframe shortens. It is also honest —
 // the paper 5m number was never achievable by this bot at any fee.
 function liveFlipStep(state, bars, tf, cfg = {}) {
-  const { feeBps = num("ACCUM_FEE_BPS", 10), seedUnits = null, seedCash = 0 } = cfg;
+  // ── DUST IS NOT A POSITION (2026-08-19) ─────────────────────────────────────────────────────
+  // The first live arm came up holding 0.00767931 BTC and 1.2 CENTS of leftover USDT. Treating
+  // any non-zero cash as "in cash" would have reported the arm as sold when it holds the whole
+  // stack, and — far worse — the next green reading would have tried to BUY with $0.012, which
+  // is under the venue's $10 minimum. That order gets refused, the refusal trips the rollback,
+  // and the arm retries the same thing every run forever. So both sides ignore anything too
+  // small to be an order.
+  const { feeBps = num("ACCUM_FEE_BPS", 10), seedUnits = null, seedCash = 0,
+          minOrderUsdt = num("ACCUM_MIN_ORDER_USDT", 10) } = cfg;
   const st = {
     tf: null, units: 0, cash: 0, trips: 0, sells: 0, lastT: 0,
     startUnits: 0, startedAt: null, armedAt: null, want: null,
@@ -2135,12 +2143,12 @@ function liveFlipStep(state, bars, tf, cfg = {}) {
   const px = last.c;
 
   // At most ONE order per run, for the whole position, at the newest price we have.
-  if (!wantCoins && st.units > 0) {
+  if (!wantCoins && st.units * px >= minOrderUsdt) {
     const sell = st.units;
     const proceeds = sell * px * (1 - feeBps / 1e4);
     st.cash += proceeds; st.units = 0; st.sells++;
     events.push({ kind: "flip-sell", at: last.t, px, units: sell, cash: proceeds });
-  } else if (wantCoins && st.cash > 0) {
+  } else if (wantCoins && st.cash >= minOrderUsdt) {
     const spent = st.cash;
     const got = (spent / px) * (1 - feeBps / 1e4);
     st.units += got; st.cash = 0; st.trips++;
@@ -2927,7 +2935,9 @@ async function runAccumulator() {
             const lpx = flipBars[flipTf][flipBars[flipTf].length - 1].c;
             lf.unitsNow = +(lf.units + (lf.cash || 0) / lpx).toFixed(8);
             lf.gainPct = +(((lf.unitsNow / (lf.startUnits || lf.unitsNow || 1)) - 1) * 100).toFixed(2);
-            lf.holding = (lf.cash || 0) <= 0;
+            // "Holding" means the coins are what it owns, not that its cash is exactly zero —
+            // a cent of leftover USDT does not make a stack of BTC into a cash position.
+            lf.holding = (lf.units || 0) * lpx > (lf.cash || 0);
             await setJSON(LIVE_FLIP_KEY, lf);
             // ONE TRUTH about what is actually held. While the flip owns the coins the ladder's
             // own book would otherwise sit frozen at the handover figures, and every downstream
