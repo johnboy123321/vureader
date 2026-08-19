@@ -1411,7 +1411,7 @@ body.layout-edit #layout-bar { display:flex; flex-wrap:wrap; justify-content:cen
   <div class="kb-box">
     <div class="kb-title">Accumulator <button class="s-close" onclick="toggleAccum()">✕</button><button class="s-close" style="right:52px;font-size:13px;" onclick="loadAccum()" title="Refresh — re-read the bot's state">⟳</button></div>
     <div style="font-size:12px;color:var(--dim);margin-bottom:12px;line-height:1.5;">
-      A different scoreboard from every other panel here: this one is counted in <b>coins, not pounds</b>. It sells a slice on a daily VuManChu red dot when money flow is negative, then ladders buy-backs at real levels below — swing lows, order blocks, unfilled gaps. The benchmark is not a profit target, it is the flat <b>1.00000</b> units you would hold by doing nothing at all. Under that line means it has cost you Bitcoin.
+      A different scoreboard from every other panel here: this one is counted in <b>coins, not pounds</b>. It sells a slice when BTC closes up sharply and money flow is negative — the threshold is shown as the <b>trigger</b> below — then ladders buy-backs at real levels beneath: swing lows, order blocks, unfilled gaps. The benchmark is not a profit target, it is simply <b>the balance you started with</b>, held and never traded. Under that line means it has cost you Bitcoin.
     </div>
     <div id="accum-panel"><div style="font-size:11px;color:var(--dim);">Loading…</div></div>
     <div style="font-size:10px;color:var(--dim);margin-top:14px;line-height:1.5;">
@@ -10037,6 +10037,10 @@ document.addEventListener('click', function(e){
     // Sell the lot on a red dot, buy it all back on a green one. Shown for 5m through 1D together
     // rather than one being switched on, because the point is to SEE which timeframe survives its
     // own trading costs. Measure-only: it places nothing.
+    if(!a.flips || !Object.keys(a.flips).length){
+      h += '<div style="font-size:11px;font-weight:700;color:var(--muted);margin:12px 0 6px;">DOT FLIP — GREEN BUYS, RED SELLS</div>'
+        +  '<div class="bot-why" style="color:var(--dim);">Waiting for the bot\'s next run to populate 5m through 1D. It runs every 30–40 minutes.</div>';
+    }
     if(a.flips && Object.keys(a.flips).length){
       const ORDER=['5m','15m','30m','1H','2H','3H','4H','1D'];
       h += '<div style="font-size:11px;font-weight:700;color:var(--muted);margin:12px 0 6px;">DOT FLIP — GREEN BUYS, RED SELLS (measured, places nothing)</div>';
