@@ -9248,7 +9248,36 @@ document.addEventListener('click', function(e){
   // record that decides (automatically, no review step) whether the brain earns the gate:
   // Phase 2 promotes it once 20+ graded verdicts beat the numeric record. Runs in ALL
   // modes including LEDGER, so the sample builds even before real money.
-  const BRAIN_LS='mc_exec_brainlog', BRAIN_PROMOTE_N=20, VERDICT_V=2; // v2 = blind judgement prompt
+  const BRAIN_LS='mc_exec_brainlog', BRAIN_PROMOTE_N=20, VERDICT_V=3; // v3 = blind judgement + inert labels
+  // ── THE TRAINING VOCABULARY (2026-08-20) ────────────────────────────────────────────────────
+  // From John and Codex's brain packs. Held here as a FIXED vocabulary so the brain picks from a
+  // closed list instead of inventing terms — free-text labels across a small sample is how a
+  // system finds patterns that are not there.
+  //
+  // Wired to NOTHING. These labels do not filter, score, size, gate, promote or demote anything.
+  // gateLive() and the brain-vs-bot comparison are untouched and must stay untouched: the whole
+  // point is to be accumulating clean forward data now, so that IF a hypothesis is ever worth
+  // testing there is a record to test it against. You cannot backfill a label you never recorded.
+  //
+  // The four axes are kept separate on purpose. A good signal can have a bad entry; a working
+  // order path can flatter a weak strategy. Blending them is how a bot learns the wrong lesson.
+  const BRAIN_VOCAB = {
+    signal_family: ['confluence','divergence','rollover','green_dot','continuation','reversal','trap','imbalance','structure_break','unknown'],
+    pattern_tags: ['bull_flag','bear_flag','flag_retest','flag_fakeout','abcd_continuation','abcd_completion_reversal','abcd_late_d',
+                   'bullish_fvg','bearish_fvg','fvg_retest','fvg_unfilled','fvg_filled_failed',
+                   'head_shoulders_top','inverse_head_shoulders','neckline_break','neckline_retest',
+                   'bull_trap','bear_trap','liquidity_sweep_high','liquidity_sweep_low',
+                   'engulfing_bull','engulfing_bear','pinbar_bull','pinbar_bear','dragonfly_doji','gravestone_doji',
+                   'golden_cross','death_cross','ema_trend_aligned','ema_countertrend',
+                   'demand_zone','supply_zone','order_block_retest','order_block_rejection'],
+    market_context: ['trend_aligned','countertrend','range','chop','breakout','fakeout','exhaustion','compression','post_impulse','range_high','range_low','range_mid_chop'],
+    entry_state: ['early','fresh','acceptable','late','chased','missed_pullback','invalid'],
+    risk_state: ['clean_stop','stop_beyond_structure','stop_inside_noise','stop_too_tight_for_costs','stop_too_wide_for_signal','poor_rr','clamped_size','no_trade'],
+    confidence: ['low','medium','high'],
+  };
+  const BRAIN_VOCAB_TEXT = Object.entries(BRAIN_VOCAB).map(([k,v])=>k+': '+v.join('|')).join('\n');
+  // Learning labels are assigned AFTER the outcome is known, not by the pre-trade verdict.
+  const BRAIN_LEARNING_LABELS = ['clean_win','clean_loss','entry_late','entry_too_early','stopped_before_thesis','target_too_far','stop_too_tight','signal_failed','execution_artifact','insufficient_data'];
   function brainLog(){ try{ return JSON.parse(get(BRAIN_LS,'[]'))||[]; }catch{ return []; } }
   // One-time purge: v1 verdicts were made while the brain could see the numeric rule and just
   // echoed it ("score 5 below minimum 8"). Ungraded ones are dropped so the record starts clean;
@@ -9300,10 +9329,18 @@ document.addEventListener('click', function(e){
         // exit rule behind the figure. Now it can, and is asked to check the arithmetic.
         +'IMPORTANT — audit the numbers: any win-rate/expectancy figure in the setup text comes from a backtest that exits at 2R with a 1× stop. It does NOT describe a 1:1 trade. Check the quoted edge is consistent with the exit the bot is actually taking, and say so if it is not. A 35% win rate is profitable at 2R (+0.14R) but loses at 1:1 (−0.30R).\n'
         +'Would YOU put money on this? Judge the setup, the levels and the risk/reward — not any rule or threshold.\n'
-        +'Reply with ONLY this JSON, nothing else: {"verdict":"TAKE"|"PASS"|"RESIZE","size":<0.25-1, only if RESIZE>,"reason":"<one plain sentence about THIS setup, max 20 words — never mention scores, minimums or thresholds>"}. No bare wait — commit.';
+        +'Reply with ONLY this JSON, nothing else: {"verdict":"TAKE"|"PASS"|"RESIZE","size":<0.25-1, only if RESIZE>,"reason":"<one plain sentence about THIS setup, max 20 words — never mention scores, minimums or thresholds>"'
+        // ── LABELS, SECONDARY AND INERT (2026-08-20) ────────────────────────────────────────
+        // Asked for AFTER the verdict so a malformed label block can never cost us the verdict,
+        // and explicitly told these change nothing — a brain that thinks its labels gate trades
+        // will label defensively rather than honestly.
+        +',"labels":{"signal_family":"","pattern_tags":[],"market_context":[],"entry_state":"","risk_state":"","confidence":""}}.\n'
+        +'The labels are for a research record ONLY. They do not affect this trade, your verdict, sizing, or any rule. Label what you SEE, not what you want the outcome to be. Use ONLY these exact values, and leave a field empty or the array empty rather than guessing:\n'
+        +BRAIN_VOCAB_TEXT+'\n'
+        +'A pattern is context, not a reason to trade. No bare wait — commit.';
       const res=await fetch('https://api.anthropic.com/v1/messages',{ method:'POST',
         headers:{'Content-Type':'application/json','x-api-key':key,'anthropic-version':'2023-06-01','anthropic-dangerous-direct-browser-access':'true'},
-        body:JSON.stringify({ model:(typeof modelFor==='function')?modelFor('light'):'claude-haiku-4-5-20251001', max_tokens:120, system:sys, messages:[{role:'user',content:user}] }) });
+        body:JSON.stringify({ model:(typeof modelFor==='function')?modelFor('light'):'claude-haiku-4-5-20251001', max_tokens:300, system:sys, messages:[{role:'user',content:user}] }) });
       if(!res.ok) return;
       const txt=((typeof extractText==='function')?extractText(await res.json()):'')||'';
       const m=String(txt).match(/\{[\s\S]*\}/); if(!m) return;
@@ -9311,8 +9348,23 @@ document.addEventListener('click', function(e){
       const verdict=String(v.verdict||'').toUpperCase();
       if(verdict!=='TAKE'&&verdict!=='PASS'&&verdict!=='RESIZE') return;
       const l=brainLog();
+      // Labels are parsed defensively and clamped to the vocabulary. A model that invents a term
+      // gets it dropped rather than stored — an unknown label in the record is worse than none,
+      // because it looks like data. Missing labels are simply absent; nothing depends on them.
+      const pick=(field,val)=>{ const allow=BRAIN_VOCAB[field]||[]; const one=String(val||'').trim().toLowerCase(); return allow.includes(one)?one:''; };
+      const pickMany=(field,val)=>{ const allow=BRAIN_VOCAB[field]||[]; return (Array.isArray(val)?val:[]).map(x=>String(x||'').trim().toLowerCase()).filter(x=>allow.includes(x)).slice(0,6); };
+      let labels=null;
+      try{ const L=v&&v.labels; if(L&&typeof L==='object'){
+        labels={ signal_family:pick('signal_family',L.signal_family), pattern_tags:pickMany('pattern_tags',L.pattern_tags),
+                 market_context:pickMany('market_context',L.market_context), entry_state:pick('entry_state',L.entry_state),
+                 risk_state:pick('risk_state',L.risk_state), confidence:pick('confidence',L.confidence) };
+        // dropped: anything the model said that is not in the vocabulary, counted so drift is visible
+        const said=(Array.isArray(L.pattern_tags)?L.pattern_tags.length:0);
+        labels.dropped_tags=Math.max(0,said-labels.pattern_tags.length);
+      } }catch{ labels=null; }
       l.unshift({ id:t.id, at:new Date().toISOString(), coin:t.coin, dir:t.dir||'long', entry:t.entry, sl:t.sl, tp1:t.tp1, score, source:t.source||'',
         botTook, verdict, v:VERDICT_V, size:(verdict==='RESIZE'&&Number.isFinite(+v.size))?+v.size:null, reason:String(v.reason||'').slice(0,140),
+        labels, learning_label:null,
         outcome:null, result:null, brainRight:null, botRight:null });
       const entry=l[0];
       saveBrainLog(l);
@@ -9349,6 +9401,26 @@ document.addEventListener('click', function(e){
         const brainSaidTake=(e.verdict!=='PASS');
         e.brainRight=(brainSaidTake===won);   // TAKE/RESIZE right iff it won; PASS right iff it lost
         e.botRight=(!!e.botTook===won);       // same test for the numeric path, same trades
+        // ── THE OUTCOME-SIDE LABEL (2026-08-20) ──────────────────────────────────────────
+        // Assigned here, not by the pre-trade verdict, because it is the one label that needs
+        // to know what happened. It is recorded and consumed by nothing — brainRight and
+        // botRight above are unchanged and stay the only things the gate ever reads.
+        //
+        // `execution_artifact` is the important value. A trade that never filled, or that was
+        // closed by hand, says nothing about whether the setup was any good, and letting it
+        // into the signal record is exactly the mistake the four-way split exists to prevent.
+        try{
+          const R=Number(t.result);
+          const noFill=(t.status==='closed'&&!Number.isFinite(R));
+          const byHand=!!(t.closedByHand||t.manualClose);
+          e.learning_label =
+            (noFill||byHand)              ? 'execution_artifact'
+          : (t.status==='win')            ? 'clean_win'
+          : (t.status==='loss'&&Number.isFinite(R)&&R<=-0.95) ? 'clean_loss'
+          : (t.status==='loss')           ? 'stopped_before_thesis'
+          : Number.isFinite(R)            ? (R>0?'clean_win':'clean_loss')
+          :                                 'insufficient_data';
+        }catch(x){ e.learning_label='insufficient_data'; }
         dirty=true;
       });
       if(dirty) saveBrainLog(l);
@@ -9377,6 +9449,42 @@ document.addEventListener('click', function(e){
       if(n){ try{ const bp=document.getElementById('bot-panel'); if(bp&&bp.classList.contains('show')) renderBot(); }catch{} }
       return n;
     }catch(e){ return 0; }
+  }
+  // ── WHAT THE LABEL PILE LOOKS LIKE (2026-08-20) ─────────────────────────────────────────────
+  // Counting is all this does. Exposed so John can watch the record build and, when a hypothesis
+  // is finally worth testing, see immediately whether there is enough of it to test with.
+  // Deliberately reports the SAMPLE alongside every count: a tag with n=3 is an anecdote.
+  function brainLabelStats(){
+    const l=brainLog(), withLabels=l.filter(e=>e.labels);
+    const tally=(get)=>{ const m={}; for(const e of withLabels){ for(const v of [].concat(get(e)||[])) if(v) m[v]=(m[v]||0)+1; } return m; };
+    const graded=l.filter(e=>e.learning_label);
+    return {
+      total:l.length, labelled:withLabels.length, graded:graded.length,
+      dropped:withLabels.reduce((a,e)=>a+(e.labels.dropped_tags||0),0),
+      signal_family:tally(e=>e.labels.signal_family),
+      pattern_tags:tally(e=>e.labels.pattern_tags),
+      market_context:tally(e=>e.labels.market_context),
+      entry_state:tally(e=>e.labels.entry_state),
+      risk_state:tally(e=>e.labels.risk_state),
+      learning_label:(()=>{ const m={}; for(const e of graded) m[e.learning_label]=(m[e.learning_label]||0)+1; return m; })(),
+      // The only number that matters yet: how far off a testable sample are we?
+      readyAt:60, note:'Recorded only. Nothing here filters, scores, sizes, gates, promotes or demotes.',
+    };
+  }
+  function brainLabelReport(){
+    const s=brainLabelStats();
+    const top=(m)=>Object.entries(m).sort((a,b)=>b[1]-a[1]).slice(0,6).map(([k,v])=>k+' '+v).join(', ')||'—';
+    return [
+      'LABEL RECORD — inert, accumulating',
+      '  verdicts '+s.total+' · labelled '+s.labelled+' · outcome-graded '+s.graded+(s.dropped?' · '+s.dropped+' invented tags dropped':''),
+      '  signal family : '+top(s.signal_family),
+      '  patterns      : '+top(s.pattern_tags),
+      '  context       : '+top(s.market_context),
+      '  entry state   : '+top(s.entry_state),
+      '  risk state    : '+top(s.risk_state),
+      '  outcome label : '+top(s.learning_label),
+      '  nothing above changes a single trade. 60 per hypothesis before anything is testable.',
+    ].join('\n');
   }
   function brainScore(){
     const g=brainLog().filter(e=>e.outcome);
@@ -10262,7 +10370,7 @@ document.addEventListener('click', function(e){
 
   function refreshServerPanel(){ loadServerConfig(); loadServerLog(); }
 
-  window.CipherExec={ setServerMode, toggleServerKill, saveServerConfig, refreshServerPanel, loadServerConfig, loadServerLog, onTrade, panic, status, renderPill, renderBot, buildOrder, testFire, logDecision:pushLog, shadowVerdict, gradeBrain, brainScore, getBrainLog:brainLog, gateLive, setBrainGate:g=>set('mc_brain_gate',g), symOK, rejudgeOpen, symbols:()=>String(get('mc_exec_symbols','BTC,ETH,SOL')).split(',').map(s=>s.trim().toUpperCase()), setUrl:u=>set(LS.url,u), setToken:t=>set(LS.token,t), setMode:m=>{set(LS.mode,m);renderPill();}, setMinScore:s=>set(LS.min,String(s)), setRisk:r=>set(LS.risk,String(r)), getLog:()=>{ try{ return JSON.parse(get(LS.log,'[]')); }catch{ return []; } } };
+  window.CipherExec={ setServerMode, toggleServerKill, saveServerConfig, refreshServerPanel, loadServerConfig, loadServerLog, onTrade, panic, status, renderPill, renderBot, buildOrder, testFire, logDecision:pushLog, shadowVerdict, gradeBrain, brainScore, brainLabelStats, brainLabelReport, getBrainLog:brainLog, gateLive, setBrainGate:g=>set('mc_brain_gate',g), symOK, rejudgeOpen, symbols:()=>String(get('mc_exec_symbols','BTC,ETH,SOL')).split(',').map(s=>s.trim().toUpperCase()), setUrl:u=>set(LS.url,u), setToken:t=>set(LS.token,t), setMode:m=>{set(LS.mode,m);renderPill();}, setMinScore:s=>set(LS.min,String(s)), setRisk:r=>set(LS.risk,String(r)), getLog:()=>{ try{ return JSON.parse(get(LS.log,'[]')); }catch{ return []; } } };
   if(document.readyState==='loading') document.addEventListener('DOMContentLoaded',renderPill); else renderPill();
 })();
 </script>
