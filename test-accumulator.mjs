@@ -203,7 +203,11 @@ console.log('\n10. Spot execution has three independent brakes');
   ok('notional cap checked', /ACCUM_MAX_USDT/.test(fn));
   // Armed by instruction 2026-08-19, so the DEFAULT is now "armed". The assertion that still
   // matters is that a single explicit value stands it down, and that the other brakes are intact.
-  ok('the arm switch exists and is checked', /ACCUM_EXEC", "armed"\)\) === "armed"/.test(fn));
+  // Updated 2026-08-20: this used to pin the default at "armed", which is the thing Codex's
+  // review flagged — a test can enforce a bug as easily as a feature. It now pins the SAFE
+  // direction, so a drift back to arming-by-default turns this suite red.
+  ok('the arm switch exists and is checked', /ACCUM_EXEC", "dry"\)\) === "armed"/.test(fn));
+  ok('and it defaults to dry, so arming must be stated in the workflow', !/ACCUM_EXEC", "armed"/.test(fn));
   ok('setting ACCUM_EXEC to anything else stands it down', /const armed = String\(env\("ACCUM_EXEC"[^)]*\)\) === "armed"/.test(fn));
   ok('the cap was raised to clear a full-stack slice', /num\("ACCUM_MAX_USDT", 200\)/.test(src));
   ok('all three are checked BEFORE the wire call', fn.indexOf('phemexCall') > fn.indexOf('armed'));

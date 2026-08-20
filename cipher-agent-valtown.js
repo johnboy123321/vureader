@@ -2276,8 +2276,14 @@ function liveFlipStep(state, bars, tf, cfg = {}) {
 // from the venue, the order is refused.
 //
 // IMPORTANT, stated plainly: this code has NOT been exercised against the live venue — Phemex is
-// unreachable from the machine it was written on. It is DRY by default (ACCUM_EXEC=dry) and logs
-// the exact payload it would send. The first armed run must be watched.
+// unreachable from the machine it was written on.
+//
+// ── CORRECTED 2026-08-20, after Codex's review ──────────────────────────────────────────────
+// This comment used to claim "It is DRY by default (ACCUM_EXEC=dry)". That was false, and had
+// been false since the accumulator was armed. The default below is now genuinely "dry", and the
+// arming lives in ONE auditable place: ACCUM_EXEC in .github/workflows/cipher-agent.yml.
+// A safety note that lies is worse than no safety note — anyone auditing this file would have
+// concluded the spot path could not place an order, and been wrong.
 const SPOT_KEY = "cipher_spot_products";
 let _spotProducts = null;
 
@@ -2446,7 +2452,10 @@ async function sendSpotOrder(order, notionalUsdt, opts = {}) {
   // stack does not make it smaller, it makes it BROKEN: the order is silently skipped while the
   // strategy's book records a sell that never happened. A cap that turns a live strategy into a
   // fiction is worse than no cap, so the flip gets its own, set above the stack on purpose.
-  const armed = String(env("ACCUM_EXEC", "armed")) === "armed";
+  // DEFAULT IS DRY (2026-08-20). It was "armed", which meant any deploy of this file anywhere
+  // started able to place real spot orders with nothing stating that intent. Arming is now an
+  // explicit ACCUM_EXEC=armed in the workflow — one place, auditable, greppable.
+  const armed = String(env("ACCUM_EXEC", "dry")) === "armed";
   const cap = opts.cap != null ? opts.cap : num("ACCUM_MAX_USDT", 200);
   if (CFG.kill()) return { dry: true, why: "KILL switch is on", order };
   if (!(notionalUsdt <= cap)) return { dry: true, why: `notional ${notionalUsdt.toFixed(2)} over the ACCUM_MAX_USDT cap ${cap}`, order };
@@ -3111,7 +3120,7 @@ async function runAccumulator() {
             // with the wallet still holding coins the strategy thinks it converted to cash.
             // So an arm that cannot possibly execute is refused up front and said out loud.
             const capUsdt = num("ACCUM_FLIP_MAX_USDT", 1500);
-            const armedExec = String(env("ACCUM_EXEC", "armed")) === "armed";
+            const armedExec = String(env("ACCUM_EXEC", "dry")) === "armed";
             let outOfSync = false;
             // ── THE WALLET IS THE ARBITER (2026-08-19) ──────────────────────────────────────
             // Found live: the book said 0.00767931 BTC while the spot wallet held 0.00000031.
@@ -3270,17 +3279,17 @@ async function runAccumulator() {
           // Benchmark is the STARTING balance, not 1.0 — see the same fix in the app panel.
           const startU = Number(state.startUnits) > 0 ? Number(state.startUnits) : 1;
           const gainPct = (units / startU - 1) * 100;
-          console.log(`accumulator (${coin} SPOT, core ${(state.coreUnits || 0).toFixed(8)}, ${String(env("ACCUM_EXEC", "armed")) === "armed" ? "ARMED" : "measure only"}): ${units.toFixed(8)} units vs buy-and-hold ${startU.toFixed(8)} — ${gainPct >= 0 ? "+" : ""}${gainPct.toFixed(2)}% since ${since} · ${state.sells} sells, ${state.fills} fills · resting: ${resting}`);
+          console.log(`accumulator (${coin} SPOT, core ${(state.coreUnits || 0).toFixed(8)}, ${String(env("ACCUM_EXEC", "dry")) === "armed" ? "ARMED" : "measure only"}): ${units.toFixed(8)} units vs buy-and-hold ${startU.toFixed(8)} — ${gainPct >= 0 ? "+" : ""}${gainPct.toFixed(2)}% since ${since} · ${state.sells} sells, ${state.fills} fills · resting: ${resting}`);
           state.unitsNow = +units.toFixed(6); state.pxNow = px;
           state.trigger = env("ACCUM_TRIGGER", "pump1");
-          state.exec = String(env("ACCUM_EXEC", "armed"));
+          state.exec = String(env("ACCUM_EXEC", "dry"));
           if (PF) state.spot = { ready: PF.ready, why: PF.why, symbol: PF.symbol, hasProduct: !!PF.product,
                                  scales: PF.product ? `${PF.product.priceScale}/${PF.product.baseValueScale}/${PF.product.quoteValueScale}` : null,
                                  spotSymbols: PF.spotSymbolCount || 0, walletStatus: PF.walletStatus ?? null,
                                  balances: PF.balances || [], err: PF.walletErr || PF.productsErr || null,
                                  baseBalance: Number.isFinite(PF.baseBalance) ? PF.baseBalance : null,
                                  quoteBalance: Number.isFinite(PF.quoteBalance) ? PF.quoteBalance : null,
-                                 exec: String(env("ACCUM_EXEC", "armed")), checkedAt: PF.checkedAt };
+                                 exec: String(env("ACCUM_EXEC", "dry")), checkedAt: PF.checkedAt };
 
           // ── brain oversight: weekly, cheap, and it cannot change anything ──────────────────
           // Only when something has actually happened (a sell or a fill), at most once every
