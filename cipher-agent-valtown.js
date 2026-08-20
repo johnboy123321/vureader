@@ -1215,22 +1215,105 @@ async function adoptOrphans(nowOpen, bookMap) {
 
 // Anything in the previous snapshot that is no longer open has resolved. Classify it by where
 // price ended up relative to the plan — target side, stop side, or neither.
-function resolvedSince(prev, now, priceOf) {
+// ═══════════ FOUR SEPARATE QUESTIONS, NOT ONE VERDICT (2026-08-20) ═══════════
+// Adopted from John and Codex's training pack, and it fixes a defect this bot has had all along.
+//
+// The old version asked one question — "how did it end?" — and answered it by comparing the
+// CURRENT price to the plan. Three things were wrong with that:
+//
+//   1. It graded a position the bot never closed. Every exit that was not a venue-side stop or
+//      target fill is somebody else's decision, and inferring "closed in profit / at a loss"
+//      from a price up to forty minutes stale is a guess wearing a fact's clothes. Those guesses
+//      then fed the circuit breaker: close a winner by hand, watch price dip under your entry
+//      before the bot woke, and it recorded a LOSS and moved you a third of the way to a
+//      twelve-hour trading pause.
+//   2. It used a snapshot, not a range. Price can touch the target and retrace before the bot
+//      looks; the old code would call that "closed" and throw away a real win.
+//   3. It blended the four things that have to stay apart. A rejected order, a late entry and a
+//      wrong thesis all arrived as one number. Today alone we had two execution failures — an
+//      INSUFFICIENT_BASE_BALANCE and a Cloudflare 502 — that say nothing whatever about whether
+//      the signal was right, and under the old scheme they were indistinguishable from being
+//      wrong about the market.
+//
+// So each resolution now carries four independent labels, and — the part that matters — a
+// `klass` of "strategy" or "execution_artifact". Only strategy outcomes are allowed to touch the
+// breaker or the shadow ledger. An artifact is recorded in full and counted in nothing.
+//
+// `rangeOf(coin)` gives the high/low since the position was last seen, so a target that was hit
+// and given back is still a target. Callers that cannot supply a range may omit it and fall back
+// to the snapshot, which is weaker but never silently pretends otherwise.
+const RESOLUTION_CLASSES = ["strategy", "execution_artifact"];
+
+function resolvedSince(prev, now, priceOf, rangeOf) {
   const out = [];
   for (const k of Object.keys(prev || {})) {
     if (now[k]) continue;                                   // still open
     const was = prev[k], px = priceOf(was.coin);
-    let how = "closed";
-    if (was.plan && Number.isFinite(px)) {
-      const { entry, stop, target } = was.plan;
-      const isLong = was.dir !== "short";
-      if (Number.isFinite(target) && (isLong ? px >= target : px <= target)) how = "target";
-      else if (Number.isFinite(stop) && (isLong ? px <= stop : px >= stop)) how = "stop";
-      else if (Number.isFinite(entry)) how = (isLong ? px > entry : px < entry) ? "closed in profit" : "closed at a loss";
-    }
-    out.push({ ...was, how, exit: px });
+    const range = typeof rangeOf === "function" ? rangeOf(was.coin) : null;
+    out.push({ ...was, ...classifyResolution(was, px, range), exit: px });
   }
   return out;
+}
+
+// PURE. Position + last price + the range it traded through = the four labels.
+function classifyResolution(was, px, range) {
+  const isLong = was.dir !== "short";
+  const plan = was.plan;
+
+  // No plan at all: the bot was never managing this, so it can say nothing about it.
+  if (!plan) {
+    return { how: "closed", outcome: "unattributed", klass: "execution_artifact",
+             execution: was.unprotected ? "unprotected_no_plan" : "no_plan",
+             why: "held with no plan — nothing to grade it against",
+             countsForStreak: false, countsForStats: false };
+  }
+
+  const { entry, stop, target } = plan;
+  const haveRange = !!(range && Number.isFinite(range.hi) && Number.isFinite(range.lo));
+  // With a range we ask "did price TRADE THROUGH this level" — the honest question. Without one
+  // we fall back to the old snapshot comparison, which is weaker (it cannot see a target that was
+  // hit and given back) and is labelled as such rather than quietly passed off as equivalent.
+  const touched = haveRange
+    ? (lvl) => Number.isFinite(lvl) && lvl <= range.hi && lvl >= range.lo
+    : (lvl) => Number.isFinite(lvl) && Number.isFinite(px) && (isLong ? px >= lvl : px <= lvl);
+  const hitTarget = touched(target);
+  // On the snapshot path a long sitting below its stop also sits below its target, so test the
+  // stop the other way round or every stop-out would read as a target miss.
+  const hitStop = haveRange
+    ? (Number.isFinite(stop) && stop <= range.hi && stop >= range.lo)
+    : (Number.isFinite(stop) && Number.isFinite(px) && (isLong ? px <= stop : px >= stop));
+
+  // Both touched in the same window and we cannot know the order. Saying "win" or "loss" here
+  // would be a coin toss recorded as evidence, which is worse than admitting we do not know.
+  if (hitTarget && hitStop) {
+    return { how: "ambiguous", outcome: "unattributed", klass: "execution_artifact",
+             execution: "both_levels_touched",
+             why: "price traded through both the stop and the target between two runs — the order cannot be recovered",
+             countsForStreak: false, countsForStats: false };
+  }
+  if (hitTarget) {
+    return { how: "target", outcome: "win", klass: "strategy",
+             execution: haveRange ? "filled" : "filled_snapshot_only",
+             why: haveRange ? "price traded through the target" : "price was at or beyond the target when we looked",
+             countsForStreak: true, countsForStats: true };
+  }
+  if (hitStop) {
+    return { how: "stop", outcome: "loss", klass: "strategy",
+             execution: haveRange ? "filled" : "filled_snapshot_only",
+             why: haveRange ? "price traded through the stop" : "price was at or beyond the stop when we looked",
+             countsForStreak: true, countsForStats: true };
+  }
+
+  // Gone, but at neither of its own levels. By elimination somebody closed it by hand (or the
+  // venue did). Direction is recorded for information; it counts toward nothing, because the
+  // exit price the bot can see is not the price it was closed at.
+  const dir = Number.isFinite(entry) && Number.isFinite(px)
+    ? ((isLong ? px > entry : px < entry) ? "was in profit when we looked" : "was in loss when we looked")
+    : "no entry recorded";
+  return { how: "closed_by_hand", outcome: "unattributed", klass: "execution_artifact",
+           execution: "closed_off_plan",
+           why: `closed at neither the stop nor the target — ${dir}. Not the bot's exit, so it grades nothing.`,
+           countsForStreak: false, countsForStats: false };
 }
 
 // ═══════════════ TWO BOOKS: fast and swing (2026-08-16) ═══════════════
@@ -2632,6 +2715,110 @@ function vetoCandidates(records) {
   return out.sort((a, b) => b.n - a.n);
 }
 
+// ═══════════════ THE ENTRY LAB (2026-08-20) ═══════════════
+// From John and Codex's pack, cut from eight arms to three for a reason that is arithmetic
+// rather than taste: this bot resolves about 10.7 trades a day, and the pack's own promotion
+// rule wants 60 resolved per arm. Three arms is 17 days to a verdict. Eight would be 45, and the
+// full eight-by-six entry/exit grid would be 268 days — longer than the strategy will stay
+// unchanged, which makes it not an experiment but a wish.
+//
+// The three are chosen to answer ONE question, the one the record cannot currently answer:
+//
+//     Are the losses because the SIGNALS are bad, or because the ENTRIES are late?
+//
+// That question is John's own weakness stated mechanically — "I panic and buy back higher" — and
+// until it is answered, every other tuning decision is guesswork.
+//
+//   immediate_marketable  the live behaviour, and therefore the baseline. Not a shadow.
+//   structure_retest      rest at the zone the move came from; EXPIRES rather than waiting for
+//                         ever, because an entry that never fills is not a better entry, it is
+//                         no trade — and pretending otherwise is how a retest arm flatters itself.
+//   no_chase_filter       skip when price has already travelled more than N ATR from the signal.
+//                         It RECORDS the skip. An arm that makes trades disappear cannot be
+//                         compared with one that takes them.
+//
+// Everything here is measurement. No arm but the live one places anything, nothing here filters,
+// scores, promotes, demotes or sizes, and the pattern taxonomy is deliberately absent: patterns
+// stay reference-only until one of them earns a hypothesis of its own.
+const ENTRY_LAB_KEY = "cipher_entry_lab";
+const ENTRY_ARMS = ["immediate_marketable", "structure_retest", "no_chase_filter"];
+
+// PURE. A signal in, the three arms' intents out. No venue, no clock, no I/O.
+function entryArmPlan(sig, bars, cfg = {}) {
+  const {
+    chaseAtr = num("LAB_CHASE_ATR", 1.0),      // "already travelled too far" in ATR from the trigger
+    expireBars = num("LAB_EXPIRE_BARS", 12),   // a retest that has not filled by then is no trade
+  } = cfg;
+  const { coin, dir, entry, stop, target, tf, at } = sig;
+  const isLong = dir !== "short";
+  const risk = Math.abs(entry - stop);
+  if (!(risk > 0) || !Number.isFinite(entry)) return null;
+
+  const atr = atrArr(bars, 14);
+  const a = atr[atr.length - 1];
+  const trigger = Number.isFinite(sig.triggerPx) ? sig.triggerPx : entry;
+  // How far price has ALREADY run from the bar that produced the signal, in ATR. This is the
+  // number "chased" actually means, and it is why the filter is expressed in ATR rather than
+  // percent: the same 1% is a shrug on DOGE and a lot on BTC.
+  const travelled = Number.isFinite(a) && a > 0 ? Math.abs(entry - trigger) / a : 0;
+
+  const zone = nearestZone(bars, dir);
+  const retestPx = zone ? (isLong ? zone.top : zone.bottom) : null;
+
+  return {
+    coin, dir, tf, at, risk, atr: a,
+    arms: [
+      { arm: "immediate_marketable", live: true, wants: entry, stop, target,
+        note: "what the bot actually does" },
+      { arm: "structure_retest", live: false,
+        wants: Number.isFinite(retestPx) ? retestPx : null, stop, target,
+        expireBars, zone: zone ? zone.src : null,
+        note: Number.isFinite(retestPx) ? "rest at the zone the move came from"
+                                        : "no zone within reach — this arm sits out and says so" },
+      { arm: "no_chase_filter", live: false,
+        wants: travelled <= chaseAtr ? entry : null, stop, target,
+        travelledAtr: +travelled.toFixed(3), chaseAtr,
+        skipped: travelled > chaseAtr,
+        note: travelled > chaseAtr
+          ? `skipped — price had already run ${travelled.toFixed(2)} ATR from the trigger`
+          : "took it, same price as live" },
+    ],
+  };
+}
+
+// PURE. Walk an arm's intent forward over bars and say what happened to it. Grades ONLY the
+// entry model — whether the venue would have taken the order is a different question, kept in a
+// different column, because blending them is exactly what the four-way split exists to prevent.
+function entryArmResolve(intent, forward) {
+  const isLong = intent.dir !== "short";
+  const { wants, stop, target } = intent;
+  const out = { arm: intent.arm, wouldFill: false, fillBar: null, fillPx: null,
+                mfeR: 0, maeR: 0, hitTarget: false, hitStop: false, expired: false,
+                skipped: !!intent.skipped, note: intent.note };
+  if (intent.skipped) { out.note = intent.note; return out; }          // recorded, not vanished
+  if (!Number.isFinite(wants)) { out.note = intent.note; out.noZone = true; return out; }
+
+  const limit = intent.expireBars || Infinity;
+  for (let i = 0; i < forward.length; i++) {
+    const b = forward[i];
+    if (!out.wouldFill) {
+      if (i >= limit) { out.expired = true; break; }                    // a retest that never came
+      const filled = isLong ? b.l <= wants : b.h >= wants;
+      if (filled) { out.wouldFill = true; out.fillBar = i; out.fillPx = wants; }
+      continue;
+    }
+    const risk = Math.abs(wants - stop) || 1;
+    const fav = isLong ? (b.h - wants) / risk : (wants - b.l) / risk;
+    const adv = isLong ? (wants - b.l) / risk : (b.h - wants) / risk;
+    out.mfeR = Math.max(out.mfeR, fav);
+    out.maeR = Math.max(out.maeR, adv);
+    if (Number.isFinite(target) && (isLong ? b.h >= target : b.l <= target)) { out.hitTarget = true; break; }
+    if (Number.isFinite(stop) && (isLong ? b.l <= stop : b.h >= stop)) { out.hitStop = true; break; }
+  }
+  out.mfeR = +out.mfeR.toFixed(3); out.maeR = +out.maeR.toFixed(3);
+  return out;
+}
+
 const SHADOW_KEY = "cipher_shadow";
 const SHADOW_MIN_RESOLVED = 30;    // per arm, before a comparison means anything
 const SHADOW_MARGIN_R     = 0.05;  // variant must beat baseline by this much in mean R
@@ -3690,22 +3877,52 @@ export default async function cipherAgent() {
       console.error(`⚠ ${orphans.length} UNPROTECTED position(s) — no stop, no target, not in any book: ` +
         orphans.map(p => `${p.coin} ${p.dir} ${p.size} (~${((Number(p.size)||0)*(Number(p.avgEntry)||0)).toFixed(0)} USDT)`).join(", "));
     }
-    const resolved = resolvedSince(prevOpen, nowOpen, priceOf);
+    // The range each resolved position traded through since we last saw it, so a target that was
+    // hit and given back before the next run still reads as a target rather than as "closed".
+    const ranges = {};
+    for (const k of Object.keys(prevOpen || {})) {
+      if (nowOpen[k]) continue;
+      const coin = prevOpen[k].coin;
+      if (ranges[coin]) continue;
+      try {
+        const c = await fetchCandles(coin, "15m", 96);        // ~24h, far more than any run gap
+        const since = Number(prevOpen[k].lastSeen) || (Date.now() - 6 * 36e5);
+        const win = (c || []).filter(b => b.t >= since - 36e5);
+        if (win.length) ranges[coin] = { hi: Math.max(...win.map(b => b.h)), lo: Math.min(...win.map(b => b.l)) };
+      } catch { /* no range — classifyResolution falls back to the snapshot and says so */ }
+    }
+    const resolved = resolvedSince(prevOpen, nowOpen, priceOf, c => ranges[c] || null);
     const queue = [];
     for (const r of resolved) {
       const line = `${r.coin} ${r.dir} ${r.how}${Number.isFinite(r.exit) ? " at " + formatPrice(r.exit) : ""}`;
-      await pushLog({ coin: r.coin, dir: r.dir, book: r.book || undefined, result: "RESOLVED",
-        skipped: `${line} — ${r.how === "target" ? "target hit, queued for a reverse look" : "closed, freeing its slot"}` });
+      await pushLog({ coin: r.coin, dir: r.dir, book: r.book || undefined,
+        result: r.klass === "execution_artifact" ? "RESOLVED (not counted)" : "RESOLVED",
+        skipped: `${line} — ${r.why}` +
+          (r.klass === "execution_artifact"
+            ? " This is an EXECUTION ARTIFACT: it does not count toward the loss streak or the strategy's record."
+            : r.how === "target" ? " Target hit, queued for a reverse look." : "") });
       delete bookMap[posKey(r.coin, r.dir)];
       if (r.how === "target") queue.push(r.coin);
     }
     if (queue.length) await setJSON(PRIORITY_KEY, queue);
+    // Stamp when each open position was last seen, so the next resolution knows how far back to
+    // look for its range. Without this the window is a guess.
+    const seenAt = Date.now();
+    for (const v of Object.values(nowOpen)) if (v) v.lastSeen = seenAt;
     await setJSON(OPEN_KEY, nowOpen);
-    if (resolved.length) console.log(`resolved: ${resolved.map(r => r.coin + " " + r.how).join(", ")}`);
-    // feed this run's outcomes to the breaker's streak arm — a trip here pauses the NEXT run
-    if (resolved.length) {
+    if (resolved.length) console.log(`resolved: ${resolved.map(r => `${r.coin} ${r.how}${r.klass === "execution_artifact" ? " (artifact, not counted)" : ""}`).join(", ")}`);
+
+    // ── ONLY REAL STRATEGY OUTCOMES REACH THE BREAKER (2026-08-20) ─────────────────────────
+    // The circuit breaker exists to stop the bot re-asking a market that keeps saying no. A
+    // rejected order, a hand-closed position or an unrecoverable ambiguity is not the market
+    // saying no — it is the plumbing, or you, and pausing trading over it would be the breaker
+    // firing at a phantom. Artifacts are logged in full above and consumed by nothing.
+    const strategyOutcomes = resolved.filter(r => r.countsForStreak);
+    const artifacts = resolved.filter(r => r.klass === "execution_artifact");
+    if (artifacts.length) console.log(`  ${artifacts.length} of those were execution artifacts and count toward nothing: ${artifacts.map(r => r.coin + " " + r.how).join(", ")}`);
+    if (strategyOutcomes.length) {
       const bst = await getJSON(BREAKER_KEY, {});
-      const b = breakerStep(bst, { now: Date.now(), equity: null, resolvedHows: resolved.map(r => r.how) });
+      const b = breakerStep(bst, { now: Date.now(), equity: null, resolvedHows: strategyOutcomes.map(r => r.how) });
       await setJSON(BREAKER_KEY, b.st);
       if (b.trips.includes("streak")) {
         console.log(`CIRCUIT BREAKER TRIPPED (streak): ${b.st.pausedWhy}`);
