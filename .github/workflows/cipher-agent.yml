@@ -46,7 +46,12 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     env:
-      MODE: off             # ← dry = logs what it would do. Change to: armed
+      MODE: off             # FALLBACK ONLY. The app panel sets the real mode via the relay and
+                            # that wins whenever the relay answers. This value is what the agent
+                            # falls back to when the relay read fails, and "off" is the safe
+                            # direction to fail in — it stands the FUTURES scanner down.
+                            # It does NOT stand the accumulator down; see ACCUM_EXEC below.
+                            # off | dry | armed
       RISK_GBP: "10"
       MIN_SCORE: "6"
       DAY_CAP: "25"
@@ -56,6 +61,22 @@ jobs:
       MAX_ATTEMPTS: "3"      # failed sends per coin+direction per day, then it rests
       EXEC_DIRECT: "1"       # 1 = sign here and call Phemex direct · 0 = go via the relay
       MAX_NOTIONAL_USDT: "2000"   # the relay's cap, re-enforced here now the relay is bypassed
+      # ── THE ACCUMULATOR (spot, units not pounds) ──────────────────────────────────────────
+      # THIS IS THE ONLY PLACE THE SPOT PATH IS ARMED. The code default is "dry"; without the
+      # line below no spot order can be placed, whatever else any comment or panel says.
+      # Added 2026-08-20 after Codex's review found the arming buried in a code default and
+      # contradicted by a comment claiming the opposite.
+      ACCUM: "1"                        # 1 = run the accumulator · 0 = off entirely
+      ACCUM_COIN: "BTC"
+      ACCUM_EXEC: "armed"               # armed = places REAL spot orders · dry = log only
+      ACCUM_MAX_USDT: "200"             # cap on one LADDER slice
+      ACCUM_FLIP_MAX_USDT: "1500"       # cap on one whole-stack FLIP order; must exceed the stack
+      ACCUM_FLIP_TF: "off"              # fallback only — the app toggles set this live via the relay
+      ACCUM_SELL_RESERVE_BPS: "15"      # leave the venue room for its fee on a full-stack sell
+      ACCUM_MIN_ORDER_USDT: "10"        # venue minimum
+      ACCUM_CORE_PCT: "0"               # 0 = no protected core (John's call, 2026-08-19)
+      ACCUM_TRIGGER: "pump1"
+      ACCUM_MF_GATE: "1"                # also require VuManChu money flow to be negative
       RELAY_URL: ${{ secrets.RELAY_URL }}
       RELAY_TOKEN: ${{ secrets.RELAY_TOKEN }}
       PHEMEX_KEY: ${{ secrets.PHEMEX_KEY }}
