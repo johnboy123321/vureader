@@ -10097,15 +10097,29 @@ document.addEventListener('click', function(e){
       h += '<div class="bot-why" style="color:var(--dim);">★ best paper arm · ● live on real money. The paper arms are costed at 1bp a side (maker), which is optimistic — it assumes every post-only order fills at its price. On real 2025-26 data the same flip at TAKER fees loses everything below about 1H; 5m pays 3,346% of the account in fees. The signal is real at every timeframe; the costs are what decide it. The live arm books at the real 10bps, so its number and the paper number for the same timeframe will not agree — that gap is the cost of being real. It differs in one more way, deliberately: the paper arm acts on every dot the instant it prints, while the bot wakes every 30–40 minutes and can only ask "coins or cash?" when it is awake, at a price that is current. Dots that open and close between two runs are invisible to it. On 1D that changes almost nothing; on 5m it changes almost everything.</div>';
     }
 
-    const ev = (log||[]).filter(e=>String(e.result||'').startsWith('ACCUM')).slice(0,8);
+    // ── SHOW THE FLIP'S TRADES TOO (2026-08-20) ──────────────────────────────────────────────
+    // This filtered on results beginning "ACCUM", which was right when the ladder was the only
+    // thing trading. The dot flip logs under FLIP SELL / FLIP BUY / FLIP ARMED, so every one of
+    // its orders was invisible here — John watched it place twenty real trades and reasonably
+    // concluded nothing was happening. A panel that hides the very activity it exists to show is
+    // worse than no panel: it reports silence as fact.
+    const ev = (log||[]).filter(e=>/^(ACCUM|FLIP)\b/.test(String(e.result||''))).slice(0,10);
     if(ev.length){
       h += '<div style="font-size:11px;font-weight:700;color:var(--muted);margin:12px 0 6px;">RECENT ACTIVITY</div>';
       h += ev.map(e=>{
         const when = new Date(e.at).toLocaleString(undefined,{month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'});
-        const kind = String(e.result).replace('ACCUM ','');
-        const c = kind==='BUY'?'#9c9':kind==='SELL'?'#e8c07a':'#999';
+        const raw = String(e.result);
+        const isFlip = raw.startsWith('FLIP');
+        const kind = raw.replace('ACCUM ','');
+        // A failed order must never look like a completed one.
+        const bad = /UNPLACED|BLOCKED|OUT OF SYNC/.test(raw);
+        const c = bad ? '#e88'
+                : /BUY/.test(kind) ? '#9c9'
+                : /SELL/.test(kind) ? '#e8c07a'
+                : '#999';
         return '<div style="border-bottom:1px solid var(--line);padding:6px 0;font-size:12px;">'
-          + '<div style="display:flex;justify-content:space-between;gap:8px;"><span style="color:'+c+';font-weight:700;">'+esc(kind)+'</span>'
+          + '<div style="display:flex;justify-content:space-between;gap:8px;"><span style="color:'+c+';font-weight:700;">'+esc(kind)
+          + (isFlip?'<span style="color:var(--dim);font-weight:400;font-size:10px;"> · dot flip</span>':'')+'</span>'
           + '<span style="color:var(--dim);font-size:11px;">'+esc(when)+'</span></div>'
           + '<div style="color:var(--dim);font-size:11px;margin-top:2px;line-height:1.45;">'+esc(String(e.skipped||'').slice(0,240))+'</div></div>';
       }).join('');

@@ -129,5 +129,38 @@ console.log('\n8. The toggles look like something you can press');
   ok('and OFF is not', !/data-tf="off"[^>]*color:#8bd/.test(html));
 }
 
+console.log('\n9. The flip\'s trades appear in Recent Activity');
+{
+  // 2026-08-20: the filter matched only results starting "ACCUM", so twenty real FLIP orders
+  // were invisible and John concluded nothing was happening. A panel that hides the activity it
+  // exists to show reports silence as fact.
+  const flips = { '5m':{gainPct:-4.65,trips:58,holding:true} };
+  const base = { units:0.00739181, cash:0, open:[], sells:0, fills:0, pxNow:72650,
+                 startUnits:0.00767949, flips,
+                 liveFlip:{ tf:'5m', holding:true, gainPct:-3.75, sells:10, trips:10 } };
+  const log = [
+    { at:'2026-08-20T19:48:00Z', result:'FLIP BUY',  skipped:'5m green dot — bought back with 537.57 USDT at 72652.9. SPOT BUY PLACED' },
+    { at:'2026-08-20T17:35:00Z', result:'FLIP SELL', skipped:'5m red dot — sold the whole stack at 72748.6. SPOT SELL PLACED' },
+    { at:'2026-08-19T17:09:00Z', result:'FLIP UNPLACED', skipped:'did not reach the venue' },
+    { at:'2026-08-19T16:48:00Z', result:'FLIP ARMED', skipped:'5m dot flip is now live' },
+    { at:'2026-08-19T13:59:00Z', result:'ACCUM SEEDED', skipped:'spot wallet funded' },
+  ];
+  fn({ cipher_accum: base }, log);
+  ok('a flip buy is listed', /FLIP BUY/.test(html));
+  ok('a flip sell is listed', /FLIP SELL/.test(html));
+  ok('the arming event is listed', /FLIP ARMED/.test(html));
+  ok('ladder events still listed too', /SEEDED/.test(html));
+  ok('flip rows are labelled as such', /dot flip/.test(html));
+  ok('a buy is green', /color:#9c9;font-weight:700;">FLIP BUY/.test(html));
+  ok('a sell is amber', /color:#e8c07a;font-weight:700;">FLIP SELL/.test(html));
+  ok('a FAILED order is red, never mistaken for a fill',
+     /color:#e88;font-weight:700;">FLIP UNPLACED/.test(html));
+  ok('the section header appears', /RECENT ACTIVITY/.test(html));
+
+  // The old filter would have shown only the one ACCUM row.
+  const oldWouldShow = log.filter(e => String(e.result).startsWith('ACCUM')).length;
+  ok('the old filter would have hidden all four flip rows', oldWouldShow === 1, oldWouldShow);
+}
+
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail?1:0);
