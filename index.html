@@ -9973,25 +9973,44 @@ document.addEventListener('click', function(e){
     const start = Number(a.startUnits) > 0 ? Number(a.startUnits) : 1;
     const gain = start > 0 ? units / start - 1 : 0;
     const col = gain > 0.0001 ? '#9c9' : gain < -0.0001 ? '#e88' : 'var(--muted)';
+    // ── REPORT WHICHEVER STRATEGY ACTUALLY HOLDS THE COINS (2026-08-20) ─────────────────────
+    // This header read "sells 0 · buy-backs 0 · trigger pump1" while the dot flip two lines below
+    // reported ten sells. Both were true of their own book and the panel showed them side by side
+    // as if they described one thing. A number that contradicts the number under it does not just
+    // confuse — it teaches you to distrust the whole panel. So: one driver, named, with ITS
+    // counters, and the stood-down strategy's settings hidden rather than displayed as live.
+    const lf = a.liveFlip || {};
+    const flipDrives = !!lf.tf;
     const resting = Array.isArray(a.open) ? a.open : [];
-    const waiting = resting.length > 0;
-    const state = waiting ? 'SOLD — WAITING TO BUY BACK' : 'FULLY HOLDING';
+    const waiting = flipDrives ? !lf.holding : resting.length > 0;
+    const sells = flipDrives ? (lf.sells||0) : (a.sells||0);
+    const backs = flipDrives ? (lf.trips||0) : (a.fills||0);
+    const driver = flipDrives ? lf.tf + ' dot flip' : 'pump ladder (' + esc(a.trigger||'pump1') + ')';
+    const state = waiting ? 'IN CASH — WAITING TO BUY BACK' : 'HOLDING BITCOIN';
     const stateCol = waiting ? '#e8c07a' : '#8bd';
+    const lost = (units - start) * (px||0);
 
     let h = '<div class="bot-row" style="cursor:default">';
     h += '<div class="bot-row-top"><span class="bot-badge" style="color:'+stateCol+';border-color:'+stateCol+'55">'+state+'</span>'
        + '<span style="margin-left:auto;color:'+col+';font-weight:700;">'+units.toFixed(5)+' BTC</span></div>';
+
+    // The one sentence that answers "how is it doing", in coins AND in money, because a
+    // percentage on five decimal places of Bitcoin is not something anyone feels.
+    h += '<div style="margin-top:8px;font-size:13px;line-height:1.5;">'
+       + 'You started with <b>'+start.toFixed(8).replace(/0+$/,'').replace(/\.$/,'')+'</b> BTC. '
+       + 'You now have <b style="color:'+col+'">'+units.toFixed(8).replace(/0+$/,'').replace(/\.$/,'')+'</b> — '
+       + '<b style="color:'+col+'">'+(gain>=0?'+':'')+(gain*100).toFixed(2)+'%</b>'
+       + (px ? ' (about <b style="color:'+col+'">'+(lost>=0?'+':'−')+'$'+Math.abs(lost).toFixed(2)+'</b> of Bitcoin)' : '')
+       + '.</div>';
+    h += '<div class="bot-why" style="color:var(--dim);">Doing nothing at all would have left you with exactly '+start.toFixed(8).replace(/0+$/,'').replace(/\.$/,'')+' — that is the only line this has to beat, and it never moves. Running since '+esc(a.startedAt||a.seededAt||'—')+'.</div>';
+
     h += '<div class="bot-nums" style="margin-top:6px;">'
-       + '<span>vs buy-and-hold <b style="color:'+col+'">'+(gain>=0?'+':'')+(gain*100).toFixed(2)+'%</b></span>'
-       + '<span>benchmark <b>'+start.toFixed(8).replace(/0+$/,'').replace(/\.$/,'')+'</b></span>'
-       + '<span>sells <b>'+(a.sells||0)+'</b></span>'
-       + '<span>buy-backs <b>'+(a.fills||0)+'</b></span>'
-       + (a.cash>0?'<span>cash idle <b>'+Number(a.cash).toFixed(2)+' USDT</b></span>':'')
+       + '<span>driving <b style="color:#8bd;">'+driver+'</b></span>'
+       + '<span>sells <b>'+sells+'</b></span>'
+       + '<span>buy-backs <b>'+backs+'</b></span>'
+       + (a.cash>0?'<span>cash <b>'+Number(a.cash).toFixed(2)+' USDT</b></span>':'')
        + (a.coreUnits?'<span>core (never sold) <b>'+Number(a.coreUnits).toFixed(5)+'</b></span>':'')
-       + (a.coreUnits?'<span>tradeable <b>'+Math.max(0,(Number(a.units)||0)-Number(a.coreUnits)).toFixed(5)+'</b></span>':'')
-       + (a.trigger?'<span>trigger <b>'+esc(a.trigger)+'</b></span>':'')
        + '</div>';
-    h += '<div class="bot-why" style="color:var(--dim);">Buy-and-hold always ends on exactly what you started with — '+start.toFixed(8).replace(/0+$/,'').replace(/\.$/,'')+' — and that is the line this has to beat. Since '+esc(a.startedAt||a.seededAt||'—')+'.</div>';
     // Can it actually trade? The bot checks the venue itself each run and records the verdict.
     const sp = a.spot;
     if(sp){
