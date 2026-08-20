@@ -84,6 +84,34 @@ console.log('\n  7. PHEMEX IS TESTNET UNLESS DELIBERATELY CHANGED IN ONE PLACE')
   ok('the workflow preflight pings testnet, not live', /testnet-api\.phemex\.com/.test(wf) && !/\/\/api\.phemex\.com/.test(wf));
 }
 
+console.log('\n  9. DATA HYGIENE — an execution failure is never signal evidence');
+{
+  // Codex's testnet question: is the forward data clean enough that a later decision rests on the
+  // strategy rather than on execution artifacts? In the 2026-08-19/20 window, 13 of 24 order
+  // attempts were rejected and every one landed as a bare `ERR phemex 11048`.
+  ok('venue rejections are classified, not logged as raw codes', /const PHEMEX_REJECTIONS = \{/.test(src));
+  ok('11048 and 11052 are named as staleness, not as bad setups',
+     /"11048"[\s\S]{0,200}stale — price moved past the stop/.test(src) &&
+     /"11052"[\s\S]{0,200}stale — price moved past the stop/.test(src));
+  ok('the cause is attributed to cadence, which is measurable', /cause: "cadence"/.test(src));
+  ok('venue-side outages are separated from our mistakes', /cause: "venue"/.test(src));
+  ok('unlisted symbols are separated too', /cause: "universe"/.test(src));
+  ok('every rejection class is an execution artifact', (src.match(/klass: "execution_artifact", cause:/g)||[]).length >= 4);
+  ok('an unknown code still classifies as an artifact, never as a signal',
+     /if \(!hit\) return \{ label: String\(why \|\| "rejected"\), klass: "execution_artifact"/.test(src));
+  ok('the log line says it is not a signal', /REJECTED \(not a signal\)/.test(src));
+  ok('and the record carries countsForStats:false', /countsForStats: ok \? true : false/.test(src));
+
+  // The resolution side, from the four-way split.
+  ok('hand-closed positions count toward nothing', /how: "closed_by_hand"[\s\S]{0,300}countsForStreak: false, countsForStats: false/.test(src));
+  ok('the breaker only ever eats real strategy losses', /const strategyOutcomes = resolved\.filter\(r => r\.countsForStreak\)/.test(src));
+  ok('clamped trades are recorded with what they ACTUALLY risked', /riskActual = \+\(qty \* stopDist\)/.test(src));
+  ok('and the clamp itself is flagged on the log line', /clamped: built\.meta\.clamped \|\| undefined/.test(src));
+  ok('dry runs are labelled distinctly from placed orders', /"dry-run OK"/.test(src) && /"PLACED"/.test(src));
+  ok('spot events are prefixed so they never read as futures trades',
+     /result: "ACCUM SELL"|result: isSell \? "FLIP SELL"/.test(src));
+}
+
 console.log('\n  8. THE SAFETY NET TESTS THE LIVE FILE, NOT A GHOST');
 {
   const tests = fs.readdirSync('.').filter(f=>/^test-.*\.mjs$/.test(f));

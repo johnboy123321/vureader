@@ -1244,6 +1244,42 @@ async function adoptOrphans(nowOpen, bookMap) {
 // to the snapshot, which is weaker but never silently pretends otherwise.
 const RESOLUTION_CLASSES = ["strategy", "execution_artifact"];
 
+// ═══════════ WHAT A VENUE REJECTION ACTUALLY MEANS (2026-08-20) ═══════════
+// Codex's testnet question: "are we collecting clean enough forward data that a later decision
+// rests on the strategy, not on execution artifacts?" The honest answer in this window was no,
+// and this is one of the reasons: 13 of 24 order attempts were rejected by Phemex and every one
+// of them landed in the record as a bare code — `ERR phemex 11048` — which is unreadable, and
+// worse, indistinguishable from the strategy being wrong.
+//
+// The 11048/11052 pair is the interesting one and it is OUR bug, not the venue's. We validate the
+// stop against the PLANNED ENTRY; Phemex validates it against the LIVE MARK (`slTrigger:
+// "ByMarkPrice"`). On a 30–40 minute cadence those diverge: price drifts past the stop between
+// the candle that produced the signal and the moment the order is sent, so a stop that is
+// correctly below our entry is already above the mark. That is not a bad setup. It is a stale
+// one, and calling it by its name turns a mystery into a measurable fact about cadence.
+//
+// Every value here classifies as an execution artifact: none of it is evidence about a signal.
+const PHEMEX_REJECTIONS = {
+  "11048": { label: "stale — price moved past the stop before the order was sent",
+             detail: "LONG stop must be below the live MARK price, not just below the planned entry. The signal aged out between the candle close and the send.",
+             klass: "execution_artifact", cause: "cadence" },
+  "11052": { label: "stale — price moved past the stop before the order was sent",
+             detail: "SHORT stop must be above the live MARK price, not just above the planned entry. The signal aged out between the candle close and the send.",
+             klass: "execution_artifact", cause: "cadence" },
+  "20005": { label: "the venue has this symbol switched off",
+             detail: "TE_SEQ_TURN_OFF — Phemex testnet disables symbols periodically. Nothing to do with the setup.",
+             klass: "execution_artifact", cause: "venue" },
+  "39999": { label: "symbol is not listed on this venue",
+             detail: "The universe includes a coin testnet does not carry. Nothing to do with the setup.",
+             klass: "execution_artifact", cause: "universe" },
+};
+function explainRejection(why) {
+  const m = /phemex (\d+)/.exec(String(why || ""));
+  const hit = m && PHEMEX_REJECTIONS[m[1]];
+  if (!hit) return { label: String(why || "rejected"), klass: "execution_artifact", cause: "unknown", detail: "" };
+  return { ...hit, code: m[1] };
+}
+
 function resolvedSince(prev, now, priceOf, rangeOf) {
   const out = [];
   for (const k of Object.keys(prev || {})) {
@@ -3641,7 +3677,9 @@ export default async function cipherAgent() {
     // chars. A bare "ERR 502" is undiagnosable after the fact — it hid a relay crash for two
     // days (2026-08-13). The cause must be in the log entry itself, not in a val's console.
     const why = r.data.error || (r.data.parseError ? r.status + " unparseable — " + String(r.data.raw || "").slice(0, 200) : r.status);
-    await pushLog({ ...t, qty: built.meta.qty, risk: built.meta.riskActual, clamped: built.meta.clamped || undefined, mode, orderID: oid, entryKind: built.meta.entryKind, stopKind: built.meta.stopKind, book, recovered: recovered ? recovered.trim() : undefined, via: EXEC(), attempt: attempts[key], diag: ok ? undefined : r.diag, result: ok ? (r.data.dryRun ? "dry-run OK" : "PLACED" + recovered) : "ERR " + why, thesis: sig.ev.join("; ") + " · plan from " + (sig.planTf || "1D") + (sig.detector ? " · " + sig.detector + " detector" + (sig.alt ? " (best of " + (sig.alt + 1) + " hits)" : "") : " · confluence") });
+    await pushLog({ ...t, qty: built.meta.qty, risk: built.meta.riskActual, clamped: built.meta.clamped || undefined, mode, orderID: oid, entryKind: built.meta.entryKind, stopKind: built.meta.stopKind, book, recovered: recovered ? recovered.trim() : undefined, via: EXEC(), attempt: attempts[key], diag: ok ? undefined : r.diag, result: ok ? (r.data.dryRun ? "dry-run OK" : "PLACED" + recovered) : "REJECTED (not a signal) — " + explainRejection(why).label,
+      rejection: ok ? undefined : { ...explainRejection(why), raw: String(why).slice(0, 120) },
+      countsForStats: ok ? true : false, thesis: sig.ev.join("; ") + " · plan from " + (sig.planTf || "1D") + (sig.detector ? " · " + sig.detector + " detector" + (sig.alt ? " (best of " + (sig.alt + 1) + " hits)" : "") : " · confluence") });
     // fired[] was set BEFORE the attempt, so a failed order still burned the coin for the whole
     // day — 17 signals in Aug were lost twice over: no order placed AND no retry. A server-side
     // fault is not a decision, so undo the mark and let the next sweep have another go. A 4xx IS
