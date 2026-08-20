@@ -1182,7 +1182,25 @@ async function adoptOrphans(nowOpen, bookMap) {
     // average entry, so "closed in profit / at a loss" is judged against reality.
     const cur = bars[bars.length - 1].c;
     const plan = buildTradePlan(bars, pos.dir, cur);
-    if (!plan) continue;
+    // ── A FAILED ADOPTION MUST NOT BE SILENT (2026-08-20) ───────────────────────────────────
+    // Found by John: a SOL long appeared at 07:59 that this bot never opened, and sat for
+    // thirteen hours with no stop, no target and no book — because buildTradePlan returned null
+    // (structure wider than 3 ATR, most likely) and this line was a bare `continue`.
+    //
+    // The position was not idle while it waited. A plan-less position counts as belonging to
+    // BOTH books for the no-hedge rule, so it was silently blocking every SOL trade, while
+    // itself carrying no stop. Unmanaged AND obstructive, and nothing said a word.
+    //
+    // Refusing to invent a plan is still right — a stop pulled from thin air is worse than an
+    // honest "I cannot size this". Refusing QUIETLY is what was wrong.
+    if (!plan) {
+      const notional = (Number(pos.size) || 0) * (Number(pos.avgEntry) || cur);
+      await pushLog({ coin: pos.coin, dir: pos.dir, result: "UNPROTECTED",
+        skipped: `held with no plan and none could be built from today's structure — the stop it needs is more than 3 ATR away. It has NO stop and NO target at the venue, it is not in any book, and it is blocking new ${pos.coin} trades in both books. Size ${pos.size} (~${notional.toFixed(0)} USDT). This bot did not open it — close it by hand, or give it a stop yourself.` });
+      console.error(`UNPROTECTED: ${pos.coin} ${pos.dir} size ${pos.size} (~${notional.toFixed(0)} USDT) — no plan could be built, no stop at the venue`);
+      pos.unprotected = true;
+      continue;
+    }
     const ref = Number.isFinite(pos.avgEntry) && pos.avgEntry > 0 ? pos.avgEntry : cur;
     pos.plan = { entry: ref, stop: plan.stop, target: plan.targets[1] ?? plan.targets[0] };
     pos.book = pos.book || "swing";
@@ -1237,6 +1255,11 @@ const BOOK_CFG = {
 // before books existed have no entry here — and those are treated as belonging to BOTH books, so
 // the no-hedge protection never quietly lapses while this rolls out.
 const BOOKMAP_KEY = "cipher_books";
+// Positions the bot holds but cannot manage: no plan, so no stop and no target, and no book —
+// which means the no-hedge rule treats them as belonging to BOTH books and they quietly block
+// every new trade in that coin. Written every run so the app can show them, cleared the moment
+// they are adopted or closed.
+const ORPHAN_KEY = "cipher_unprotected";
 const posKey = (coin, dir) => String(coin).toUpperCase() + "|" + dir;
 
 // ═══════════════ TIME STOP — make trades RESOLVE (2026-08-16) ═══════════════
@@ -3655,6 +3678,18 @@ export default async function cipherAgent() {
     // Anything held with no plan gets adopted — see adoptOrphans. Bookkeeping only, no orders.
     const adopted = await adoptOrphans(nowOpen, bookMap);
     if (adopted.length) console.log(`adopted ${adopted.length} plan-less position(s): ${adopted.map(p => p.coin + " " + p.dir).join(", ")} — plan and book attached, no orders placed`);
+    // ── AND THE ONES IT COULD NOT ADOPT ─────────────────────────────────────────────────────
+    // Reported EVERY run, not once when it appeared. A warning you have to have been watching
+    // for is not a warning; this is money sitting at the venue with no stop on it, and it stays
+    // on the screen until it is gone. Recorded on state so the app panel shows it too.
+    const orphans = Object.values(nowOpen).filter(p => p && !p.plan && p.size > 0);
+    await setJSON(ORPHAN_KEY, orphans.map(p => ({
+      coin: p.coin, dir: p.dir, size: p.size, avgEntry: p.avgEntry,
+      notional: (Number(p.size) || 0) * (Number(p.avgEntry) || 0), since: p.since })));
+    if (orphans.length) {
+      console.error(`⚠ ${orphans.length} UNPROTECTED position(s) — no stop, no target, not in any book: ` +
+        orphans.map(p => `${p.coin} ${p.dir} ${p.size} (~${((Number(p.size)||0)*(Number(p.avgEntry)||0)).toFixed(0)} USDT)`).join(", "));
+    }
     const resolved = resolvedSince(prevOpen, nowOpen, priceOf);
     const queue = [];
     for (const r of resolved) {

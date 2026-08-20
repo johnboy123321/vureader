@@ -10155,6 +10155,21 @@ document.addEventListener('click', function(e){
       const hb = st.cipher_heartbeat, log = Array.isArray(st.cipher_log) ? st.cipher_log : [];
       try{ renderAccum(st, log); }catch(err){ }
       let h = '';
+      // ── UNPROTECTED POSITIONS, AT THE TOP, EVERY TIME (2026-08-20) ────────────────────────
+      // A SOL long this bot never opened sat for thirteen hours with no stop, no target and no
+      // book, silently blocking every SOL trade — and nothing on this screen said so. Money at
+      // the venue with no stop on it is the single most important thing the panel can tell you,
+      // so it goes above everything else and stays until the position is gone.
+      const orphans = Array.isArray(st.cipher_unprotected) ? st.cipher_unprotected : [];
+      if(orphans.length){
+        h += '<div style="border:1px solid #e88;border-radius:6px;padding:10px;margin-bottom:10px;background:rgba(238,136,136,0.08);">'
+          +  '<div style="color:#e88;font-weight:700;font-size:12px;margin-bottom:4px;">⚠ '+orphans.length+' UNPROTECTED POSITION'+(orphans.length>1?'S':'')+'</div>'
+          +  orphans.map(o=>'<div style="font-size:12px;margin-bottom:2px;"><b>'+esc(o.coin)+' '+esc(o.dir)+'</b> · '+esc(o.size)
+             +' (~'+Math.round(Number(o.notional)||0).toLocaleString()+' USDT)'
+             +(o.since?' · held since '+new Date(o.since).toLocaleString(undefined,{month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'}):'')+'</div>').join('')
+          +  '<div style="font-size:11px;color:var(--dim);margin-top:6px;line-height:1.45;">No stop and no target at the venue. Not in any book, so it is also blocking new trades in that coin — in both books. The bot did not open these and cannot size a plan for them; close by hand or set a stop yourself.</div>'
+          +  '</div>';
+      }
       if(hb){
         const age = Math.round((Date.now() - new Date(hb.at).getTime())/60000);
         h += '<div style="font-size:11px;color:var(--dim);font-family:ui-monospace,monospace;margin-bottom:8px;">last run ' + (age<1?'just now':age + ' min ago') +
