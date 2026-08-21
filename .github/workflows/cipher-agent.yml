@@ -77,6 +77,10 @@ jobs:
       ACCUM_CORE_PCT: "0"               # 0 = no protected core (John's call, 2026-08-19)
       ACCUM_TRIGGER: "pump1"
       ACCUM_MF_GATE: "1"                # also require VuManChu money flow to be negative
+      # Optional. Without it the loser-autopsy brain never runs — it returns before doing
+      # anything and the panel simply shows nothing, which reads as broken rather than off.
+      # Costs at most BRAIN_DAILY_USD a day (default $0.25) and cannot place or block an order.
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
       RELAY_URL: ${{ secrets.RELAY_URL }}
       RELAY_TOKEN: ${{ secrets.RELAY_TOKEN }}
       PHEMEX_KEY: ${{ secrets.PHEMEX_KEY }}
