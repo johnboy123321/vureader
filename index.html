@@ -3013,7 +3013,7 @@ function closeQROutside(e) {
 // ═══════════════════════════ SETTINGS ═══════════════════════════
 // Model routing: 'smart' = deep-analysis model (chart reads/verdicts); 'light' = cheap model for mechanical jobs.
 // Build stamp — bump on every deploy so "which version am I running?" has a true answer.
-const APP_BUILD = 'v4.0 · 21 Aug 2026 · stale-page guard (this page now tells you when it is out of date); accumulator header reports whichever strategy actually holds the coins; dot-flip timeframe toggles; venue rejections classified as execution artifacts, never as signal evidence';
+const APP_BUILD = 'v4.1 · 21 Aug 2026 · a permanent trade ledger (the debug log only ever held 28 hours); a scoreboard on Bot Trades; the brain\'s paper book shown split by direction; promotion now needs both directions across a week, and the rule promoted on 35 hours of a rally has been unwound';
 // ── STALE PAGE GUARD (2026-08-21) ────────────────────────────────────────────────────────────
 // GitHub Pages sets a cache header on index.html, and a phone with this saved to its home screen
 // will hold that copy for days. On 2026-08-21 John reported two bugs — "sells 0 / buy-backs 0"
@@ -10328,11 +10328,14 @@ document.addEventListener('click', function(e){
   function tallyLog(log){
     const t = { wins:0, losses:0, R:0, rUnknown:0, artifacts:0, rejected:0, placed:0, graded:0, risk:null };
     for(const e of (log||[])){
+      // A ledger row names its own kind; a log row has to be read off the result string. Both
+      // shapes are accepted so the panel keeps working through the changeover.
+      const kind = e.kind || '';
       const res = String(e.result||'');
-      if(/^PLACED/.test(res)) t.placed++;
-      if(/^(REJECTED|ERR)/.test(res)) t.rejected++;
+      if(kind === 'placed' || /^PLACED/.test(res)) t.placed++;
+      if(kind === 'rejected' || /^(REJECTED|ERR)/.test(res)) t.rejected++;
       if(t.risk === null && Number.isFinite(Number(e.risk))) t.risk = Number(e.risk);
-      if(!/^RESOLVED/.test(res)) continue;
+      if(kind !== 'resolved' && !/^RESOLVED/.test(res)) continue;
       // Records written before the labels existed carry only a sentence: "COIN dir how at px — why".
       // Read the label when it is there and fall back to the sentence when it is not, but never
       // let a fallback invent an R it cannot know.
@@ -10345,13 +10348,22 @@ document.addEventListener('click', function(e){
       if(!counts){ t.artifacts++; continue; }
       t.graded++;
       if(how === 'target') t.wins++; else if(how === 'stop') t.losses++;
-      if(Number.isFinite(Number(e.R))) t.R += Number(e.R); else t.rUnknown++;
+      if(e.R !== null && e.R !== undefined && Number.isFinite(Number(e.R))) t.R += Number(e.R); else t.rUnknown++;
     }
     return t;
   }
 
   function botScoreboard(st, log){
-    const t = tallyLog(log);
+    // ── COUNT THE LEDGER, NOT THE DEBUG FEED (2026-08-21) ──────────────────────────────────
+    // The first version of this counted cipher_log, which is the last 300 decisions and nothing
+    // more. On the day it shipped that was twenty-eight hours, 247 of the 300 entries were notes
+    // about trades the bot passed on, and John's real trading history had already been thrown
+    // away. The agent now keeps cipher_ledger — events that actually happened, 5,000 of them, no
+    // chatter — so the record can reach back months. Fall back to the log while the ledger fills.
+    const ledger = st && Array.isArray(st.cipher_ledger) ? st.cipher_ledger : null;
+    const source = ledger && ledger.length ? ledger : (log || []);
+    const usingLedger = !!(ledger && ledger.length);
+    const t = tallyLog(source);
     const open = st && st.cipher_open ? Object.values(st.cipher_open).filter(Boolean) : [];
     const br = (st && st.cipher_breaker) || {};
     const risk = t.risk || 10;
@@ -10385,8 +10397,11 @@ document.addEventListener('click', function(e){
 
     // Every number above has a denominator, and here it is. A record without its window is a
     // boast, not a measurement.
-    h += '<div class="bot-why" style="color:var(--dim);">Counted from the bot\'s last '
-      + (log ? log.length : 0) + ' decisions, back to <b>' + esc(since) + '</b> — it keeps 300 and then forgets. '
+    h += '<div class="bot-why" style="color:var(--dim);">Counted from '
+      + (usingLedger
+          ? '<b>the permanent ledger</b> — ' + source.length + ' real events, back to <b>' + esc(since) + '</b>. It keeps 5,000, so this reaches back months rather than hours.'
+          : 'the bot\'s last ' + source.length + ' decisions, back to <b>' + esc(since) + '</b> — the debug log keeps 300 and then forgets. The permanent ledger starts filling on the bot\'s next run.')
+      + ' '
       + '<b>Only trades that reached their own stop or target are graded.</b> Positions closed by hand, ones where '
       + 'price went through both levels between two runs, and orders the venue refused are counted separately as '
       + '"not counted" — they are facts about the plumbing, not about whether the strategy works.'
@@ -10402,7 +10417,67 @@ document.addEventListener('click', function(e){
         + (br.streak ? ' Current losing streak: <b>' + br.streak + '</b>.' : '')
         + '</div>';
     }
+    h += brainBook(st);
     return h + '<div style="height:10px;"></div>';
+  }
+
+  // ── THE BRAIN'S OWN BOOK (2026-08-21) ───────────────────────────────────────────────────────
+  // John: "why has the brain not been recording the trades." It had been — six hundred of them,
+  // two hundred and twenty-one already graded — and nothing in this app had ever shown him one.
+  //
+  // It is shown split by DIRECTION, always, and that is not decoration. On the day this was
+  // written the book read: 113 longs, 113 wins, 100%; 51 shorts, 0 wins, 0%. Thirty-five hours
+  // of a market that only went up, recorded 164 times. A single "69% win rate" would have hidden
+  // that completely and read like an edge. The split is the finding.
+  function brainBook(st){
+    const sh = st && st.cipher_shadow && st.cipher_shadow.rank_vs_threshold;
+    const recs = sh && Array.isArray(sh.records) ? sh.records : null;
+    if(!recs || !recs.length) return '';
+    const graded = r => r && r.R !== null && r.R !== undefined && Number.isFinite(Number(r.R));
+    const done = recs.filter(graded);   // R: null means STILL OPEN — Number(null) is 0, which is finite
+    if(!done.length){
+      return '<div style="font-size:11px;font-weight:700;color:var(--muted);margin:12px 0 6px;">THE BRAIN\'S PAPER BOOK</div>'
+        + '<div class="bot-why" style="color:var(--dim);">' + recs.length + ' decisions recorded, none graded yet. '
+        + 'It waits a few hours before scoring one, so it is not judging a trade that has had no time to move.</div>';
+    }
+    const cut = (rows) => {
+      const n = rows.length, w = rows.filter(r => Number(r.R) > 0).length;
+      const sum = rows.reduce((a, r) => a + Number(r.R), 0);
+      return { n, w, rate: n ? w / n * 100 : 0, mean: n ? sum / n : 0 };
+    };
+    const L = cut(done.filter(r => r.dir !== 'short'));
+    const S = cut(done.filter(r => r.dir === 'short'));
+    const ts = done.map(r => Number(r.at)).filter(Number.isFinite);
+    const spanH = ts.length ? (Math.max(...ts) - Math.min(...ts)) / 3.6e6 : 0;
+    const row = (label, c) => c.n
+      ? '<div style="display:flex;font-size:12px;border-bottom:1px solid var(--line);padding:5px 0;">'
+        + '<span style="width:64px;font-weight:700;">' + esc(label) + '</span>'
+        + '<span style="width:56px;text-align:right;color:var(--dim);">' + c.n + '</span>'
+        + '<span style="width:64px;text-align:right;color:' + (c.rate >= 50 ? '#9c9' : '#e88') + ';font-weight:700;">' + c.rate.toFixed(0) + '%</span>'
+        + '<span style="flex:1;text-align:right;color:' + (c.mean > 0 ? '#9c9' : c.mean < 0 ? '#e88' : 'var(--muted)') + ';">'
+        + (c.mean >= 0 ? '+' : '') + c.mean.toFixed(2) + 'R avg</span></div>'
+      : '<div style="display:flex;font-size:12px;border-bottom:1px solid var(--line);padding:5px 0;color:var(--dim);">'
+        + '<span style="width:64px;font-weight:700;">' + esc(label) + '</span><span style="flex:1;">never tested — not one graded</span></div>';
+
+    let out = '<div style="font-size:11px;font-weight:700;color:var(--muted);margin:12px 0 6px;">THE BRAIN\'S PAPER BOOK — PLACES NOTHING</div>';
+    out += '<div style="display:flex;font-size:10px;color:var(--dim);padding:0 0 4px;"><span style="width:64px;"></span><span style="width:56px;text-align:right;">graded</span><span style="width:64px;text-align:right;">win rate</span><span style="flex:1;text-align:right;">per trade</span></div>';
+    out += row('LONGS', L);
+    out += row('SHORTS', S);
+
+    // The warning is the point of the panel, so it is not buried under the table as a footnote.
+    const lopsided = (!S.n || !L.n) || Math.abs(L.rate - S.rate) > 60;
+    const brief = spanH < 168;
+    if(lopsided || brief){
+      out += '<div style="border:1px solid #e8c07a;border-radius:6px;padding:8px 10px;margin-top:8px;background:rgba(232,192,122,0.08);font-size:12px;line-height:1.5;color:#e8c07a;">'
+        + '<b>Read this before believing the numbers above.</b> '
+        + (lopsided ? 'The two directions disagree so completely that this is measuring the market, not the rules. ' : '')
+        + (brief ? 'The whole book spans ' + Math.round(spanH) + ' hours — that is one mood of market, sampled ' + done.length + ' times, not ' + done.length + ' independent tests. ' : '')
+        + 'Nothing gets promoted off a book like this any more: the gate now needs at least 10 longs AND 10 shorts across a week before it will hand a rule the wheel.'
+        + '</div>';
+    }
+    out += '<div class="bot-why" style="color:var(--dim);">' + recs.length + ' decisions recorded, ' + done.length + ' graded on real candles after the fact. '
+        + 'These are PAPER — the brain scores every idea it sees, whether or not the bot took it, which is how it can tell a rule from a run of luck.</div>';
+    return out;
   }
 
   async function loadServerLog(){

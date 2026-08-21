@@ -1054,6 +1054,34 @@ async function pushLog(entry) {
   await setJSON(KEY.log, log.slice(0, 300));
 }
 
+// ── THE LEDGER: WHAT ACTUALLY HAPPENED, KEPT (2026-08-21) ────────────────────────────────────
+// John: "why has the brain not been recording the trades, we have had a fair few now."
+// It had. They were then thrown away.
+//
+// cipher_log is a DEBUG FEED, not a record. It holds the last 300 decisions, and roughly 82% of
+// those are notes about trades the bot decided NOT to take — on 2026-08-21 the whole 300 covered
+// twenty-eight hours and contained seven results. Every real trade older than about a day had
+// already been binned. So the scoreboard could only ever count one day, and John could not find
+// out how his own bot was doing at any horizon that mattered.
+//
+// This is the other thing: an append-only ledger of events that actually occurred — orders sent,
+// orders refused, positions resolved — and nothing else. No "passed on this one" chatter, so it
+// fills roughly fifty times slower and a year of trading fits comfortably. It is written NEXT TO
+// the log rather than instead of it, because the log is genuinely useful for debugging the last
+// day and this is genuinely useful for judging the last year. They are different questions.
+const LEDGER_KEY = "cipher_ledger";
+const LEDGER_MAX = 5000;
+async function pushLedger(entry) {
+  try {
+    const led = await getJSON(LEDGER_KEY, []);
+    led.unshift({ at: new Date().toISOString(), ...entry });
+    await setJSON(LEDGER_KEY, led.slice(0, LEDGER_MAX));
+  } catch (e) {
+    // A ledger write must never be able to stop a trade being managed. Record the miss and move on.
+    console.error("ledger write failed (harmless to trading):", e && e.message);
+  }
+}
+
 // ── LIVE CONFIG from the relay (the app's control panel) ──────────────────────────────────────
 // Settings used to live only in the GitHub workflow, so changing the risk or stopping the bot
 // meant editing YAML and committing. Now the app writes them to the relay and we read them here.
@@ -2974,20 +3002,65 @@ async function gradeShadow(sh) {
 
 function armStats(records, arm) {
   const done = records.filter(r => r.arm === arm && r.R !== null);
-  if (!done.length) return { n: 0, meanR: 0, wins: 0 };
+  if (!done.length) return { n: 0, meanR: 0, wins: 0, longs: 0, shorts: 0, spanH: 0 };
   const sum = done.reduce((a, r) => a + r.R, 0);
-  return { n: done.length, meanR: +(sum / done.length).toFixed(3), wins: done.filter(r => r.R > 0).length };
+  const ts = done.map(r => r.at).filter(Number.isFinite);
+  // Direction and span are recorded because a count on its own cannot tell the difference between
+  // fifty-seven tests and one test run fifty-seven times. See the gate below.
+  return { n: done.length, meanR: +(sum / done.length).toFixed(3), wins: done.filter(r => r.R > 0).length,
+           longs: done.filter(r => r.dir !== "short").length,
+           shorts: done.filter(r => r.dir === "short").length,
+           spanH: ts.length ? +((Math.max(...ts) - Math.min(...ts)) / 3.6e6).toFixed(1) : 0 };
 }
 
 // Promotion and demotion, on evidence only. Both arms need a real sample: a variant that beats a
 // baseline of four trades has proved nothing, and this is exactly where a system talks itself
 // into a change it likes the look of.
+// ── A SAMPLE IS NOT EVIDENCE UNTIL IT HAS BEEN TESTED BOTH WAYS (2026-08-21) ─────────────────
+// Caught on 2026-08-21, and it is the most expensive kind of wrong this file can be: a rule that
+// was promoted for being right, when it had only ever been asked an easy question.
+//
+// The record at the moment of the audit:
+//     every LONG   113 trades, 113 wins, 100%
+//     every SHORT   51 trades,   0 wins,   0%
+// Across thirty-five hours in which Bitcoin went up and did not stop. The variant arm — the one
+// the gate promoted, on a flawless 57 from 57 — contained NOT ONE SHORT. It scored perfectly
+// because it happened to hold only longs during a rally, and the gate had no way to notice: it
+// checked the count, the edge, and that the winner made money, all of which were true.
+//
+// Counting trades measures how long you looked. It does not measure how much you saw. So the
+// gate now also asks whether the sample contains both directions and spans more than one mood
+// of market. A variant that has never been short has not been tested; it has been flattered.
+const SHADOW_MIN_SIDE   = 10;   // at least this many LONGS and this many SHORTS, in each arm
+const SHADOW_MIN_SPAN_H = 168;  // and the decisions must span at least a week, not a good afternoon
+function armTested(a) {
+  return a.longs >= SHADOW_MIN_SIDE && a.shorts >= SHADOW_MIN_SIDE && a.spanH >= SHADOW_MIN_SPAN_H;
+}
+function whyNotTested(a) {
+  const gaps = [];
+  if (a.longs < SHADOW_MIN_SIDE) gaps.push(`only ${a.longs} longs`);
+  if (a.shorts < SHADOW_MIN_SIDE) gaps.push(a.shorts === 0 ? "not one short" : `only ${a.shorts} shorts`);
+  if (a.spanH < SHADOW_MIN_SPAN_H) gaps.push(`only ${Math.round(a.spanH)}h of decisions`);
+  return gaps.join(", ");
+}
+
 function shadowJudge(sh, id) {
   const slot = shadowSlot(sh, id);
   const base = armStats(slot.records, "baseline"), varr = armStats(slot.records, "variant");
-  const ready = base.n >= SHADOW_MIN_RESOLVED && varr.n >= SHADOW_MIN_RESOLVED;
+  const counted = base.n >= SHADOW_MIN_RESOLVED && varr.n >= SHADOW_MIN_RESOLVED;
+  const tested = armTested(base) && armTested(varr);
+  const ready = counted && tested;
   const edge = +(varr.meanR - base.meanR).toFixed(3);
-  let changed = null;
+  let changed = null, why = null;
+
+  // Unwind anything promoted before this bar existed. A promotion granted on evidence that would
+  // not be accepted today is not grandfathered — it is exactly the thing being corrected.
+  if (slot.promoted && !tested) {
+    slot.promoted = false; changed = "demoted";
+    why = `promoted on a sample that was never really tested — ${whyNotTested(varr) || whyNotTested(base)}. Back to the baseline rule until the evidence covers both directions over at least a week.`;
+    slot.history.push({ at: Date.now(), changed, why, base, varr, edge });
+    return { ready, tested, base, varr, edge, promoted: false, changed, why };
+  }
   // ── BEATING A LOSER IS NOT WINNING (2026-08-18) ──────────────────────────────────────────────
   // On 2026-08-18 this gate promoted rank_vs_threshold on an edge of +0.084R — while the variant
   // was losing 0.705R a trade and the baseline 0.789R. "Better than the incumbent" was the only
@@ -3001,8 +3074,8 @@ function shadowJudge(sh, id) {
     // clause also unwinds any promotion granted before the floor existed.
     slot.promoted = false; changed = "demoted";
   }
-  if (changed) slot.history.push({ at: Date.now(), changed, base, varr, edge });
-  return { ready, base, varr, edge, promoted: slot.promoted, changed };
+  if (changed) slot.history.push({ at: Date.now(), changed, why, base, varr, edge });
+  return { ready, tested, base, varr, edge, promoted: slot.promoted, changed, why };
 }
 
 // ═══════════ THE ACCUMULATOR, RUN INDEPENDENTLY OF THE FUTURES BOT (2026-08-19) ═══════════
@@ -3692,6 +3765,14 @@ export default async function cipherAgent() {
     await pushLog({ ...t, qty: built.meta.qty, risk: built.meta.riskActual, clamped: built.meta.clamped || undefined, mode, orderID: oid, entryKind: built.meta.entryKind, stopKind: built.meta.stopKind, book, recovered: recovered ? recovered.trim() : undefined, via: EXEC(), attempt: attempts[key], diag: ok ? undefined : r.diag, result: ok ? (r.data.dryRun ? "dry-run OK" : "PLACED" + recovered) : "REJECTED (not a signal) — " + explainRejection(why).label,
       rejection: ok ? undefined : { ...explainRejection(why), raw: String(why).slice(0, 120) },
       countsForStats: ok ? true : false, thesis: sig.ev.join("; ") + " · plan from " + (sig.planTf || "1D") + (sig.detector ? " · " + sig.detector + " detector" + (sig.alt ? " (best of " + (sig.alt + 1) + " hits)" : "") : " · confluence") });
+    // The ledger gets the order attempt too, so a rejection rate can be measured over months
+    // rather than over whatever happens to still be in the last 300 log lines.
+    await pushLedger({ kind: ok ? "placed" : "rejected", coin: t.coin, dir: t.dir, book,
+      entry: t.entry, stop: t.sl, target: t.tp1, qty: built.meta.qty, risk: built.meta.riskActual,
+      mode, via: EXEC(), orderID: oid || undefined,
+      dryRun: ok ? !!r.data.dryRun : undefined,
+      rejection: ok ? undefined : { ...explainRejection(why), raw: String(why).slice(0, 120) },
+      countsForStats: !!ok });
     // fired[] was set BEFORE the attempt, so a failed order still burned the coin for the whole
     // day — 17 signals in Aug were lost twice over: no order placed AND no retry. A server-side
     // fault is not a decision, so undo the mark and let the next sweep have another go. A 4xx IS
@@ -3967,6 +4048,15 @@ export default async function cipherAgent() {
           (r.klass === "execution_artifact"
             ? " This is an EXECUTION ARTIFACT: it does not count toward the loss streak or the strategy's record."
             : r.how === "target" ? " Target hit, queued for a reverse look." : "") });
+      await pushLedger({ kind: "resolved", coin: r.coin, dir: r.dir, book: r.book || undefined,
+        how: r.how, outcome: r.outcome, klass: r.klass, execution: r.execution,
+        R: Number.isFinite(r.R) ? r.R : undefined,
+        entry: r.plan && Number.isFinite(r.plan.entry) ? r.plan.entry : undefined,
+        stop: r.plan && Number.isFinite(r.plan.stop) ? r.plan.stop : undefined,
+        target: r.plan && Number.isFinite(r.plan.target) ? r.plan.target : undefined,
+        exit: Number.isFinite(r.exit) ? r.exit : undefined,
+        opened: r.since || undefined,
+        countsForStats: !!r.countsForStats, countsForStreak: !!r.countsForStreak });
       delete bookMap[posKey(r.coin, r.dir)];
       if (r.how === "target") queue.push(r.coin);
     }
