@@ -3,11 +3,16 @@
 // execution artifact can never be counted as a strategy result, in either direction.
 import fs from 'node:fs';
 const src = fs.readFileSync('index.html', 'utf8');
-const a = src.indexOf('  function tallyLog(log){');
-const b = src.indexOf('  async function loadServerLog(){');
+const a = src.indexOf('  function tallyLog(log');
+const b = src.indexOf("  // \u2500\u2500 THE SERVER BOT'S STATE, CACHED");
 if (a < 0 || b < 0) { console.log('FAIL: could not extract the scoreboard'); process.exit(1); }
 const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
-const { tallyLog, botScoreboard, brainBook } = new Function('esc', src.slice(a, b) + '; return { tallyLog, botScoreboard, brainBook };')(esc);
+// A stand-in for the browser bits the scoreboard touches, so the marker can be driven from a test.
+let STORE = {};
+const localStorage = { getItem: k => (k in STORE ? STORE[k] : null), setItem: (k, v) => { STORE[k] = String(v); }, removeItem: k => { delete STORE[k]; } };
+const window = {};
+const loadServerLog = () => {};
+const { tallyLog, botScoreboard, brainBook, pnlSince, midnightMs } = new Function('esc','localStorage','window','loadServerLog', src.slice(a, b) + '; return { tallyLog, botScoreboard, brainBook, pnlSince, midnightMs };')(esc, localStorage, window, loadServerLog);
 
 let pass = 0, fail = 0;
 const ok = (n, c, x) => { c ? (pass++, console.log('  ok   ' + n)) : (fail++, console.log('  FAIL ' + n + (x !== undefined ? ' → ' + String(x).slice(0, 160) : ''))); };
@@ -147,6 +152,42 @@ console.log('\n9. THE BRAIN\'S BOOK — the direction split is the finding');
   ok('an empty book says so rather than rendering blank', /none graded yet/.test(brainBook({ cipher_shadow:{ rank_vs_threshold:{ records:[{arm:'baseline',dir:'long',R:null,at:now}] } } })));
   ok('no shadow at all renders nothing', brainBook({}) === '');
   ok('a direction never tested is named as such', /never tested/.test(brainBook({ cipher_shadow:{ rank_vs_threshold:{ records: mk('long',20,2) } } })));
+}
+
+console.log('\n10. A day P&L you can zero');
+{
+  STORE = {};
+  const now = Date.now(), DAY = 864e5;
+  const row = (ms, R) => ({ at: new Date(ms).toISOString(), kind:'resolved', coin:'BTC',
+                            how: R > 0 ? 'target' : 'stop', klass:'strategy', R, countsForStats:true });
+  const mid = midnightMs();
+  const st = { cipher_ledger: [ row(now - 1000, 2.25), row(now - 2000, -1), row(mid - DAY/2, 5) ] };
+
+  ok('the marker defaults to midnight', pnlSince() === mid);
+  const today = tallyLog(st.cipher_ledger, pnlSince());
+  ok("yesterday's +5R is excluded from today", Math.abs(today.R - 1.25) < 1e-9, today.R);
+  ok('but the all-time total still contains it', Math.abs(tallyLog(st.cipher_ledger).R - 6.25) < 1e-9);
+
+  const h = botScoreboard(st, []);
+  ok('the panel shows a today row', /today — R/.test(h) && /today — P&amp;L|today — P&L/.test(h), h.match(/today[^<]*/g));
+  ok('and a reset control', /resetDayPnl\(\)/.test(h));
+  ok('which says what it is counting from', /counting from midnight/.test(h));
+
+  // Reset moves the marker to now: today's two trades fall outside it.
+  window.resetDayPnl();
+  ok('resetting moves the marker forward', pnlSince() > mid);
+  ok('and the day count goes to nothing', tallyLog(st.cipher_ledger, pnlSince()).graded === 0);
+  const h2 = botScoreboard(st, []);
+  ok('the label changes so you know you are not seeing a full day', /since reset — R/.test(h2));
+  ok('and there is a way back', /resetDayPnl\(true\)/.test(h2));
+  ok('the all-time record is untouched by a reset', /TRADES|trades/.test(h2) && /\+6\.25|6\.25/.test(h2), h2.match(/[-+]?\d+\.\d\dR?/g));
+
+  window.resetDayPnl(true);
+  ok('going back to midnight restores the day', pnlSince() === midnightMs());
+
+  // A marker left over from yesterday must not present yesterday's window as today.
+  STORE['mc_pnl_since'] = String(mid - 3 * 36e5);
+  ok('a stale marker from yesterday rolls forward to midnight', pnlSince() === midnightMs());
 }
 
 console.log(`\n${pass} passed, ${fail} failed`);

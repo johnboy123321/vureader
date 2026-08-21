@@ -3013,7 +3013,7 @@ function closeQROutside(e) {
 // ═══════════════════════════ SETTINGS ═══════════════════════════
 // Model routing: 'smart' = deep-analysis model (chart reads/verdicts); 'light' = cheap model for mechanical jobs.
 // Build stamp — bump on every deploy so "which version am I running?" has a true answer.
-const APP_BUILD = 'v4.1 · 21 Aug 2026 · a permanent trade ledger (the debug log only ever held 28 hours); a scoreboard on Bot Trades; the brain\'s paper book shown split by direction; promotion now needs both directions across a week, and the rule promoted on 35 hours of a rally has been unwound';
+const APP_BUILD = 'v4.2 · 21 Aug 2026 · a day P&L you can zero (and put back); the in-app chat can now read the 24/7 agent, the ledger, the accumulator and the paper book — it had been answering from the app feed that has been dormant since 15 Aug';
 // ── STALE PAGE GUARD (2026-08-21) ────────────────────────────────────────────────────────────
 // GitHub Pages sets a cache header on index.html, and a phone with this saved to its home screen
 // will hold that copy for days. On 2026-08-21 John reported two bugs — "sells 0 / buy-backs 0"
@@ -4115,6 +4115,88 @@ If asked "is my stop on the exchange": positions DO show their stops correctly a
 }
 
 // ── BOT EXEC CONTEXT: give the brain live knowledge of the bot's decisions + exchange positions ──
+// ── WHAT THE 24/7 AGENT IS DOING, IN THE BRAIN'S OWN CONTEXT (2026-08-21) ────────────────────
+// Everything above this reads localStorage, which is the APP's execution feed. Since 2026-08-15
+// the app places nothing and the GitHub Actions agent does all the trading, so on its own the
+// block above describes a bot that has not traded in a week. This adds the one that has.
+//
+// Read from the cached agent-state.json — the same file the panels read, so the chat and the
+// screen cannot disagree. If the cache is empty it says so plainly rather than staying silent:
+// a missing feed the model does not know is missing is how confident fiction gets written.
+function serverBotContext() {
+  try {
+    const snap = (typeof window !== 'undefined' && window.getServerState) ? window.getServerState() : null;
+    if (!snap || !snap.st) return '\n\nSERVER BOT (the 24/7 agent): its state has not been read yet this session. Say so rather than guessing — do NOT describe the agent from the app feed above, which is a different bot and has been dormant since 2026-08-15.';
+    const st = snap.st;
+    const ageMin = Math.round((Date.now() - snap.at) / 60000);
+    let o = '\n\nSERVER BOT (the 24/7 GitHub Actions agent — THIS is the one that trades; the app feed above is dormant). State read ' + (ageMin < 1 ? 'just now' : ageMin + ' min ago') + '.';
+
+    const hb = st.cipher_heartbeat;
+    if (hb) o += '\nLast run ' + Math.round((Date.now() - new Date(hb.at).getTime()) / 60000) + ' min ago · scanned ' + hb.scanned + ' · ' + hb.candidates + ' candidates · ' + hb.placed + ' placed · mode ' + (hb.mode || '?') + ' · via ' + (hb.via || '?') + '.';
+
+    // The graded record, counted the same way the panel counts it.
+    const led = Array.isArray(st.cipher_ledger) ? st.cipher_ledger : null;
+    const rows = led && led.length ? led : (Array.isArray(st.cipher_log) ? st.cipher_log : []);
+    let wins = 0, losses = 0, R = 0, rUnknown = 0, artifacts = 0, rejected = 0;
+    for (const e of rows) {
+      const kind = e.kind || '', res = String(e.result || '');
+      if (kind === 'rejected' || /^(REJECTED|ERR)/.test(res)) rejected++;
+      if (kind !== 'resolved' && !/^RESOLVED/.test(res)) continue;
+      let how = e.how, counts = e.countsForStats;
+      if (how === undefined) { const m = /^\S+\s+\S+\s+(\S+)/.exec(String(e.skipped || '')); how = m ? m[1] : ''; counts = (how === 'target' || how === 'stop'); }
+      if (!counts) { artifacts++; continue; }
+      if (how === 'target') wins++; else if (how === 'stop') losses++;
+      if (e.R !== null && e.R !== undefined && Number.isFinite(Number(e.R))) R += Number(e.R); else rUnknown++;
+    }
+    const graded = wins + losses;
+    o += '\nTHE RECORD (' + (led && led.length ? 'permanent ledger, ' + led.length + ' real events' : 'debug log only — last 300 decisions, roughly a day') + '): '
+      + graded + ' graded trades, ' + wins + ' won, ' + losses + ' lost'
+      + (graded ? ', ' + Math.round(wins / graded * 100) + '% win rate' : '')
+      + (rUnknown < graded ? ', total ' + (R > 0 ? '+' : '') + R.toFixed(2) + 'R' : '')
+      + '. NOT COUNTED: ' + artifacts + ' execution artifacts (hand-closed or ambiguous) and ' + rejected + ' venue rejections. '
+      + 'Only trades that reached their own stop or target are graded — never fold artifacts or rejections into a win rate, they are facts about the plumbing.';
+
+    const op = st.cipher_open ? Object.values(st.cipher_open).filter(Boolean) : [];
+    o += '\nOPEN AT THE VENUE: ' + (op.length ? op.map(p => p.coin + ' ' + p.dir + ' size ' + p.size + (p.plan ? ' (stop ' + p.plan.stop + ', target ' + p.plan.target + ')' : ' NO PLAN')).join('; ') : 'none');
+    const orph = Array.isArray(st.cipher_unprotected) ? st.cipher_unprotected : [];
+    if (orph.length) o += '\nUNPROTECTED (no stop, no target, not in any book — say this plainly if asked anything about positions): ' + orph.map(p => p.coin + ' ' + p.dir).join(', ');
+    const br = st.cipher_breaker || {};
+    if (br.dayEq) o += '\nDRAWDOWN GUARD: measuring today from ' + Math.round(br.dayEq) + ' USDT, this week from ' + Math.round(br.weekEq || 0) + ' USDT. Losing streak ' + (br.streak || 0) + '. This is the ANCHOR it measures from, NOT the current balance — the app cannot see the live balance.';
+
+    // The accumulator: a different scoreboard, counted in coins.
+    const a = st.cipher_accum;
+    if (a) {
+      const px = Number(a.pxNow) || 0;
+      const units = (Number(a.units) || 0) + (px ? (Number(a.cash) || 0) / px : 0);
+      const start = Number(a.startUnits) > 0 ? Number(a.startUnits) : 1;
+      const lf = a.liveFlip || {};
+      o += '\n\nACCUMULATOR (SPOT, a SECOND strategy scored in COINS not pounds; buy-and-hold ends with exactly the starting units and that is the line to beat): '
+        + 'started ' + start.toFixed(8) + ' BTC, now ' + units.toFixed(8) + ' BTC (' + ((units / start - 1) * 100).toFixed(2) + '% vs holding). '
+        + 'Arming: ' + (a.exec || '?') + '. '
+        + (lf.tf ? 'The ' + lf.tf + ' dot flip currently holds the real coins — ' + (lf.sells || 0) + ' sells, ' + (lf.trips || 0) + ' round trips, ' + (lf.holding ? 'holding coins' : 'sitting in cash') + '. The pump ladder is stood down.'
+                 : 'The pump ladder holds the coins; no dot-flip timeframe is armed.')
+        + (Array.isArray(a.open) && a.open.length ? ' ' + a.open.length + ' buy-back rungs still resting.' : '');
+      o += '\nKNOWN DEFECT (found 2026-08-21, not yet fixed): a resting buy-back rung never expires, and the 4-ladder cap counts dead ladders, so three ladders laid in Oct 2023 at ~26k jammed the pump ladder completely from Sep 2024 onward. Backtested 2023-26 it ends with 0.77 BTC against 1.00 held. Do not describe the pump ladder as working.';
+    }
+
+    // The shadow book — and the reason not to believe its headline.
+    const sh = st.cipher_shadow && st.cipher_shadow.rank_vs_threshold;
+    const recs = sh && Array.isArray(sh.records) ? sh.records : null;
+    if (recs && recs.length) {
+      const done = recs.filter(r => r && r.R !== null && r.R !== undefined && Number.isFinite(Number(r.R)));
+      const side = d => { const x = done.filter(r => (d === 'short' ? r.dir === 'short' : r.dir !== 'short')); const w = x.filter(r => Number(r.R) > 0).length; return { n: x.length, w, rate: x.length ? Math.round(w / x.length * 100) : null }; };
+      const L = side('long'), S = side('short');
+      const ts = done.map(r => Number(r.at)).filter(Number.isFinite);
+      const spanH = ts.length ? Math.round((Math.max(...ts) - Math.min(...ts)) / 3.6e6) : 0;
+      o += '\n\nTHE BRAIN\'S PAPER BOOK (shadow framework — scores every idea it sees, places NOTHING): ' + recs.length + ' decisions, ' + done.length + ' graded on real candles after the fact. '
+        + 'LONGS ' + L.n + ' at ' + (L.rate === null ? 'n/a' : L.rate + '%') + ', SHORTS ' + S.n + ' at ' + (S.rate === null ? 'n/a' : S.rate + '%') + ', over ' + spanH + ' hours of decisions. '
+        + 'ALWAYS quote the direction split, never a single blended win rate: on 2026-08-21 it was 113 longs all winning and 51 shorts all losing across 35 hours, which measures the market going up, not the rules working. '
+        + 'A variant was promoted off that and has been unwound; the gate now needs at least 10 longs AND 10 shorts spanning a week before anything is promoted.';
+    }
+    return o;
+  } catch (e) { return '\n\nSERVER BOT: could not read its state (' + (e && e.message) + '). Say so rather than describing it from the app feed above.'; }
+}
+
 function botContext() {
   try {
     const g = k => { try { return localStorage.getItem(k); } catch { return null; } };
@@ -4158,6 +4240,7 @@ function botContext() {
         + '. If the user asks why there are no trades, use THESE numbers — distinguish "the market is quiet" (few matches) from "the same setups already fired today" (many matches, few new). Never guess at settings; the minimum score and mode are stated above.';
     } catch (e) {}
     out += '\nWhen asked why a trade was taken or passed, quote its logged reason/thesis. If an open position shows no stop or a test-fire origin, tell the user plainly and urge closing it or setting a stop on Phemex.';
+    out += serverBotContext();
     return out;
   } catch (e) { return ''; }
 }
@@ -10325,9 +10408,10 @@ document.addEventListener('click', function(e){
   //      like it was losing when it had not been asked a question yet.
   //   2. The window is stated. The bot keeps the last 300 decisions and no more, so "12 wins"
   //      without "since Wednesday" is a number with no denominator.
-  function tallyLog(log){
+  function tallyLog(log, sinceMs){
     const t = { wins:0, losses:0, R:0, rUnknown:0, artifacts:0, rejected:0, placed:0, graded:0, risk:null };
     for(const e of (log||[])){
+      if(sinceMs){ const ts = new Date(e.at).getTime(); if(!(ts >= sinceMs)) continue; }
       // A ledger row names its own kind; a log row has to be read off the result string. Both
       // shapes are accepted so the panel keeps working through the changeover.
       const kind = e.kind || '';
@@ -10353,6 +10437,23 @@ document.addEventListener('click', function(e){
     return t;
   }
 
+  // The marker lives in this browser. Default: midnight local, so "today" means today without
+  // anyone having to press anything on a fresh device.
+  const PNL_SINCE_KEY = 'mc_pnl_since';
+  function midnightMs(){ const d = new Date(); d.setHours(0,0,0,0); return d.getTime(); }
+  function pnlSince(){
+    let v = null; try { v = localStorage.getItem(PNL_SINCE_KEY); } catch(e){}
+    const n = Number(v);
+    // A marker from a previous day is stale — roll it forward rather than showing yesterday's
+    // reset as if it were today's number.
+    return (Number.isFinite(n) && n > midnightMs()) ? n : midnightMs();
+  }
+  function markerIsMidnight(){ return pnlSince() === midnightMs(); }
+  window.resetDayPnl = function(toMidnight){
+    try { toMidnight ? localStorage.removeItem(PNL_SINCE_KEY) : localStorage.setItem(PNL_SINCE_KEY, String(Date.now())); } catch(e){}
+    try { loadServerLog(); } catch(e){}
+  };
+
   function botScoreboard(st, log){
     // ── COUNT THE LEDGER, NOT THE DEBUG FEED (2026-08-21) ──────────────────────────────────
     // The first version of this counted cipher_log, which is the last 300 decisions and nothing
@@ -10370,6 +10471,16 @@ document.addEventListener('click', function(e){
     const rate = t.graded ? (t.wins / t.graded * 100) : null;
     const gbp = t.R * risk;
     const rCol = t.R > 0 ? '#9c9' : t.R < 0 ? '#e88' : 'var(--muted)';
+    // ── A DAY P&L YOU CAN ZERO (2026-08-21) ─────────────────────────────────────────────
+    // John: "should show a day P&L which we can reset later." Two numbers, then: the running
+    // total since the ledger began, and a short one you control. The marker is kept in THIS
+    // browser, not on the bot — pressing reset changes what you are looking at and must never
+    // change what the bot is doing. It also cannot destroy anything: the ledger is untouched,
+    // so a reset is a change of view and is always undoable by resetting back to midnight.
+    const dayTally = tallyLog(source, pnlSince());
+    const dayGbp = dayTally.R * risk;
+    const dayCol = dayTally.R > 0 ? '#9c9' : dayTally.R < 0 ? '#e88' : 'var(--muted)';
+    const dayNoR = dayTally.graded > 0 && dayTally.rUnknown === dayTally.graded;
     const first = log && log.length ? log[log.length-1].at : null;
     const since = first ? new Date(first).toLocaleString(undefined,{month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'}) : '—';
 
@@ -10393,6 +10504,21 @@ document.addEventListener('click', function(e){
               noR ? 'var(--dim)' : rCol, noR ? 'no R on record yet' : 'what that R is worth');
     h += tile('open now', open.length, open.length ? '#8bd' : 'var(--dim)', open.length ? (open.map(o=>o.coin).slice(0,4).join(' ') + (open.length > 4 ? ' +' + (open.length - 4) + ' more' : '')) : 'nothing at risk');
     h += tile('not counted', t.artifacts + t.rejected, (t.artifacts + t.rejected) ? '#e8c07a' : 'var(--dim)', t.artifacts + ' artifacts · ' + t.rejected + ' rejected');
+    h += '</div>';
+
+    const sinceLbl = markerIsMidnight() ? 'today' : 'since reset';
+    h += '<div style="display:flex;flex-wrap:wrap;gap:6px;align-items:stretch;margin-bottom:6px;">';
+    h += tile(sinceLbl + ' — trades', dayTally.graded, dayTally.graded ? null : 'var(--dim)',
+              dayTally.graded ? dayTally.wins + ' won · ' + dayTally.losses + ' lost' : 'nothing graded yet');
+    h += tile(sinceLbl + ' — R', dayNoR || !dayTally.graded ? '—' : (dayTally.R > 0 ? '+' : '') + dayTally.R.toFixed(2),
+              dayNoR || !dayTally.graded ? 'var(--dim)' : dayCol);
+    h += tile(sinceLbl + ' — P&L', dayNoR || !dayTally.graded ? '—' : (dayGbp >= 0 ? '+£' : '−£') + Math.abs(dayGbp).toFixed(2),
+              dayNoR || !dayTally.graded ? 'var(--dim)' : dayCol, 'at £' + risk + ' a trade');
+    h += '<div style="flex:1 1 90px;min-width:90px;padding:8px 10px;border:1px solid var(--line);border-radius:6px;display:flex;flex-direction:column;justify-content:center;gap:5px;">'
+      +  '<button onclick="resetDayPnl()" style="padding:6px 8px;font-size:12px;cursor:pointer;border-radius:5px;border:1px solid #4a4a4a;background:rgba(255,255,255,0.07);color:#cfcfcf;">Reset to now</button>'
+      +  (markerIsMidnight() ? '<div style="font-size:10px;color:var(--dim);text-align:center;">counting from midnight</div>'
+                             : '<button onclick="resetDayPnl(true)" style="padding:5px 8px;font-size:11px;cursor:pointer;border-radius:5px;border:1px solid transparent;background:transparent;color:var(--dim);text-decoration:underline;">back to midnight</button>')
+      +  '</div>';
     h += '</div>';
 
     // Every number above has a denominator, and here it is. A record without its window is a
@@ -10480,12 +10606,38 @@ document.addEventListener('click', function(e){
     return out;
   }
 
+  // ── THE SERVER BOT'S STATE, CACHED FOR THE BRAIN (2026-08-21) ──────────────────────────────
+  // John: "make sure the brain has full read access to this desktop, same with the accumulator."
+  // It did not have it. botContext() below was built when the app placed its own orders, so it
+  // reads localStorage — the APP's exec log — and knows nothing whatsoever about the 24/7 agent,
+  // the ledger, the accumulator or the shadow book. Ask the chat "how is the bot doing" and it
+  // would answer confidently from a feed that has been dormant since the agent took over on
+  // 2026-08-15. Confidently, and about the wrong bot.
+  //
+  // So the same state file the panels read is cached here the moment any panel fetches it, plus
+  // a refresh on load and every five minutes, and the brain is handed a summary of it. Cached
+  // rather than fetched on demand because building the prompt has to be synchronous — and a
+  // stale-but-timestamped snapshot is honest, whereas a missing one invites invention.
+  let SRV_STATE = null, SRV_STATE_AT = 0;
+  async function refreshServerState(){
+    try{
+      const res = await fetch(SRV_STATE_URL + '?t=' + Date.now(), { cache:'no-store' });
+      if(!res.ok) return null;
+      SRV_STATE = JSON.parse(await res.text()); SRV_STATE_AT = Date.now();
+      return SRV_STATE;
+    }catch(e){ return null; }
+  }
+  window.refreshServerState = refreshServerState;
+  window.getServerState = () => (SRV_STATE ? { st: SRV_STATE, at: SRV_STATE_AT } : null);
+  window.addEventListener('load', () => { setTimeout(refreshServerState, 3000); setInterval(refreshServerState, 300000); });
+
   async function loadServerLog(){
     const el = document.getElementById('srv-log'); if(!el) return;
     try{
       const res = await fetch(SRV_STATE_URL + '?t=' + Date.now(), { cache:'no-store' });
       if(!res.ok){ el.innerHTML = '<div style="font-size:11px;color:var(--dim);">could not read the server log (' + res.status + ')</div>'; return; }
       const st = JSON.parse(await res.text());
+      SRV_STATE = st; SRV_STATE_AT = Date.now();
       const hb = st.cipher_heartbeat, log = Array.isArray(st.cipher_log) ? st.cipher_log : [];
       try{ renderAccum(st, log); }catch(err){ }
       let h = '';
@@ -10541,6 +10693,7 @@ document.addEventListener('click', function(e){
       const res = await fetch(SRV_STATE_URL + '?t=' + Date.now(), { cache:'no-store' });
       if(!res.ok){ el.innerHTML = '<div style="font-size:11px;color:var(--dim);">could not read the bot state (' + res.status + ')</div>'; return; }
       const st = JSON.parse(await res.text());
+      SRV_STATE = st; SRV_STATE_AT = Date.now();
       renderAccum(st, Array.isArray(st.cipher_log) ? st.cipher_log : []);
     }catch(e){ el.innerHTML = '<div style="font-size:11px;color:var(--dim);">state unavailable: ' + esc(String(e && e.message || e)) + '</div>'; }
   }
