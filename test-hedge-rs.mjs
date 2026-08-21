@@ -11,6 +11,10 @@ fs.writeFileSync(out, src.replace(/\n\/\/ ── Node \/ GitHub Actions entry po
   '\nexport { hedgeCloseOrder, closeOrderFor, rsBand, rsBoxes, rsVerdict, RS_BANDS, RS_LOOKBACK_D, RS_MIN_FIELD, REGIME_MIN_PER_BOX, shadowRecord };\n');
 const M = await import(pathToFileURL(out).href);
 
+const T0 = 1787000000000, DAY = 864e5;
+// A fixture has to span what the gate now asks for — a fortnight, not a run of milliseconds.
+// Both halves of one afternoon are still one afternoon (see BOX_MIN_SPAN_H).
+const spread = (i, n = 60) => T0 + i * (14 * DAY / Math.max(1, n - 1));
 let pass = 0, fail = 0;
 const ok = (n, c, x) => { c ? (pass++, console.log('  ok   ' + n)) : (fail++, console.log('  FAIL ' + n + (x !== undefined ? ' → ' + x : ''))); };
 
@@ -61,13 +65,13 @@ console.log('\n5. The same both-halves gate as the regime experiment');
 {
   const mk = (rs, R, at) => ({ arm: 'baseline', rs, R, at });
   // a box that pays handsomely then gives it back must not be believed
-  const flip = []; for (let i = 0; i < 60; i++) flip.push(mk(0.9, i < 30 ? 3 : -1, 1000 + i));
+  const flip = []; for (let i = 0; i < 60; i++) flip.push(mk(0.9, i < 30 ? 3 : -1, spread(i)));
   ok('a box that flips is not believed', M.rsVerdict(flip).trustworthy.length === 0);
-  const steady = []; for (let i = 0; i < 60; i++) steady.push(mk(0.9, i % 3 === 0 ? 2.25 : -0.4, 1000 + i));
+  const steady = []; for (let i = 0; i < 60; i++) steady.push(mk(0.9, i % 3 === 0 ? 2.25 : -0.4, spread(i)));
   ok('a box that holds in both halves is', M.rsVerdict(steady).trustworthy.length === 1);
-  const thin = []; for (let i = 0; i < 40; i++) thin.push(mk(0.9, 2, 1000 + i));
+  const thin = []; for (let i = 0; i < 40; i++) thin.push(mk(0.9, 2, spread(i, 40)));
   ok('too small a sample is not believed however good', M.rsVerdict(thin).trustworthy.length === 0);
-  const mixed = [...steady, ...Array.from({ length: 60 }, (_, i) => ({ ...mk(0.9, 5, i), arm: 'variant' }))];
+  const mixed = [...steady, ...Array.from({ length: 60 }, (_, i) => ({ ...mk(0.9, 5, spread(i)), arm: 'variant' }))];
   ok('variant-arm records are excluded', M.rsVerdict(mixed).boxes['d. with the leader'].n === 60);
   ok('ungraded records are excluded', M.rsVerdict([...steady, mk(0.9, null, 1)]).boxes['d. with the leader'].n === 60);
 }

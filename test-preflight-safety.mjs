@@ -146,5 +146,19 @@ console.log('\n  10. DROPPED TRADES — a venue refusal must never cost a tradin
   ok('a failed de-hedge no longer reports itself as a success', /"DE-HEDGE FAILED"/.test(src) && !/ERR de-hedge/.test(src));
 }
 
+console.log('\n  11. EVERY BRAIN GATE ASKS FOR MORE THAN ONE AFTERNOON');
+{
+  // The 2026-08-21 morning fix covered the promotion gate only. regime_direction, relative
+  // strength and the insight scanner were still publishing verdicts off the same 35-hour book.
+  ok('there is one span bar, not three different ones', /const BOX_MIN_SPAN_H = 168;/.test(src));
+  ok('the regime gate uses it', /if \(!boxSpansEnough\(b\)\) continue;\s+\/\/ …over more than one afternoon/.test(src));
+  ok('the relative-strength gate uses it', (src.match(/if \(!boxSpansEnough\(b\)\) continue;/g) || []).length >= 2);
+  ok('the insight scanner uses it', /spanH >= BOX_MIN_SPAN_H/.test(src));
+  ok('every box reports its own span, so a refusal is explainable', (src.match(/spanH: spanHoursOf\(sorted\)/g) || []).length >= 2);
+  ok('and the promotion gate still has the both-directions bar', /const SHADOW_MIN_SIDE   = 10;/.test(src));
+  ok('none of these gates filter a trade — they stay advisory', /Still advisory — nothing is filtered/.test(src));
+  ok('a feature that cannot run says so on the record rather than staying silent', /result: "OFF"/.test(src));
+}
+
 console.log(`\n  ${pass} passed, ${fail} failed\n`);
 process.exit(fail?1:0);

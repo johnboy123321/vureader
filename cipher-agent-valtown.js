@@ -1995,7 +1995,7 @@ function rsBoxes(records) {
     const sorted = [...rs].sort((a, b) => a.at - b.at);
     const half = Math.floor(sorted.length / 2);
     const meanOf = a => a.length ? +(a.reduce((x, r) => x + r.R, 0) / a.length).toFixed(3) : null;
-    out[k] = { n: sorted.length, meanR: meanOf(sorted), firstHalf: meanOf(sorted.slice(0, half)), secondHalf: meanOf(sorted.slice(half)) };
+    out[k] = { n: sorted.length, spanH: spanHoursOf(sorted), meanR: meanOf(sorted), firstHalf: meanOf(sorted.slice(0, half)), secondHalf: meanOf(sorted.slice(half)) };
   }
   return out;
 }
@@ -2005,6 +2005,7 @@ function rsVerdict(records) {
   const trustworthy = [];
   for (const [k, b] of Object.entries(boxes)) {
     if (b.n < REGIME_MIN_PER_BOX * 2) continue;
+    if (!boxSpansEnough(b)) continue;
     if (b.firstHalf === null || b.secondHalf === null) continue;
     if ((b.firstHalf > 0) === (b.secondHalf > 0)) trustworthy.push({ box: k, ...b, sign: b.meanR > 0 ? "pays" : "costs" });
   }
@@ -2070,6 +2071,27 @@ function regimeBreadthTally(reg, dailyBars) {
 }
 
 // ── the 2x2, and the stability test that decides whether to believe it ────────────────────────
+// ── BOTH HALVES OF ONE AFTERNOON ARE STILL ONE AFTERNOON (2026-08-21) ───────────────────────
+// Every experiment below guards itself the same way: a box is believed only if BOTH halves of its
+// own history agree on the sign. That was written after the 2026-08-17 lesson and it is a good
+// rule — but it has a blind spot, and on 2026-08-21 the blind spot was the whole result.
+//
+// The live book that day: 113 longs, 113 wins; 51 shorts, 51 losses; 35 hours, every decision.
+// So "a. fighting the field" showed firstHalf 2.25 and secondHalf 2.25 and sailed through the
+// stability check — because both halves were the same rally, cut down the middle. Splitting one
+// mood of market in two does not produce two independent samples; it produces the same evidence
+// twice, which is exactly the thing the gate believes it is protecting against.
+//
+// So every box now also has to SPAN something. A week, the same bar the promotion gate uses.
+// Reported alongside n so a box that fails on span says so rather than just going quiet.
+const BOX_MIN_SPAN_H = 168;
+function spanHoursOf(sorted) {
+  if (!sorted || sorted.length < 2) return 0;
+  const ts = sorted.map(r => Number(r.at)).filter(Number.isFinite);
+  return ts.length < 2 ? 0 : +((Math.max(...ts) - Math.min(...ts)) / 3.6e6).toFixed(1);
+}
+function boxSpansEnough(b) { return Number(b && b.spanH) >= BOX_MIN_SPAN_H; }
+
 function regimeBoxes(records) {
   const box = {};
   for (const key of ["long|bull", "long|bear", "short|bull", "short|bear"]) box[key] = [];
@@ -2085,6 +2107,7 @@ function regimeBoxes(records) {
     const meanOf = (a) => a.length ? +(a.reduce((x, r) => x + r.R, 0) / a.length).toFixed(3) : null;
     out[k] = {
       n: sorted.length,
+      spanH: spanHoursOf(sorted),
       meanR: meanOf(sorted),
       firstHalf: meanOf(sorted.slice(0, half)),
       secondHalf: meanOf(sorted.slice(half)),
@@ -2100,6 +2123,7 @@ function regimeVerdict(records) {
   const trustworthy = [];
   for (const [k, b] of Object.entries(boxes)) {
     if (b.n < REGIME_MIN_PER_BOX * 2) continue;                 // need enough to split in half
+    if (!boxSpansEnough(b)) continue;                           // …over more than one afternoon
     if (b.firstHalf === null || b.secondHalf === null) continue;
     const agree = (b.firstHalf > 0) === (b.secondHalf > 0);
     if (agree) trustworthy.push({ box: k, ...b, sign: b.meanR > 0 ? "pays" : "costs" });
@@ -2818,9 +2842,11 @@ function insightScan(records) {
       const half = Math.floor(sorted.length / 2);
       const first = meanOf(sorted.slice(0, half)), second = meanOf(sorted.slice(half));
       const m = meanOf(sorted);
-      const stable = sorted.length >= INSIGHT_MIN_N && first !== null && second !== null &&
+      const spanH = spanHoursOf(sorted);
+      const stable = sorted.length >= INSIGHT_MIN_N && spanH >= BOX_MIN_SPAN_H &&
+                     first !== null && second !== null &&
                      Math.sign(first) === Math.sign(second) && Math.sign(first) !== 0;
-      rows.push({ feature, bucket, n: sorted.length, meanR: m, firstHalf: first, secondHalf: second, stable });
+      rows.push({ feature, bucket, n: sorted.length, spanH, meanR: m, firstHalf: first, secondHalf: second, stable });
     }
   }
   return rows.sort((a, b) => b.n - a.n);
@@ -4280,7 +4306,24 @@ export default async function cipherAgent() {
       const fresh = src.filter(r => r.arm === "baseline" && r.R !== null && r.R <= AUTOPSY_MAX_R() && !r.autopsy)
                        .sort((a, b) => a.at - b.at).slice(0, AUTOPSY_BATCH());
       if (!env("ANTHROPIC_API_KEY", "")) {
-        if (fresh.length) console.log(`brain autopsy: ${fresh.length} unread loss(es) waiting — no ANTHROPIC_API_KEY secret set, brain is off`);
+        // ── OFF IS A STATE, NOT AN ABSENCE (2026-08-21) ──────────────────────────────────────
+        // John: "why has brain_autopsy never recorded anything?" Because it has never run: there
+        // is no ANTHROPIC_API_KEY, so it returns here every time. That was reported only to the
+        // GitHub Actions console, which is not where anyone looks — so from the app's side the
+        // feature looked wired up and simply silent, which is indistinguishable from broken.
+        //
+        // It is a config gap, not a bug: add ANTHROPIC_API_KEY to the repo secrets and it starts.
+        // Until then it says so on the record, once, where it can actually be seen.
+        if (fresh.length) {
+          console.log(`brain autopsy: ${fresh.length} unread loss(es) waiting — no ANTHROPIC_API_KEY secret set, brain is off`);
+          if (!bSlot.offNoted || Date.now() - bSlot.offNoted > 6 * 3600e3) {
+            bSlot.offNoted = Date.now();
+            await pushLog({ shadow: "brain_autopsy", result: "OFF", countsForStats: false,
+              skipped: `${fresh.length} losing trade(s) are waiting to be read, but the loser-autopsy brain has never run: no ANTHROPIC_API_KEY secret is set on the repo, so it returns before doing anything. `
+                + `This is a setting, not a fault — add the secret in Settings → Secrets and variables → Actions and it starts on the next run. `
+                + `It costs at most $${num("BRAIN_DAILY_USD", 0.25)} a day and never places, sizes or blocks an order.` });
+          }
+        }
       } else if (fresh.length && brainBudget(bSlot, Date.now(), null)) {
         const res = await brainCall(buildAutopsyPrompt(fresh));
         if (res) {

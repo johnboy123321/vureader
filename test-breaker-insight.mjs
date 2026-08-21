@@ -8,6 +8,10 @@ const out = path.join(process.cwd(), '.breaker-under-test.mjs');
 fs.writeFileSync(out, src.replace(/\n\/\/ ── Node \/ GitHub Actions entry point[\s\S]*$/, '\n') +
   '\nexport { breakerStep, insightScan, findAccount, INSIGHT_MIN_N, dayKeyOf, weekKeyOf, nextDayStart, nextWeekStart };\n');
 const M = await import(pathToFileURL(out).href);
+const T0 = 1787000000000;
+// A fixture has to span what the gate now asks for — a fortnight, not a run of milliseconds.
+// Both halves of one afternoon are still one afternoon (see BOX_MIN_SPAN_H).
+const spread = (i, n = 60) => T0 + i * (14 * 864e5 / Math.max(1, n - 1));
 let pass=0, fail=0;
 const ok=(n,c,x)=>{c?(pass++,console.log('  ok   '+n)):(fail++,console.log('  FAIL '+n+(x!==undefined?' → '+x:'')));};
 const CFG={dayDD:0.05,weekDD:0.10,streakN:3,streakPauseH:12};
@@ -78,7 +82,7 @@ console.log('\n6. findAccount digs the balance out of a nested venue response');
 console.log('\n7. Insight scanner — stability is the bar, same as everything else');
 {
   const rec=(over,{dir='long',tf='1D',note='rollover',quality=5.5,breadth=0.5,regDist=5,R=1})=>
-    Array.from({length:over},(_,i)=>({arm:'baseline',at:i,dir,tf,note,quality,breadth,regDist,R}));
+    Array.from({length:over},(_,i)=>({arm:'baseline',at:spread(i,over),dir,tf,note,quality,breadth,regDist,R}));
   // 40 winners on 4H vs 40 losers on 1H — both stable, opposite signs
   const rows=M.insightScan([...rec(40,{tf:'4H',R:0.5}), ...rec(40,{tf:'1H',R:-0.5})]);
   const h4=rows.find(r=>r.feature==='timeframe'&&r.bucket==='4H');
@@ -86,7 +90,9 @@ console.log('\n7. Insight scanner — stability is the bar, same as everything e
   ok('a stable winner is flagged', h4 && h4.stable && h4.meanR>0);
   ok('a stable loser is flagged too — losers are insights', h1 && h1.stable && h1.meanR<0);
   // sign flips across halves = not an insight, however good the full-sample mean looks
-  const flip=[...rec(20,{note:'divergence',R:2}), ...rec(20,{note:'divergence',R:-1}).map(r=>({...r,at:r.at+100}))];
+  // The second group must come AFTER the first in time, not overlap it — otherwise the two
+  // sets interleave when sorted and each half ends up holding a mix, which is not a flip.
+  const flip=[...rec(20,{note:'divergence',R:2}), ...rec(20,{note:'divergence',R:-1}).map(r=>({...r,at:r.at+15*864e5}))];
   const f=M.insightScan(flip).find(r=>r.feature==='detector'&&r.bucket==='divergence');
   ok('a bucket that flips halves is never stable', f && !f.stable && f.meanR>0);
   const thin=M.insightScan(rec(29,{R:1})).find(r=>r.feature==='timeframe');

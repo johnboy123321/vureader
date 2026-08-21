@@ -17,6 +17,10 @@ const M = await import(pathToFileURL(out).href);
 let pass = 0, fail = 0;
 const ok = (n, c, x) => { c ? (pass++, console.log('  ok   ' + n)) : (fail++, console.log('  FAIL ' + n + (x !== undefined ? ' → ' + x : ''))); };
 
+const T0 = 1787000000000, DAY = 864e5;
+// A fixture has to span what the gate now asks for — a fortnight, not a run of milliseconds.
+// Both halves of one afternoon are still one afternoon (see BOX_MIN_SPAN_H).
+const spread = (i, n = 60) => T0 + i * (14 * DAY / Math.max(1, n - 1));
 const rec = (dir, reg, R, at) => ({ arm: 'baseline', dir, reg, R, at });
 
 console.log('\n1. It cannot place, block or resize anything');
@@ -44,7 +48,7 @@ console.log('\n2. The average alone is not enough');
   // A box that pays handsomely for its first half and gives it all back — the real 2024/25
   // pattern — must NOT be reported as trustworthy however good the overall mean looks.
   const recs = [];
-  for (let i = 0; i < 60; i++) recs.push(rec('long', 'bear', i < 30 ? 8.1 : -0.5, 1000 + i));
+  for (let i = 0; i < 60; i++) recs.push(rec('long', 'bear', i < 30 ? 8.1 : -0.5, spread(i)));
   const v = M.regimeVerdict(recs);
   ok('the full-sample mean does look good', v.boxes['long|bear'].meanR > 3, v.boxes['long|bear'].meanR);
   ok('but the halves disagree', v.boxes['long|bear'].firstHalf > 0 && v.boxes['long|bear'].secondHalf < 0);
@@ -55,7 +59,7 @@ console.log('\n2. The average alone is not enough');
 console.log('\n3. A box that holds in both halves is believed');
 {
   const recs = [];
-  for (let i = 0; i < 60; i++) recs.push(rec('short', 'bull', i % 3 === 0 ? 2.25 : -0.4, 1000 + i));
+  for (let i = 0; i < 60; i++) recs.push(rec('short', 'bull', i % 3 === 0 ? 2.25 : -0.4, spread(i)));
   const v = M.regimeVerdict(recs);
   const t = v.trustworthy.find(x => x.box === 'short|bull');
   ok('it is picked up', !!t);
@@ -66,19 +70,20 @@ console.log('\n3. A box that holds in both halves is believed');
 console.log('\n4. Sample-size floor');
 {
   const recs = [];
-  for (let i = 0; i < M.REGIME_MIN_PER_BOX * 2 - 1; i++) recs.push(rec('long', 'bull', 2.0, 1000 + i));
+  const NEED = M.REGIME_MIN_PER_BOX * 2;
+  for (let i = 0; i < NEED - 1; i++) recs.push(rec('long', 'bull', 2.0, spread(i, NEED)));
   ok('one short of the floor is not believed, however good', M.regimeVerdict(recs).trustworthy.length === 0);
-  recs.push(rec('long', 'bull', 2.0, 9999));
+  recs.push(rec('long', 'bull', 2.0, spread(NEED - 1, NEED)));
   ok('at the floor it is', M.regimeVerdict(recs).trustworthy.length === 1);
 }
 
 console.log('\n5. Only real, resolved, live-rule decisions count');
 {
   const recs = [
-    ...Array.from({ length: 60 }, (_, i) => rec('long', 'bull', 1, i)),
-    ...Array.from({ length: 60 }, (_, i) => ({ ...rec('long', 'bull', 1, i), arm: 'variant' })),
-    ...Array.from({ length: 20 }, (_, i) => rec('long', 'bull', null, i)),      // ungraded
-    ...Array.from({ length: 20 }, (_, i) => rec('long', null, 1, i)),           // no regime known
+    ...Array.from({ length: 60 }, (_, i) => rec('long', 'bull', 1, spread(i))),
+    ...Array.from({ length: 60 }, (_, i) => ({ ...rec('long', 'bull', 1, spread(i)), arm: 'variant' })),
+    ...Array.from({ length: 20 }, (_, i) => rec('long', 'bull', null, spread(i))),      // ungraded
+    ...Array.from({ length: 20 }, (_, i) => rec('long', null, 1, spread(i))),           // no regime known
   ];
   const b = M.regimeBoxes(recs)['long|bull'];
   ok('variant-arm records are excluded', b.n === 60, b.n);
@@ -116,5 +121,37 @@ console.log('\n7. Records carry what the boxes need');
 }
 
 fs.unlinkSync(out);
+console.log('\n7. BOTH HALVES OF ONE AFTERNOON ARE STILL ONE AFTERNOON (2026-08-21)');
+{
+  // The live book on 2026-08-21: every long won, every short lost, across 35 hours. Splitting
+  // that down the middle gives two halves that agree perfectly — because they are the same
+  // rally twice. "relative_strength" duly reported "fighting the field pays, 2.25R over 91".
+  const oneAfternoon = [];
+  for (let i = 0; i < 120; i++) oneAfternoon.push(rec('long', 'bull', 2.25, T0 + i * 1000));
+  const v = M.regimeVerdict(oneAfternoon);
+  const b = v.boxes['long|bull'];
+  ok('the sample is plenty big', b.n === 120);
+  ok('and both halves agree perfectly', b.firstHalf === b.secondHalf && b.firstHalf > 0);
+  ok('the old gate would have believed it', b.n >= M.REGIME_MIN_PER_BOX * 2 && b.firstHalf > 0 === b.secondHalf > 0);
+  ok('but it spans almost nothing', b.spanH < 1, b.spanH);
+  ok('so it is NOT believed', v.trustworthy.length === 0);
+  ok('and the box carries its span, so the reason is visible', Number.isFinite(b.spanH));
+
+  // The same shape, spread over a month, IS evidence.
+  const overAMonth = [];
+  for (let i = 0; i < 120; i++) overAMonth.push(rec('long', 'bull', i % 3 === 0 ? 2.25 : -0.4, T0 + i * (30 * DAY / 119)));
+  const v2 = M.regimeVerdict(overAMonth);
+  ok('a month of the same evidence is believed', v2.trustworthy.length === 1, JSON.stringify(v2.boxes['long|bull']));
+  ok('and its span is reported', v2.boxes['long|bull'].spanH > 168);
+
+  // Exactly at the bar.
+  const atBar = [];
+  for (let i = 0; i < 120; i++) atBar.push(rec('short', 'bear', 1.5, T0 + i * (168 * 36e5 / 119)));
+  ok('exactly one week qualifies', M.regimeVerdict(atBar).trustworthy.length === 1);
+  const under = [];
+  for (let i = 0; i < 120; i++) under.push(rec('short', 'bear', 1.5, T0 + i * (167 * 36e5 / 119)));
+  ok('one hour short of a week does not', M.regimeVerdict(under).trustworthy.length === 0);
+}
+
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);
