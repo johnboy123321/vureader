@@ -1304,30 +1304,64 @@ const RESOLUTION_CLASSES = ["strategy", "execution_artifact"];
 // switched off right now" (20005), which is temporary and does not show up in a product listing.
 const PERP_MIN = 20;              // below this the list is not credible — fail open
 let _perpSymbols = null;
+
+// ── DO NOT GUESS WHICH KEY THE PERPS ARE UNDER (fixed 2026-08-21, same evening) ──────────────
+// The first version read body.products and filtered for symbols ending in USDT, and the live run
+// answered: "only 0 perpetuals parsed (need 20) — NOT filtering the universe this run". The guard
+// did its job and nothing broke, but the parse was wrong twice over:
+//   · Phemex keeps USDT-margined perpetuals in their OWN array (perpProductsV2 on this account),
+//     not in `products` — which holds the inverse contracts and the spot pairs.
+//   · and the spot test was `sym.startsWith("S")` AFTER uppercasing, which also throws away every
+//     genuine coin beginning with S: SOL, SUI, SAND. A filter that quietly drops SOL is worse
+//     than no filter at all.
+// So this stops guessing the key: it walks every array in the response and takes anything that
+// looks like a USDT perpetual, whichever bucket it arrived in. And when it still comes up short
+// it PRINTS THE KEYS IT SAW, so the next diagnosis is one log line rather than a browser trip.
+function collectPerps(body) {
+  const out = new Set();
+  const seenKeys = [];
+  const arrays = [];
+  const walk = (o, d) => {
+    if (!o || typeof o !== "object" || d > 3) return;
+    for (const [k, v] of Object.entries(o)) {
+      if (Array.isArray(v)) { seenKeys.push(`${k}[${v.length}]`); arrays.push(v); }
+      else if (v && typeof v === "object") walk(v, d + 1);
+    }
+  };
+  walk(body, 0);
+  for (const arr of arrays) {
+    for (const p of arr) {
+      const raw = p && typeof p.symbol === "string" ? p.symbol : null;
+      if (!raw) continue;
+      if (raw[0] === "s") continue;                       // sBTCUSDT etc are SPOT — lowercase s only
+      const sym = raw.toUpperCase();
+      if (!sym.endsWith("USDT")) continue;                // USDT-margined perps only
+      // Name what is BAD, not what is good. The first attempt at this said `!/list/.test(status)`
+      // — and "delisted" contains "list", so a delisted contract sailed straight through. Test it
+      // the other way round and an unrecognised status still passes, which is right: unknown is
+      // not the same as no.
+      const status = String(p.status || "").toLowerCase();
+      if (/delist|unlist|suspend|closed|halt/.test(status)) continue;
+      const type = String(p.type || "");
+      if (type && !/perp/i.test(type)) continue;
+      out.add(sym.slice(0, -4));
+    }
+  }
+  return { symbols: out, seenKeys };
+}
+
 async function perpSymbols() {
   if (_perpSymbols) return _perpSymbols;
   try {
     const r = await phemexPublic("/public/products");
     const body = (r && r.data && (r.data.data || r.data)) || {};
-    const list = Array.isArray(body.products) ? body.products : [];
-    const out = new Set();
-    for (const p of list) {
-      const sym = p && typeof p.symbol === "string" ? p.symbol.toUpperCase() : null;
-      if (!sym || sym.startsWith("S")) continue;                       // sBTCUSDT etc are SPOT
-      if (!sym.endsWith("USDT")) continue;                             // USDT-margined perps only
-      // status/type are advisory: absent means "we do not know", which must not exclude.
-      const status = String(p.status || "").toLowerCase();
-      if (status && !/list/.test(status)) continue;                    // Delisted / Suspended
-      const type = String(p.type || "");
-      if (type && !/perp/i.test(type)) continue;
-      out.add(sym.slice(0, -4));                                       // BTCUSDT → BTC
-    }
-    if (out.size < PERP_MIN) {
-      console.warn(`phemex products: only ${out.size} perpetuals parsed (need ${PERP_MIN}) — NOT filtering the universe this run`);
+    const { symbols, seenKeys } = collectPerps(body);
+    if (symbols.size < PERP_MIN) {
+      console.warn(`phemex products: only ${symbols.size} perpetuals parsed (need ${PERP_MIN}) — NOT filtering the universe this run. Arrays seen: ${seenKeys.join(", ") || "none"}`);
       return null;
     }
-    _perpSymbols = out;
-    return out;
+    _perpSymbols = symbols;
+    return symbols;
   } catch (e) {
     console.error("phemex products read failed — universe unfiltered this run:", e && e.message);
     return null;

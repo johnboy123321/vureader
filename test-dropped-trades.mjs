@@ -17,7 +17,7 @@ import { pathToFileURL } from 'node:url';
 const src = fs.readFileSync('cipher-agent-valtown.js', 'utf8');
 const out = path.join(process.cwd(), '.dropped-under-test.mjs');
 fs.writeFileSync(out, src.replace(/\n\/\/ ── Node \/ GitHub Actions entry point[\s\S]*$/, '\n') +
-  '\nexport { venueBlock, venueNote, venueClear, venueBench, markStopVerdict, markFrom, explainRejection, VENUE_RULES, MARK_BUFFER_PCT, PERP_MIN };\n');
+  '\nexport { venueBlock, venueNote, venueClear, venueBench, markStopVerdict, markFrom, explainRejection, VENUE_RULES, MARK_BUFFER_PCT, PERP_MIN, collectPerps };\n');
 const M = await import(pathToFileURL(out).href);
 
 let pass = 0, fail = 0;
@@ -177,17 +177,24 @@ console.log('\n13. ASK THE VENUE WHAT IT CARRIES, rather than finding out one re
 {
   // John: "can't we just get the list of futures coins from Phemex and forget the rest." The
   // bench stops the SECOND refusal; this stops the first.
-  const fn = src.slice(src.indexOf('async function perpSymbols()'), src.indexOf('// ═══════════ WHAT THE VENUE WILL NOT TRADE'));
+  const fn = src.slice(src.indexOf('// ── DO NOT GUESS WHICH KEY THE PERPS ARE UNDER'),
+                       src.indexOf('// ═══════════ WHAT THE VENUE WILL NOT TRADE'));
   ok('the product list is read', /phemexPublic\("\/public\/products"\)/.test(fn));
-  ok('spot symbols are excluded', /sym\.startsWith\("S"\)/.test(fn));
+  ok('spot symbols are excluded by their lowercase s, not an uppercased one',
+     /if \(raw\[0\] === "s"\) continue;/.test(fn));
   ok('only USDT-margined perps are kept', /sym\.endsWith\("USDT"\)/.test(fn));
-  ok('a delisted symbol is dropped', /if \(status && !\/list\/\.test\(status\)\) continue;/.test(fn));
+  ok('a delisted symbol is dropped', /delist\|unlist\|suspend/.test(fn));
+  ok('proved, not just asserted', M.collectPerps({ p: [{ symbol: 'XUSDT', status: 'Delisted' }] }).symbols.size === 0);
   ok('but a MISSING status does not exclude it — unknown is not the same as no',
-     /status\/type are advisory: absent means/.test(fn));
+     M.collectPerps({ p: [{ symbol: 'XUSDT' }] }).symbols.has('X'));
+  ok('and neither does one nobody anticipated',
+     M.collectPerps({ p: [{ symbol: 'YUSDT', status: 'SomethingNew' }] }).symbols.has('Y'));
   ok('the symbol is reduced to the coin', /out\.add\(sym\.slice\(0, -4\)\)/.test(fn));
+  ok('every array in the response is searched, not one guessed key', /const arrays = \[\];/.test(fn));
+  ok('and a short parse prints the keys it DID see', /Arrays seen: \$\{seenKeys\.join/.test(src));
 
   // The guard that matters: a bad parse must not silently empty the universe.
-  ok('an implausibly short list is not believed', /if \(out\.size < PERP_MIN\)/.test(fn));
+  ok('an implausibly short list is not believed', /if \(symbols\.size < PERP_MIN\)/.test(fn));
   ok('and says so out loud', /NOT filtering the universe this run/.test(fn));
   ok('the floor is 20, not 1', M.PERP_MIN === 20, M.PERP_MIN);
   ok('a failed read fails OPEN', /universe unfiltered this run/.test(fn));
@@ -201,6 +208,40 @@ console.log('\n13. ASK THE VENUE WHAT IT CARRIES, rather than finding out one re
 
   ok('the bench survives alongside it — 20005 is temporary and cannot show in a product list',
      !!M.VENUE_RULES['20005']);
+}
+
+console.log('\n14. THE PARSE ITSELF — proved against the shape that broke it');
+{
+  // The first live run answered "only 0 perpetuals parsed". Two reasons, both now fixtures.
+  const spotOnly = { products: [{ symbol: 'sBTCUSDT' }, { symbol: 'sETHUSDT' }] };
+  ok('a body with only spot pairs yields nothing', M.collectPerps(spotOnly).symbols.size === 0);
+
+  // …because Phemex keeps the USDT perps in their own array.
+  const real = {
+    products: [{ symbol: 'sBTCUSDT' }, { symbol: 'BTCUSD', type: 'Perpetual' }],
+    perpProductsV2: [
+      { symbol: 'BTCUSDT', type: 'PerpetualV2', status: 'Listed' },
+      { symbol: 'SOLUSDT', type: 'PerpetualV2', status: 'Listed' },
+      { symbol: 'SUIUSDT', type: 'PerpetualV2', status: 'Listed' },
+      { symbol: 'OLDUSDT', type: 'PerpetualV2', status: 'Delisted' },
+    ],
+  };
+  const got = M.collectPerps(real).symbols;
+  ok('perps are found wherever the venue put them', got.size === 3, [...got].join(','));
+  ok('SOL is NOT thrown away for starting with S', got.has('SOL'));
+  ok('nor is SUI', got.has('SUI'));
+  ok('the inverse BTCUSD contract is not counted as a USDT perp', !got.has('BTCUS'));
+  ok('the spot pair is still excluded', ![...got].some(x => x.startsWith('S') && x.length > 3 && x !== 'SOL' && x !== 'SUI'));
+  ok('a delisted symbol is dropped', !got.has('OLD'));
+
+  // A shape nobody anticipated must still be searched rather than assumed empty.
+  const odd = { data: { result: { contracts: [{ symbol: 'ADAUSDT', type: 'PerpetualV2' }] } } };
+  ok('a nested, differently-named array is still found', M.collectPerps(odd).symbols.has('ADA'));
+
+  // And the diagnosis is in the log, not in a browser.
+  ok('the arrays it saw are reported', M.collectPerps(real).seenKeys.some(k => /perpProductsV2\[4\]/.test(k)),
+     M.collectPerps(real).seenKeys.join(','));
+  ok('junk in, no throw out', M.collectPerps(null).symbols.size === 0 && M.collectPerps('x').symbols.size === 0);
 }
 
 fs.unlinkSync(out);
