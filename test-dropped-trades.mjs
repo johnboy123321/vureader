@@ -17,7 +17,7 @@ import { pathToFileURL } from 'node:url';
 const src = fs.readFileSync('cipher-agent-valtown.js', 'utf8');
 const out = path.join(process.cwd(), '.dropped-under-test.mjs');
 fs.writeFileSync(out, src.replace(/\n\/\/ ── Node \/ GitHub Actions entry point[\s\S]*$/, '\n') +
-  '\nexport { venueBlock, venueNote, venueClear, venueBench, markStopVerdict, markFrom, explainRejection, VENUE_RULES, MARK_BUFFER_PCT };\n');
+  '\nexport { venueBlock, venueNote, venueClear, venueBench, markStopVerdict, markFrom, explainRejection, VENUE_RULES, MARK_BUFFER_PCT, PERP_MIN };\n');
 const M = await import(pathToFileURL(out).href);
 
 let pass = 0, fail = 0;
@@ -171,6 +171,36 @@ console.log('\n12. The classifier still agrees with the bench rules');
   }
   ok('11048 is still cadence, and is NOT benched (it is a per-order timing fault)',
      M.explainRejection('phemex 11048').cause === 'cadence' && !M.VENUE_RULES['11048']);
+}
+
+console.log('\n13. ASK THE VENUE WHAT IT CARRIES, rather than finding out one refusal at a time');
+{
+  // John: "can't we just get the list of futures coins from Phemex and forget the rest." The
+  // bench stops the SECOND refusal; this stops the first.
+  const fn = src.slice(src.indexOf('async function perpSymbols()'), src.indexOf('// ═══════════ WHAT THE VENUE WILL NOT TRADE'));
+  ok('the product list is read', /phemexPublic\("\/public\/products"\)/.test(fn));
+  ok('spot symbols are excluded', /sym\.startsWith\("S"\)/.test(fn));
+  ok('only USDT-margined perps are kept', /sym\.endsWith\("USDT"\)/.test(fn));
+  ok('a delisted symbol is dropped', /if \(status && !\/list\/\.test\(status\)\) continue;/.test(fn));
+  ok('but a MISSING status does not exclude it — unknown is not the same as no',
+     /status\/type are advisory: absent means/.test(fn));
+  ok('the symbol is reduced to the coin', /out\.add\(sym\.slice\(0, -4\)\)/.test(fn));
+
+  // The guard that matters: a bad parse must not silently empty the universe.
+  ok('an implausibly short list is not believed', /if \(out\.size < PERP_MIN\)/.test(fn));
+  ok('and says so out loud', /NOT filtering the universe this run/.test(fn));
+  ok('the floor is 20, not 1', M.PERP_MIN === 20, M.PERP_MIN);
+  ok('a failed read fails OPEN', /universe unfiltered this run/.test(fn));
+  ok('the list is cached so it is read once per run', /if \(_perpSymbols\) return _perpSymbols;/.test(fn));
+
+  const site = src.slice(src.indexOf('const perps = await perpSymbols();'), src.indexOf('const allowed = await relayWhitelist();'));
+  ok('the universe is filtered before anything is scanned', site.length > 0);
+  ok('what was dropped is named, never quietly removed', /not listed here: \$\{dropped\.join/.test(site));
+  ok('the count is reported both ways', /of \$\{before\} carried by phemex/.test(site));
+  ok('and if the filter would empty the universe, it is abandoned', /falling back to the unfiltered list/.test(site));
+
+  ok('the bench survives alongside it — 20005 is temporary and cannot show in a product list',
+     !!M.VENUE_RULES['20005']);
 }
 
 fs.unlinkSync(out);

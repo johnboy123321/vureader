@@ -1287,6 +1287,53 @@ const RESOLUTION_CLASSES = ["strategy", "execution_artifact"];
 // one, and calling it by its name turns a mystery into a measurable fact about cadence.
 //
 // Every value here classifies as an execution artifact: none of it is evidence about a signal.
+// ═══════════ ASK THE VENUE WHAT IT TRADES, RATHER THAN FINDING OUT ONE REFUSAL AT A TIME ═══════════
+// John, 2026-08-21: "can't we just get a list of all the futures traded coins from Phemex and put
+// them in the bot list, then forget about the rest." Yes — and that is plainly the right way round.
+//
+// The universe is built from the top ~100 coins by volume on Binance or OKX. Phemex does not list
+// all of them. So every run the bot was picking coins that could never be traded HERE, building a
+// plan, sizing it, sending it and being refused — and burning the coin for the day each time. The
+// bench added this morning stopped the SECOND refusal. This stops the first: a coin Phemex does
+// not carry never enters the list at all.
+//
+// Two safety rules, because a filter that goes wrong silently empties the bot's universe:
+//   · a parse that yields fewer than MIN_PERPS symbols is not believed, and nothing is filtered
+//   · what was dropped is always logged, never quietly removed
+// The bench stays as well. This list answers "does Phemex carry it"; the bench answers "is it
+// switched off right now" (20005), which is temporary and does not show up in a product listing.
+const PERP_MIN = 20;              // below this the list is not credible — fail open
+let _perpSymbols = null;
+async function perpSymbols() {
+  if (_perpSymbols) return _perpSymbols;
+  try {
+    const r = await phemexPublic("/public/products");
+    const body = (r && r.data && (r.data.data || r.data)) || {};
+    const list = Array.isArray(body.products) ? body.products : [];
+    const out = new Set();
+    for (const p of list) {
+      const sym = p && typeof p.symbol === "string" ? p.symbol.toUpperCase() : null;
+      if (!sym || sym.startsWith("S")) continue;                       // sBTCUSDT etc are SPOT
+      if (!sym.endsWith("USDT")) continue;                             // USDT-margined perps only
+      // status/type are advisory: absent means "we do not know", which must not exclude.
+      const status = String(p.status || "").toLowerCase();
+      if (status && !/list/.test(status)) continue;                    // Delisted / Suspended
+      const type = String(p.type || "");
+      if (type && !/perp/i.test(type)) continue;
+      out.add(sym.slice(0, -4));                                       // BTCUSDT → BTC
+    }
+    if (out.size < PERP_MIN) {
+      console.warn(`phemex products: only ${out.size} perpetuals parsed (need ${PERP_MIN}) — NOT filtering the universe this run`);
+      return null;
+    }
+    _perpSymbols = out;
+    return out;
+  } catch (e) {
+    console.error("phemex products read failed — universe unfiltered this run:", e && e.message);
+    return null;
+  }
+}
+
 // ═══════════ WHAT THE VENUE WILL NOT TRADE, REMEMBERED (2026-08-21) ═══════════
 // The rejection classifier told us WHY orders were dying. Counting them told us how badly:
 // nineteen of twenty order attempts in the 2026-08-20/21 window were refused, and eleven of
@@ -3682,6 +3729,19 @@ export default async function cipherAgent() {
 
   // Rotate through the universe a batch at a time so every run finishes well inside 60s.
   let uni = await topUniverse(CFG.universe());
+
+  // Only coins this venue actually carries. Everything else is a trade that could never have
+  // happened, dressed up as a decision.
+  const perps = await perpSymbols();
+  if (perps) {
+    const before = uni.length;
+    const dropped = uni.filter(c => !perps.has(c));
+    uni = uni.filter(c => perps.has(c));
+    console.log(`universe: ${uni.length} of ${before} carried by phemex (${perps.size} perpetuals listed)`
+      + (dropped.length ? ` — not listed here: ${dropped.join(", ")}` : ""));
+    if (!uni.length) { console.warn("universe: phemex carries NONE of the top movers — falling back to the unfiltered list"); uni = await topUniverse(CFG.universe()); }
+  }
+
   const allowed = await relayWhitelist();
   if (allowed) {
     const before = uni.length;
