@@ -2124,6 +2124,7 @@ function accumFillPass(state, intraday, cfg = {}) {
         st.units += got; st.cash -= r.usdt; st.fills++;
         st.open.splice(k, 1);
         events.push({ kind: "fill", px: r.px, src: r.src, at: b.t, units: +got.toFixed(8),
+                      usdt: +Number(r.usdt).toFixed(2),
                       delta: +(got - r.soldUnits).toFixed(8) });
       }
     }
@@ -2212,7 +2213,42 @@ function accumStep(state, daily, cfg = {}) {
       st.units += got; st.cash -= r.usdt; st.fills++;
       st.open.splice(k, 1);
       events.push({ kind: "fill", px: r.px, src: r.src, units: +got.toFixed(8),
+                    usdt: +Number(r.usdt).toFixed(2),
                     delta: +(got - r.soldUnits).toFixed(8), viaDaily: true });
+    }
+  }
+
+  // 1c) ── A RUNG THAT WILL NEVER FILL IS NOT A RUNG (2026-08-21) ─────────────────────────────
+  // Measured on the repo's own daily BTC data, 2023-09-30 → 2026-07-31, starting from 1.00 BTC:
+  // the ladder ended holding 0.769 BTC against 1.000 held. It did not lose that by trading badly.
+  // It STOPPED. Three ladders laid in October 2023 put rungs at $25,754–$26,360; BTC never went
+  // back; and because maxConcurrent counts a resting ladder whether or not it can ever fill, all
+  // four slots were occupied by the dead from 2024-09-08 onward. The trigger fired 113 more times
+  // and was refused every one. Nine sells in three years instead of sixty-six.
+  //
+  // So a rung gets a life. After ACCUM_RUNG_TTL_DAYS unfilled it is cancelled and the cash buys
+  // coins back at the market — which BOOKS A REAL LOSS in units, and is the point: the loss
+  // already happened the moment price left and did not come back. The rung was only hiding it,
+  // and hiding it cost the strategy the ability to trade at all. Replayed with a 30-day life the
+  // same three years end at 0.980 BTC over 66 sells — still short of holding, but ALIVE, and 27%
+  // better than what was running. Set to 0 to go back to rungs that wait forever.
+  //
+  // It runs BEFORE the paused check on purpose: a stood-down ladder still has cash out against
+  // coins it sold, and freeing that is finishing something, not starting one.
+  const ttlDays = num("ACCUM_RUNG_TTL_DAYS", 30);
+  if (ttlDays > 0 && st.open.length) {
+    const dayNo = d => Math.round(Date.parse(String(d) + "T00:00:00Z") / 864e5);
+    const today = dayNo(day);
+    for (let k = st.open.length - 1; k >= 0; k--) {
+      const r = st.open[k];
+      const age = today - dayNo(r.sinceDay || day);
+      if (!Number.isFinite(age) || age < ttlDays) continue;
+      const got = (r.usdt / bar.c) * (1 - feeBps / 1e4);
+      st.units += got; st.cash -= r.usdt; st.expired = (st.expired || 0) + 1;
+      st.open.splice(k, 1);
+      events.push({ kind: "expire", px: bar.c, src: r.src, rungPx: r.px, ageDays: age,
+                    usdt: +Number(r.usdt).toFixed(2), units: +got.toFixed(8),
+                    lost: +(r.soldUnits - got).toFixed(8) });
     }
   }
 
@@ -3274,6 +3310,11 @@ async function runAccumulator() {
             skipped: `spot wallet funded — tracking the real balance of ${PF.baseBalance} ${coin} from here. Benchmark is that same number held and never traded.` });
         }
         const all = [];
+        // The book must follow the wallet. Snapshot before anything is applied, so an armed buy
+        // that never reached the venue can be unwound rather than absorbed.
+        const ladderArmed = String(env("ACCUM_EXEC", "dry")) === "armed";
+        const stateBefore = JSON.parse(JSON.stringify(state));
+        let ladderUnplaced = null;
 
         // 1) FILLS — every run, against every 15-minute bar closed since the last check, so a
         //    3am wick through a rung is caught when it happens rather than at the daily close.
@@ -3324,9 +3365,57 @@ async function runAccumulator() {
               await pushLog({ coin, result: "ACCUM SELL",
                 skipped: `sold 20% of the tradeable stack at ${formatPrice(e.px)} — ${e.how || "signal"}, money flow negative; buy-backs laddered at ${e.rungs.join(", ")}. ${execNote}` });
             }
-            if (e.kind === "fill") await pushLog({ coin, result: "ACCUM BUY",
-              skipped: `laddered buy filled at the ${e.src} level ${formatPrice(e.px)} — ${e.delta >= 0 ? "+" : ""}${e.delta.toFixed(6)} ${coin} on that slice.${e.viaDaily ? " (caught by the daily safety net)" : ""}` });
+            // ── THE BUY-BACK HAS TO BE A REAL ORDER (2026-08-21) ─────────────────────────
+            // Found while wiring the expiry rule, and it is the more serious of the two: the
+            // SELL side placed a real spot order, and the BUY side only wrote a log line. A
+            // ladder that sells real coins and buys them back in fiction is not a ladder — it is
+            // a one-way sale, and the book would have drifted from the wallet on the very first
+            // rung. It has never fired live (the dot flip has held the coins since 19 Aug and the
+            // ladder's own record is 0 sells, 0 fills), so nothing is lost yet — but it would
+            // have gone wrong the moment John switched the flip off.
+            //
+            // Same three brakes as every other spot order, and the same discipline the live flip
+            // already uses: if we were armed and the order did not reach the venue, the book is
+            // rolled back rather than carrying on from a purchase that never happened.
+            if (e.kind === "fill" || e.kind === "expire") {
+              const isExpiry = e.kind === "expire";
+              let execNote = "Measure only — no order placed.";
+              try {
+                const prods = await spotProducts();
+                const walletQuote = PF && Number.isFinite(PF.quoteBalance) ? PF.quoteBalance : null;
+                const spend = walletQuote != null ? Math.min(Number(e.usdt) || 0, walletQuote) : (Number(e.usdt) || 0);
+                if (!(spend > 0)) execNote = "nothing to spend on this rung — no order sent.";
+                else {
+                  const built = buildSpotOrder(coin, "Buy", { price: e.px, quoteQty: spend }, prods);
+                  if (built.err) { execNote = `Spot order NOT built: ${built.err}`; if (ladderArmed) ladderUnplaced = built.err; }
+                  else {
+                    const r2 = await sendSpotOrder(built.order, spend);
+                    execNote = r2.ok ? `SPOT BUY PLACED (${built.order.clOrdID})`
+                             : r2.dry ? `dry run — would have sent a SPOT buy (${r2.why})`
+                                      : `spot buy refused: ${r2.error}`;
+                    if (ladderArmed && !r2.ok) ladderUnplaced = r2.dry ? r2.why : r2.error;
+                  }
+                }
+              } catch (err) {
+                execNote = "spot path errored (no order sent): " + (err && err.message);
+                if (ladderArmed) ladderUnplaced = String(err && err.message || err);
+              }
+              await pushLog({ coin, result: isExpiry ? "ACCUM RUNG EXPIRED" : "ACCUM BUY",
+                skipped: isExpiry
+                  ? `a buy-back rung at ${formatPrice(e.rungPx)} went ${e.ageDays} days unfilled and was given up on. `
+                    + `Bought ${e.units.toFixed(8)} ${coin} back at the market (${formatPrice(e.px)}) with its ${e.usdt} USDT — `
+                    + `${e.lost >= 0 ? "costing" : "gaining"} ${Math.abs(e.lost).toFixed(6)} ${coin} against the slice that was sold. `
+                    + `The slot is free again, which is the point: a dead rung blocks every future ladder. ${execNote}`
+                  : `laddered buy filled at the ${e.src} level ${formatPrice(e.px)} — ${e.delta >= 0 ? "+" : ""}${e.delta.toFixed(6)} ${coin} on that slice.${e.viaDaily ? " (caught by the daily safety net)" : ""} ${execNote}` });
+            }
             if (e.kind === "skip") await pushLog({ coin, result: "ACCUM PASS", skipped: `red dot, but no sell: ${e.why}.` });
+          }
+          if (ladderUnplaced) {
+            state = stateBefore;
+            await setJSON(ACCUM_KEY, state);
+            console.error(`accumulator: a BUY did not reach the venue (${ladderUnplaced}) — book rolled back, the rung will be retried next run`);
+            await pushLog({ coin, result: "ACCUM UNPLACED", countsForStats: false,
+              skipped: `a ladder buy-back did not reach the venue (${ladderUnplaced}). The strategy's book has been rolled back to match the wallet — nothing was bought. The rung is still resting and will be retried next run.` });
           }
         }
         // ── THE DOT FLIP ──────────────────────────────────────────────────────────────────

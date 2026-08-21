@@ -1,0 +1,212 @@
+//@version=6
+// ═══════════════════════════════════════════════════════════════════════════════════════════════
+//  CIPHER ACCUMULATOR — pump trigger + VuManChu money-flow gate
+//
+//  A Pine port of the spot accumulator in cipher-agent-valtown.js, written to answer ONE question:
+//
+//      does "sell a slice after a pump, buy it back lower" end up holding MORE BTC than
+//      simply holding BTC — over years, not over a day of testnet?
+//
+//  READ THE UNITS PLOT, NOT THE EQUITY CURVE. The strategy is denominated in COINS. A run that
+//  makes dollars while ending with fewer BTC than it started with has failed at the only job it
+//  has. The bottom pane plots units held vs units if you had done nothing; above 1.0 is the whole
+//  thesis, below 1.0 kills it.
+//
+//  ── WHERE THIS DIFFERS FROM THE LIVE BOT (read before trusting a number) ──────────────────────
+//  1. BUY-BACK RUNGS. The bot picks rungs from three sources: swing lows, bullish order blocks,
+//     and bullish fair-value gaps. Only swing lows are ported here — order blocks and FVGs are
+//     discretionary shapes I did not want to approximate and quietly call equivalent. Fewer rung
+//     sources means fewer places to buy back, so this port should UNDERSTATE the live logic. If
+//     it wins here it should win there; if it loses here that is not yet proof it loses there.
+//  2. INTRADAY FILLS. The bot checks rungs every 15 minutes; this checks once per daily bar
+//     against the bar low. Same outcome on most days, occasionally optimistic on a wick.
+//  3. NO VENUE FRICTION. No rejections, no minimum-order bounces, no 30-minute wake cadence. That
+//     is deliberate: this measures the STRATEGY. Execution artifacts are measured separately, in
+//     the live log, where they belong.
+//
+//  Fees are set to 10bps a side to match ACCUM_FEE_BPS. Do not zero them — half the objection to
+//  this whole approach is that the round trip is eaten by fees, and that objection deserves a
+//  fair test.
+// ═══════════════════════════════════════════════════════════════════════════════════════════════
+
+strategy("Cipher Accumulator — pump + money-flow gate", overlay = true,
+     initial_capital        = 100000,
+     default_qty_type       = strategy.fixed,
+     default_qty_value      = 1,
+     commission_type        = strategy.commission.percent,
+     commission_value       = 0.1,
+     process_orders_on_close = true,
+     calc_on_every_tick     = false)
+
+// ── INPUTS ────────────────────────────────────────────────────────────────────────────────────
+grpT      = "Trigger"
+mode      = input.string("pump", "What fires a sell", options = ["pump", "reddot"], group = grpT)
+pumpPct   = input.float(1.0,  "pump: day closed at least this % up", minval = 0.1, step = 0.1, group = grpT)
+useMfGate = input.bool(true,  "also require VuManChu money flow < 0", group = grpT)
+
+grpL      = "Ladder"
+slicePct  = input.float(20.0, "% of tradeable units sold per trigger", minval = 1, maxval = 100, group = grpL)
+maxRungs  = input.int(4,      "max buy-back rungs", minval = 1, maxval = 8, group = grpL)
+maxAway   = input.float(12.0, "a rung may sit at most this % below the sell", minval = 1, group = grpL)
+minGap    = input.float(0.2,  "rungs must be at least this % apart", minval = 0.0, step = 0.1, group = grpL)
+maxLadders= input.int(4,      "max concurrent resting ladders", minval = 1, group = grpL)
+maxCash   = input.float(50.0, "cash ceiling — max % of the stack allowed to sit waiting", minval = 5, group = grpL)
+corePct   = input.float(0.0,  "protected core, % of high-water units, never sold", minval = 0, maxval = 90, group = grpL)
+feeBps    = input.float(10.0, "fee per side, basis points", minval = 0, group = grpL)
+
+grpP      = "Pivots"
+pivLeft   = input.int(5, "swing-low left bars",  minval = 1, group = grpP)
+pivRight  = input.int(5, "swing-low right bars", minval = 1, group = grpP)
+
+fee = feeBps / 10000.0
+
+// ── VUMANCHU, matching VMC = { chlen:9, avg:12, malen:3, mfiPeriod:60, mfiMult:150, mfiPosY:2.5 }
+wtSrc = hlc3
+esa   = ta.ema(wtSrc, 9)
+de    = ta.ema(math.abs(wtSrc - esa), 9)
+ci    = de == 0 ? 0.0 : (wtSrc - esa) / (0.015 * de)
+wt1   = ta.ema(ci, 12)
+wt2   = ta.sma(wt1, 3)
+
+mfRange = high - low
+mfRaw   = mfRange == 0 ? 0.0 : ((close - open) / mfRange) * 150.0
+moneyFlow = ta.sma(mfRaw, 60) - 2.5
+
+// ── STATE ─────────────────────────────────────────────────────────────────────────────────────
+var float units      = 1.0        // BTC held
+var float cash       = 0.0        // quote currency waiting on a rung
+var float startUnits = 1.0
+var float startPx    = na
+var float highWater  = 1.0
+var float coreUnits  = 0.0
+var int   sells      = 0
+var int   fills      = 0
+
+var array<float> rungPx   = array.new<float>()
+var array<float> rungUsdt = array.new<float>()
+var array<float> rungSold = array.new<float>()
+var array<int>   rungDay  = array.new<int>()
+
+var array<float> pivots   = array.new<float>()   // recent swing lows, oldest first
+
+if na(startPx)
+    startPx := close
+
+// ── 1. FILL PASS — a resting rung is hit when the bar trades down to it ────────────────────────
+if array.size(rungPx) > 0
+    for i = array.size(rungPx) - 1 to 0
+        px = array.get(rungPx, i)
+        if low <= px
+            usdt = array.get(rungUsdt, i)
+            got  = (usdt / px) * (1.0 - fee)
+            units := units + got
+            cash  := cash - usdt
+            fills := fills + 1
+            array.remove(rungPx,   i)
+            array.remove(rungUsdt, i)
+            array.remove(rungSold, i)
+            array.remove(rungDay,  i)
+            strategy.order("rung-buy", strategy.long, qty = got, limit = px, comment = "buy back")
+
+// ── 2. KEEP A ROLLING WINDOW OF SWING LOWS (the bot uses the last 12) ─────────────────────────
+pl = ta.pivotlow(low, pivLeft, pivRight)
+if not na(pl)
+    array.push(pivots, pl)
+    if array.size(pivots) > 12
+        array.shift(pivots)
+
+// ── 3. THE CORE AND ITS RATCHET ───────────────────────────────────────────────────────────────
+// Cash counts at the current price, so a slice temporarily in cash cannot fake a new high.
+totalNow  = units + (close > 0 ? cash / close : 0.0)
+highWater := math.max(highWater, totalNow)
+coreUnits := math.max(coreUnits, highWater * corePct / 100.0)
+
+// ── 4. THE TRIGGER ────────────────────────────────────────────────────────────────────────────
+move    = close / close[1] - 1.0
+pumped  = move >= pumpPct / 100.0
+redDot  = (wt1[1] - wt2[1]) >= 0 and (wt1 - wt2) < 0 and not na(wt2) and not na(wt2[1])
+fired   = mode == "pump" ? pumped : redDot
+mfOk    = not useMfGate or (not na(moneyFlow) and moneyFlow < 0)
+
+// ── 5. SELL A SLICE AND LAY THE LADDER ────────────────────────────────────────────────────────
+ladderCount = array.size(rungDay) == 0 ? 0 : 1     // approximation: rungs are laid as one group
+// count distinct ladder days properly
+distinctDays = 0
+if array.size(rungDay) > 0
+    seen = array.new<int>()
+    for i = 0 to array.size(rungDay) - 1
+        d = array.get(rungDay, i)
+        if array.indexof(seen, d) < 0
+            array.push(seen, d)
+    distinctDays := array.size(seen)
+
+canSell = fired and mfOk and bar_index > 60 and distinctDays < maxLadders
+
+tradeable = math.max(0.0, units - coreUnits)
+sellUnits = tradeable * slicePct / 100.0
+portfolio = units * close + cash
+cashAfter = portfolio > 0 ? (cash + sellUnits * close) / portfolio : 0.0
+
+if canSell and sellUnits > 0 and cashAfter <= maxCash / 100.0
+    // Candidate rungs: swing lows below the sell price, within maxAway%.
+    cand = array.new<float>()
+    if array.size(pivots) > 0
+        for i = 0 to array.size(pivots) - 1
+            p = array.get(pivots, i)
+            if p > 0 and p < close and (close - p) / close <= maxAway / 100.0
+                array.push(cand, p)
+    array.sort(cand, order.descending)
+
+    chosen = array.new<float>()
+    if array.size(cand) > 0
+        for i = 0 to array.size(cand) - 1
+            if array.size(chosen) >= maxRungs
+                break
+            p  = array.get(cand, i)
+            ok = true
+            if array.size(chosen) > 0
+                for j = 0 to array.size(chosen) - 1
+                    if math.abs(array.get(chosen, j) - p) / close < minGap / 100.0
+                        ok := false
+            if ok
+                array.push(chosen, p)
+
+    // No level below to buy back at means no sell. A sell with nowhere to return is just a sale.
+    if array.size(chosen) > 0
+        proceeds = sellUnits * close * (1.0 - fee)
+        units   := units - sellUnits
+        cash    := cash + proceeds
+        sells   := sells + 1
+        per      = proceeds / array.size(chosen)
+        perUnits = sellUnits / array.size(chosen)
+        for i = 0 to array.size(chosen) - 1
+            array.push(rungPx,   array.get(chosen, i))
+            array.push(rungUsdt, per)
+            array.push(rungSold, perUnits)
+            array.push(rungDay,  bar_index)
+        strategy.order("slice-sell", strategy.short, qty = sellUnits, comment = "pump sell")
+
+// ── 6. THE READOUT ────────────────────────────────────────────────────────────────────────────
+// unitsTotal marks cash back to coins at the current price, so a ladder mid-flight is valued
+// honestly rather than looking like a loss until it fills.
+unitsTotal = units + (close > 0 ? cash / close : 0.0)
+vsHold     = unitsTotal / startUnits
+
+plot(unitsTotal, "units held (cash marked to coins)", color = color.new(color.teal, 0), linewidth = 2, display = display.pane)
+plot(startUnits, "units if you had held",             color = color.new(color.gray, 0), linewidth = 1, display = display.pane)
+hline(1.0, "break-even in coins", color = color.new(color.gray, 50), linestyle = hline.style_dashed)
+
+plotshape(canSell and sellUnits > 0, "sell", shape.triangledown, location.abovebar, color.new(color.red, 0), size = size.tiny)
+plotchar(fired and not mfOk, "gated by money flow", "·", location.abovebar, color.new(color.orange, 0), size = size.tiny)
+
+if barstate.islast
+    var table t = table.new(position.top_right, 2, 7, border_width = 1)
+    table.cell(t, 0, 0, "COINS, not dollars", bgcolor = color.new(color.blue, 80), text_color = color.white)
+    table.cell(t, 1, 0, "", bgcolor = color.new(color.blue, 80))
+    table.cell(t, 0, 1, "units now"),        table.cell(t, 1, 1, str.tostring(unitsTotal, "#.######"))
+    table.cell(t, 0, 2, "units if held"),    table.cell(t, 1, 2, str.tostring(startUnits, "#.######"))
+    table.cell(t, 0, 3, "vs hold"),          table.cell(t, 1, 3, str.tostring((vsHold - 1) * 100, "#.##") + "%",
+         text_color = vsHold >= 1 ? color.green : color.red)
+    table.cell(t, 0, 4, "sells"),            table.cell(t, 1, 4, str.tostring(sells))
+    table.cell(t, 0, 5, "buy-backs filled"), table.cell(t, 1, 5, str.tostring(fills))
+    table.cell(t, 0, 6, "rungs still resting"), table.cell(t, 1, 6, str.tostring(array.size(rungPx)))

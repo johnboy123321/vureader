@@ -361,5 +361,75 @@ console.log('\n17. Seeding from the real wallet happens once, and only once');
   ok('the wallet balance is de-scaled, never assumed', /10 \*\* scale/.test(src));
 }
 fs.unlinkSync(out);
+// ── THE JAM, AND THE RULE THAT ENDS IT (2026-08-21) ─────────────────────────────────────────
+// Backtested on the repo's own daily BTC data: the ladder ended three years holding 0.769 BTC
+// against 1.000 held, and it did not lose that by trading badly — it stopped. Three ladders laid
+// in Oct 2023 at ~26k never filled, and because maxConcurrent counts a resting ladder whether or
+// not it can EVER fill, all four slots were dead from Sep 2024. Nine sells in three years.
+console.log('\nA. A rung that will never fill is given up on');
+{
+  const DAYMS = 864e5;
+  const day = n => new Date(n * DAYMS).toISOString().slice(0, 10);
+  // A flat series long enough for the indicators, ending on a bar that fires nothing.
+  const flat = [];
+  for (let i = 0; i < 120; i++) flat.push({ t: i * DAYMS, o: 100, h: 100.5, l: 99.5, c: 100, v: 1 });
+  const lastDay = day(119);
+
+  const rung = (age, px) => ({ px, src: 'swingLow', usdt: 100, soldUnits: 1, sellPx: 100, sinceDay: day(119 - age) });
+
+  // Far below the market so it can never fill from the bar itself.
+  const st0 = () => ({ units: 1, cash: 100, open: [rung(40, 50)], sells: 1, fills: 0,
+                       lastDay: day(118), startedAt: day(0), startUnits: 1, coreUnits: 0, highWater: 1 });
+
+  const r = M.accumStep(st0(), flat, { corePct: 0 });
+  const exp = r.events.filter(e => e.kind === 'expire');
+  ok('a 40-day-old rung expires under the 30-day default', exp.length === 1, JSON.stringify(r.events));
+  ok('its cash is spent, not left stranded', Math.abs(r.st.cash) < 1e-9, r.st.cash);
+  ok('and it comes back as coins', r.st.units > 1, r.st.units);
+  ok('the slot is freed', r.st.open.length === 0);
+  ok('the event says how old it was', exp[0].ageDays === 40, exp[0].ageDays);
+  ok('and carries the cash so a real order can be sized', exp[0].usdt === 100, exp[0].usdt);
+  ok('the loss in units is recorded, not hidden', Number.isFinite(exp[0].lost), exp[0].lost);
+  ok('buying 100 USDT at 100 after selling 1 unit at 50 is a REAL loss', exp[0].lost > 0, exp[0].lost);
+
+  const young = M.accumStep({ ...st0(), open: [rung(29, 50)] }, flat, { corePct: 0 });
+  ok('a 29-day-old rung is left alone', young.events.filter(e => e.kind === 'expire').length === 0);
+  ok('and is still resting', young.st.open.length === 1);
+
+  const off = M.accumStep(st0(), flat, { corePct: 0, ttlDays: 0 });
+  ok('the rule is only a default — env ACCUM_RUNG_TTL_DAYS=0 keeps the old forever-rungs',
+     /num\("ACCUM_RUNG_TTL_DAYS", 30\)/.test(src));
+}
+
+console.log('\nB. Expiry frees a stood-down ladder too');
+{
+  const DAYMS = 864e5;
+  const day = n => new Date(n * DAYMS).toISOString().slice(0, 10);
+  const flat = [];
+  for (let i = 0; i < 120; i++) flat.push({ t: i * DAYMS, o: 100, h: 100.5, l: 99.5, c: 100, v: 1 });
+  const st = { units: 1, cash: 100, open: [{ px: 50, src: 'OB', usdt: 100, soldUnits: 1, sellPx: 100, sinceDay: day(70) }],
+               sells: 1, fills: 0, lastDay: day(118), startedAt: day(0), startUnits: 1, coreUnits: 0, highWater: 1 };
+  const r = M.accumStep(st, flat, { corePct: 0, paused: true, pausedWhy: 'the dot flip holds the coins' });
+  ok('a paused ladder still gives up on dead rungs', r.events.some(e => e.kind === 'expire'));
+  ok('it still refuses to START anything', !r.events.some(e => e.kind === 'sell'));
+  ok('and still says why it is standing down', r.events.some(e => e.kind === 'skip'));
+}
+
+console.log('\nC. THE BUY-BACK IS A REAL ORDER, NOT A LOG LINE');
+{
+  // The sell side placed a real spot order; the buy side wrote a sentence. A ladder that sells
+  // real coins and buys them back in fiction is a one-way sale.
+  ok('a fill now places a spot buy', /if \(e\.kind === "fill" \|\| e\.kind === "expire"\)/.test(src));
+  ok('sized from the rung\'s own cash', /quoteQty: spend/.test(src));
+  ok('and capped by what the wallet actually holds', /Math\.min\(Number\(e\.usdt\) \|\| 0, walletQuote\)/.test(src));
+  ok('fill events carry that cash', /kind: "fill"[\s\S]{0,160}usdt: \+Number\(r\.usdt\)\.toFixed\(2\)/.test(src));
+  ok('an armed order that does not place rolls the book back', /state = stateBefore;/.test(src));
+  ok('loudly', /result: "ACCUM UNPLACED"/.test(src));
+  ok('and says the rung will be retried', /still resting and will be retried next run/.test(src));
+  ok('the rollback snapshot is taken before anything is applied',
+     src.indexOf('const stateBefore = JSON.parse(JSON.stringify(state));') < src.indexOf('accumFillPass(state, fine)'));
+  ok('an expiry is logged as its own thing, not as a normal buy', /result: isExpiry \? "ACCUM RUNG EXPIRED" : "ACCUM BUY"/.test(src));
+}
+
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail?1:0);
