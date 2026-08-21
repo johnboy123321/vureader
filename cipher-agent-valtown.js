@@ -1287,6 +1287,57 @@ const RESOLUTION_CLASSES = ["strategy", "execution_artifact"];
 // one, and calling it by its name turns a mystery into a measurable fact about cadence.
 //
 // Every value here classifies as an execution artifact: none of it is evidence about a signal.
+// ═══════════ WHAT THE VENUE WILL NOT TRADE, REMEMBERED (2026-08-21) ═══════════
+// The rejection classifier told us WHY orders were dying. Counting them told us how badly:
+// nineteen of twenty order attempts in the 2026-08-20/21 window were refused, and eleven of
+// those nineteen were the same two answers repeated —
+//     20005  TE_SEQ_TURN_OFF   the venue has this symbol switched off   ×9
+//     39999  symbol not listed on this venue                            ×2
+// Nine times. The bot asked Phemex for a symbol it had already been told was off, every fifteen
+// minutes, and each refusal burned the coin for the day. Those are not near-misses; they are
+// trades the strategy wanted and never got, thrown away by asking a question already answered.
+//
+// So the answer is kept. A refusal puts the symbol in the sin bin for a while and the scan skips
+// it there — cheaply, before sizing, before the day's slot is spent — with a reason that names
+// the venue rather than the setup. The cooldown escalates for a symbol that keeps saying no and
+// clears the moment one order goes through, so a symbol switched back on returns on its own.
+//
+// The one thing it must never do is silently narrow the universe: every skip is logged, and
+// `venueBench` reports everything currently benched at the top of each run.
+const VENUE_KEY = "cipher_venue";
+const VENUE_RULES = {
+  "20005": { base: 6 * 3600e3,  max: 48 * 3600e3, why: "the venue has this symbol switched off (TE_SEQ_TURN_OFF)" },
+  "39999": { base: 7 * 864e5,   max: 7 * 864e5,   why: "the venue does not list this symbol at all" },
+};
+// PURE: memory + symbol + now → why it is benched, or null. No I/O, no clock.
+function venueBlock(mem, symbol, now) {
+  const e = mem && mem[String(symbol).toUpperCase()];
+  if (!e || !(e.until > now)) return null;
+  const mins = Math.round((e.until - now) / 60000);
+  return { code: e.code, why: e.why, until: e.until,
+           label: `${symbol} is benched — ${e.why}. Refused ${e.strikes}×; trying again in ${mins < 60 ? mins + " min" : Math.round(mins / 60) + "h"}.` };
+}
+// PURE: record a refusal and return the updated memory. Repeat offenders wait longer, up to a cap.
+function venueNote(mem, symbol, code, now) {
+  const rule = VENUE_RULES[String(code)];
+  if (!rule) return mem;                                   // only bench for reasons we understand
+  const k = String(symbol).toUpperCase();
+  const prev = (mem && mem[k]) || { strikes: 0 };
+  const strikes = (prev.strikes || 0) + 1;
+  const wait = Math.min(rule.max, rule.base * Math.pow(2, strikes - 1));
+  return { ...(mem || {}), [k]: { code: String(code), why: rule.why, strikes, lastAt: now, until: now + wait } };
+}
+// PURE: a symbol that traded is not benched, whatever it did last week.
+function venueClear(mem, symbol) {
+  const k = String(symbol).toUpperCase();
+  if (!mem || !mem[k]) return mem || {};
+  const out = { ...mem }; delete out[k]; return out;
+}
+function venueBench(mem, now) {
+  return Object.entries(mem || {}).filter(([, e]) => e.until > now)
+    .map(([sym, e]) => `${sym} (${e.code}, ${Math.round((e.until - now) / 60000)}m)`);
+}
+
 const PHEMEX_REJECTIONS = {
   "11048": { label: "stale — price moved past the stop before the order was sent",
              detail: "LONG stop must be below the live MARK price, not just below the planned entry. The signal aged out between the candle close and the send.",
@@ -1301,6 +1352,68 @@ const PHEMEX_REJECTIONS = {
              detail: "The universe includes a coin testnet does not carry. Nothing to do with the setup.",
              klass: "execution_artifact", cause: "universe" },
 };
+// ── VALIDATE THE STOP AGAINST THE PRICE PHEMEX WILL ACTUALLY USE (2026-08-21) ────────────────
+// 11048/11052 were the other repeat offender. We check the stop against the price we PLANNED at;
+// Phemex checks it against the MARK — `slTrigger: "ByMarkPrice"`, our own choice, three lines up
+// in buildOrder. On testnet the two are not close relatives: the book is thin, last price wanders
+// off the index, and a stop sitting a legal 0.4% below LAST can be sitting above MARK. The order
+// is then built, approved by every one of our guards, sent, and refused — and the coin is burned
+// for the day on a trade nobody ever got a chance to be wrong about.
+//
+// So the mark is read once, immediately before sending, and the same question Phemex is about to
+// ask gets asked here first. It DECLINES rather than nudging the stop: the stop sits at a swing
+// level for a reason, and shuffling it to satisfy a validator would place a trade whose risk is
+// no longer where the thesis put it. Better to say "this one aged out" and mean it.
+//
+// If the mark cannot be read, this returns null and the order goes exactly as it does today. A
+// guard that cannot see must not be allowed to block.
+const MARK_BUFFER_PCT = 0.001;             // the stop must clear the mark by at least this much
+function markStopVerdict(order, mark) {
+  const m = Number(mark);
+  if (!(m > 0)) return null;                                    // no mark read — do not interfere
+  const sl = Number(order && order.stopLossRp);
+  if (!(sl > 0)) return null;                                   // no stop is a different guard's job
+  const isLong = order.side === "Buy";
+  const need = isLong ? m * (1 - MARK_BUFFER_PCT) : m * (1 + MARK_BUFFER_PCT);
+  const wrongSide = isLong ? sl >= need : sl <= need;
+  if (!wrongSide) return null;
+  const driftPct = Math.abs(sl - m) / m * 100;
+  return {
+    label: "aged out — the stop is on the wrong side of the live mark",
+    detail: `${isLong ? "LONG" : "SHORT"} stop ${sl} vs mark ${m} (${driftPct.toFixed(2)}% away, wrong side). `
+          + "Phemex validates the stop against the MARK price, not our planned entry, and would refuse this. "
+          + "Declined here instead so the coin is not burned on an order that was never going to be accepted.",
+    klass: "execution_artifact", cause: "cadence", mark: m, stop: sl,
+  };
+}
+// Read the mark defensively: shapes differ across Phemex's md versions, and a shape we do not
+// recognise must read as "unknown", never as zero.
+function markFrom(body) {
+  const seen = [];
+  const walk = (o, d) => {
+    if (!o || typeof o !== "object" || d > 5) return;
+    for (const [k, v] of Object.entries(o)) {
+      if (/^mark(Price)?(Rp|Ep)?$/i.test(k)) { const n = Number(v); if (n > 0) seen.push({ k, n }); }
+      else if (v && typeof v === "object") walk(v, d + 1);
+    }
+  };
+  walk(body, 0);
+  if (!seen.length) return null;
+  // Prefer the Rp (real-number) form; an Ep value is a scaled integer and we do not know its scale.
+  const rp = seen.find(x => /Rp$/i.test(x.k)) || seen.find(x => !/Ep$/i.test(x.k));
+  return rp ? rp.n : null;
+}
+async function markPriceFor(symbol) {
+  for (const [path, q] of [["/md/v3/ticker/24hr", "symbol=" + symbol], ["/md/ticker/24hr", "symbol=" + symbol]]) {
+    try {
+      const r = await phemexPublic(path, q);
+      const m = markFrom(r && r.data);
+      if (m) return m;
+    } catch (e) { /* try the next shape */ }
+  }
+  return null;
+}
+
 function explainRejection(why) {
   const m = /phemex (\d+)/.exec(String(why || ""));
   const hit = m && PHEMEX_REJECTIONS[m[1]];
@@ -1577,14 +1690,31 @@ async function resolveHedges(positions) {
     const smaller = notional(biggestLong) <= notional(biggestShort) ? biggestLong : biggestShort;
     const order = hedgeCloseOrder(smaller);
     if (!order) { out.failed++; continue; }
-    let ok = false;
-    try { const r = await execOrder(order); ok = r && r.status === 200 && r.data && !r.data.error; }
-    catch { ok = false; }
+    // ── A FAILED CLOSE MUST NOT REPORT ITSELF AS A CLOSE (2026-08-21) ───────────────────────
+    // Both branches used to log the same sentence — "Closed the smaller leg … same net exposure"
+    // — and only the RESULT field said whether it had worked. On 2026-08-20 that produced five
+    // lines over two hours, all reading as if the hedge had been dealt with, while ADA sat there
+    // still holding both sides. The failures were also invisible in every count, because "ERR
+    // de-hedge" parses as an order rejection and got filed with the venue's refusals.
+    //
+    // A log line that describes what was ATTEMPTED as though it were what HAPPENED is the most
+    // expensive kind of wrong in this file: it costs you the chance to notice.
+    let ok = false, why = "";
+    try {
+      const r = await execOrder(order);
+      ok = r && r.status === 200 && r.data && !r.data.error;
+      if (!ok) why = String((r && r.data && (r.data.error || r.data.msg)) || ("http " + (r && r.status))).slice(0, 160);
+    } catch (e) { ok = false; why = String(e && e.message || e).slice(0, 160); }
     if (ok) out.closed++; else out.failed++;
     const coin = sym.replace(/USDT$/, "");
+    const leg = `${smaller.posSide}, ${Math.abs(Number(smaller.size))}`;
     await pushLog({ coin, dir: String(smaller.posSide || "").toLowerCase(),
-      result: ok ? "DE-HEDGED" : "ERR de-hedge",
-      skipped: `${sym} was holding both sides. Closed the smaller leg (${smaller.posSide}, ${Math.abs(Number(smaller.size))}) — same net exposure, one set of fees and funding instead of two.` });
+      result: ok ? "DE-HEDGED" : "DE-HEDGE FAILED",
+      countsForStats: false,
+      skipped: ok
+        ? `${sym} was holding both sides. Closed the smaller leg (${leg}) — same net exposure, one set of fees and funding instead of two.`
+        : `${sym} is STILL holding both sides. Tried to close the smaller leg (${leg}) and the venue refused: ${why || "no reason given"}. `
+          + `It is paying funding and fees on both legs until this succeeds or you close one by hand. This will be retried next run.` });
   }
   return out;
 }
@@ -3558,6 +3688,16 @@ export default async function cipherAgent() {
     } catch (e) { console.error("de-hedge pass failed (harmless, reduce-only):", e && e.message); }
   }
 
+  // ── WHAT THE VENUE HAS ALREADY REFUSED ────────────────────────────────────────────────────
+  // Loaded once per run, saved only when it changes. Benched symbols are printed every run: a
+  // universe that quietly narrows itself is a universe nobody is auditing.
+  let VENUE = {};
+  try {
+    VENUE = await getJSON(VENUE_KEY, {}) || {};
+    const bench = venueBench(VENUE, Date.now());
+    if (bench.length) console.log(`venue bench (${bench.length}): ${bench.join(", ")}`);
+  } catch (e) { console.error("venue memory read failed (fails open — every symbol allowed):", e && e.message); VENUE = {}; }
+
   // ── CIRCUIT BREAKER: check the money before asking for more risk ──────────────────────────
   let BREAKER = { paused: false, st: {} };
   try {
@@ -3711,8 +3851,28 @@ export default async function cipherAgent() {
     // the day: the signal was fine, the account state was not.
     if (BREAKER.paused) { await pushLog({ ...t, skipped: "CIRCUIT BREAKER — " + (BREAKER.st.pausedWhy || "paused") }); continue; }
 
+    // Already told no by the venue? Do not ask again, and do not spend the day's slot finding out.
+    const benched = venueBlock(VENUE, String(coin).toUpperCase() + "USDT", Date.now());
+    if (benched) {
+      await pushLog({ ...t, result: "SKIPPED (venue)", skipped: benched.label,
+                      rejection: { label: benched.why, klass: "execution_artifact", cause: "venue", code: benched.code },
+                      countsForStats: false });
+      continue;                                   // the coin is NOT burned — the setup was fine
+    }
+
     const built = buildOrder(t);
     if (built.err) { await pushLog({ ...t, skipped: built.err }); continue; }
+
+    // Ask the question Phemex is about to ask, before spending the coin on it.
+    if (mode === "armed") {
+      const mk = await markPriceFor(built.meta.symbol);
+      const stale = markStopVerdict(built.order, mk);
+      if (stale) {
+        await pushLog({ ...t, result: "SKIPPED (aged out)", skipped: stale.detail,
+                        rejection: { ...stale }, countsForStats: false });
+        continue;                                 // not burned: the same setup may be fine next run
+      }
+    }
 
     fired[key] = Date.now();
     if (mode === "dry") {
@@ -3773,6 +3933,15 @@ export default async function cipherAgent() {
       dryRun: ok ? !!r.data.dryRun : undefined,
       rejection: ok ? undefined : { ...explainRejection(why), raw: String(why).slice(0, 120) },
       countsForStats: !!ok });
+
+    // Remember what the venue said, so the next run does not spend a coin rediscovering it.
+    {
+      const sym = built.meta.symbol;
+      const code = ok ? null : (explainRejection(why).code || null);
+      const before = JSON.stringify(VENUE);
+      VENUE = ok ? venueClear(VENUE, sym) : venueNote(VENUE, sym, code, Date.now());
+      if (JSON.stringify(VENUE) !== before) await setJSON(VENUE_KEY, VENUE);
+    }
     // fired[] was set BEFORE the attempt, so a failed order still burned the coin for the whole
     // day — 17 signals in Aug were lost twice over: no order placed AND no retry. A server-side
     // fault is not a decision, so undo the mark and let the next sweep have another go. A 4xx IS

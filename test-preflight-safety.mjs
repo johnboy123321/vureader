@@ -129,5 +129,22 @@ console.log('\n  8. THE SAFETY NET TESTS THE LIVE FILE, NOT A GHOST');
   ok('every test suite is present', tests.length>=13, tests.length);
 }
 
+console.log('\n  10. DROPPED TRADES — a venue refusal must never cost a trading slot');
+{
+  // 19 of 20 order attempts refused on 2026-08-20/21, and every one burned the coin for the day.
+  ok('the venue bench exists', /const VENUE_KEY = "cipher_venue"/.test(src));
+  ok('it only benches codes with a named rule', /if \(!rule\) return mem;/.test(src));
+  ok('a symbol that trades is released', /function venueClear/.test(src));
+  ok('the bench is announced every run, never silent', /venue bench \(/.test(src));
+  ok('the stop is checked against the MARK before sending', /function markStopVerdict/.test(src));
+  ok('and that check declines rather than nudging the stop into legality',
+     !/stopLossRp = |sl = need|order\.stopLossRp =/.test(src));
+  ok('an unreadable mark does not block the order', /if \(!\(m > 0\)\) return null;/.test(src));
+  ok('both skips happen before fired\[key\] burns the coin',
+     src.indexOf('const benched = venueBlock(VENUE') < src.indexOf('fired[key] = Date.now();') &&
+     src.indexOf('const stale = markStopVerdict(') < src.indexOf('fired[key] = Date.now();'));
+  ok('a failed de-hedge no longer reports itself as a success', /"DE-HEDGE FAILED"/.test(src) && !/ERR de-hedge/.test(src));
+}
+
 console.log(`\n  ${pass} passed, ${fail} failed\n`);
 process.exit(fail?1:0);
