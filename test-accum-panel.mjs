@@ -193,5 +193,24 @@ console.log('\n10. The header reports whichever strategy actually holds the coin
   ok('being in cash is stated plainly', /IN CASH — WAITING TO BUY BACK/.test(html));
 }
 
+// ── THE PANEL CAN BE RIGHT AND STILL LIE (2026-08-21) ──────────────────────────────────────
+// John reported two bugs this morning — "sells 0 / buy-backs 0" and "the timeframe toggles are
+// gone" — and both had been fixed the day before. His browser was serving yesterday's index.html
+// out of its cache. Every assertion above passed the whole time, because they test the file in
+// the repo and he was not looking at the file in the repo. A panel that is correct in git and
+// stale on the phone is still a panel that reports the wrong numbers.
+console.log('\n7. The page can tell when it is out of date');
+{
+  ok('there is a build stamp to compare against', /const APP_BUILD = '[^']+'/.test(src));
+  ok('the stamp is current, not left at an old release', !/const APP_BUILD = 'v3\.9/.test(src));
+  ok('the page re-fetches its own source past the cache', /cache: 'no-store'/.test(src) && /checkForUpdate/.test(src));
+  ok('it compares the published stamp with the running one',
+     /const m = \/const APP_BUILD = '\(\[\^'\]\+\)'\/\.exec/.test(src) && /m\[1\] === APP_BUILD/.test(src));
+  ok('it tells the user rather than silently showing old numbers', /This page is out of date/.test(src));
+  ok('the reload defeats the cache with a fresh URL', /location\.replace\(location\.pathname \+ '\?v=' \+ Date\.now\(\)\)/.test(src));
+  ok('it never reloads on its own — there is a Later button', /dismiss\.textContent = 'Later'/.test(src));
+  ok('it re-checks when the tab comes back to the front', /visibilitychange/.test(src) && /if \(!document\.hidden\) checkForUpdate\(\)/.test(src));
+}
+
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail?1:0);

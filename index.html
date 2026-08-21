@@ -3013,7 +3013,64 @@ function closeQROutside(e) {
 // ═══════════════════════════ SETTINGS ═══════════════════════════
 // Model routing: 'smart' = deep-analysis model (chart reads/verdicts); 'light' = cheap model for mechanical jobs.
 // Build stamp — bump on every deploy so "which version am I running?" has a true answer.
-const APP_BUILD = 'v3.9 · 10 Aug 2026 · accuracy pass — exact VuManChu divergence levels (+45/−65, was ±45) and an R-based drift guard so stale plans never get placed; confirmations checked on the timeframe BELOW the signal (no more waiting on the daily close) and fired straight into the bot; VWAP wave computed + Momentum Rollover; exits at T2 (2.25R); Class A divergence; 30m/15m scanning; 56-token vocabulary';
+const APP_BUILD = 'v4.0 · 21 Aug 2026 · stale-page guard (this page now tells you when it is out of date); accumulator header reports whichever strategy actually holds the coins; dot-flip timeframe toggles; venue rejections classified as execution artifacts, never as signal evidence';
+// ── STALE PAGE GUARD (2026-08-21) ────────────────────────────────────────────────────────────
+// GitHub Pages sets a cache header on index.html, and a phone with this saved to its home screen
+// will hold that copy for days. On 2026-08-21 John reported two bugs — "sells 0 / buy-backs 0"
+// and "the timeframe toggles are gone" — and BOTH had been fixed the day before. His browser was
+// simply showing yesterday's page. That is the worst failure this panel can have: not going dark,
+// which you would notice, but reporting confident, wrong numbers from an old build while the real
+// bot does something else entirely.
+//
+// So the page checks itself. It fetches its own source past the cache, reads the build stamp out
+// of it, and if that differs from the stamp compiled into the running copy it says so and offers
+// a one-tap reload. It never reloads on its own — losing a half-typed note to a surprise refresh
+// would be its own kind of rude.
+async function checkForUpdate() {
+  try {
+    const here = location.pathname.replace(/\/$/, '/index.html');
+    const res = await fetch(here + '?v=' + Date.now(), { cache: 'no-store' });
+    if (!res.ok) return;
+    const m = /const APP_BUILD = '([^']+)'/.exec(await res.text());
+    if (!m || m[1] === APP_BUILD) return;
+    showUpdateBar(m[1]);
+  } catch (e) { /* offline, or opened from a file — nothing to say */ }
+}
+function hardReload() {
+  try { if (window.caches && caches.keys) caches.keys().then(ks => ks.forEach(k => caches.delete(k))); } catch (e) {}
+  // A fresh query string is a different URL, so the browser cannot serve the stale copy for it.
+  location.replace(location.pathname + '?v=' + Date.now());
+}
+function showUpdateBar(newBuild) {
+  if (document.getElementById('update-bar')) return;
+  const bar = document.createElement('div');
+  bar.id = 'update-bar';
+  bar.style.cssText = 'position:fixed;left:0;right:0;top:0;z-index:99999;background:#1d2b36;'
+    + 'border-bottom:1px solid #8bd;color:#cfe;padding:10px 14px;font-size:13px;line-height:1.4;'
+    + 'display:flex;gap:10px;align-items:center;flex-wrap:wrap;';
+  const txt = document.createElement('span');
+  txt.style.cssText = 'flex:1 1 220px;';
+  txt.innerHTML = '<b style="color:#8bd;">This page is out of date.</b> '
+    + 'The numbers below may be from an older build than the bot is running.';
+  const btn = document.createElement('button');
+  btn.textContent = 'Update now';
+  btn.style.cssText = 'padding:7px 14px;font-size:13px;font-weight:700;cursor:pointer;border-radius:6px;'
+    + 'border:1px solid #8bd;background:rgba(136,187,221,0.20);color:#8bd;';
+  btn.onclick = hardReload;
+  const dismiss = document.createElement('button');
+  dismiss.textContent = 'Later';
+  dismiss.style.cssText = 'padding:7px 12px;font-size:13px;cursor:pointer;border-radius:6px;'
+    + 'border:1px solid #4a4a4a;background:transparent;color:#9a9a9a;';
+  dismiss.onclick = () => bar.remove();
+  bar.appendChild(txt); bar.appendChild(btn); bar.appendChild(dismiss);
+  document.body.appendChild(bar);
+  try { console.log('[build] running ' + APP_BUILD + ' · published ' + newBuild); } catch (e) {}
+}
+// On load, and again whenever the tab is brought back to the front after being away — which is
+// exactly when a phone has been asleep for a day holding a stale copy.
+window.addEventListener('load', () => setTimeout(checkForUpdate, 2000));
+document.addEventListener('visibilitychange', () => { if (!document.hidden) checkForUpdate(); });
+
 function modelFor(tier) {
   if (tier === 'light') return localStorage.getItem('mc_model_light') || 'claude-haiku-4-5-20251001';
   return localStorage.getItem('mc_model') || 'claude-opus-4-8';
