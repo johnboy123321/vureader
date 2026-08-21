@@ -3013,7 +3013,7 @@ function closeQROutside(e) {
 // ═══════════════════════════ SETTINGS ═══════════════════════════
 // Model routing: 'smart' = deep-analysis model (chart reads/verdicts); 'light' = cheap model for mechanical jobs.
 // Build stamp — bump on every deploy so "which version am I running?" has a true answer.
-const APP_BUILD = 'v4.2 · 21 Aug 2026 · a day P&L you can zero (and put back); the in-app chat can now read the 24/7 agent, the ledger, the accumulator and the paper book — it had been answering from the app feed that has been dormant since 15 Aug';
+const APP_BUILD = 'v4.3 · 21 Aug 2026 · the resolver now has a price for every coin it resolves — five of seven trades were being written off as hand-closed simply because their coin was not in that run\'s 20-coin batch; "unseen" is now its own outcome and reads as the bot\'s gap, not the trade\'s';
 // ── STALE PAGE GUARD (2026-08-21) ────────────────────────────────────────────────────────────
 // GitHub Pages sets a cache header on index.html, and a phone with this saved to its home screen
 // will hold that copy for days. On 2026-08-21 John reported two bugs — "sells 0 / buy-backs 0"
@@ -10409,7 +10409,7 @@ document.addEventListener('click', function(e){
   //   2. The window is stated. The bot keeps the last 300 decisions and no more, so "12 wins"
   //      without "since Wednesday" is a number with no denominator.
   function tallyLog(log, sinceMs){
-    const t = { wins:0, losses:0, R:0, rUnknown:0, artifacts:0, rejected:0, placed:0, graded:0, risk:null };
+    const t = { wins:0, losses:0, R:0, rUnknown:0, artifacts:0, unseen:0, rejected:0, placed:0, graded:0, risk:null };
     for(const e of (log||[])){
       if(sinceMs){ const ts = new Date(e.at).getTime(); if(!(ts >= sinceMs)) continue; }
       // A ledger row names its own kind; a log row has to be read off the result string. Both
@@ -10429,7 +10429,7 @@ document.addEventListener('click', function(e){
         how = m ? m[1] : '';
         counts = (how === 'target' || how === 'stop');
       }
-      if(!counts){ t.artifacts++; continue; }
+      if(!counts){ t.artifacts++; if(how === 'unseen') t.unseen++; continue; }
       t.graded++;
       if(how === 'target') t.wins++; else if(how === 'stop') t.losses++;
       if(e.R !== null && e.R !== undefined && Number.isFinite(Number(e.R))) t.R += Number(e.R); else t.rUnknown++;
@@ -10503,7 +10503,8 @@ document.addEventListener('click', function(e){
     h += tile('at £'+risk+'/trade', noR ? '—' : (gbp >= 0 ? '+£' : '−£') + Math.abs(gbp).toFixed(2),
               noR ? 'var(--dim)' : rCol, noR ? 'no R on record yet' : 'what that R is worth');
     h += tile('open now', open.length, open.length ? '#8bd' : 'var(--dim)', open.length ? (open.map(o=>o.coin).slice(0,4).join(' ') + (open.length > 4 ? ' +' + (open.length - 4) + ' more' : '')) : 'nothing at risk');
-    h += tile('not counted', t.artifacts + t.rejected, (t.artifacts + t.rejected) ? '#e8c07a' : 'var(--dim)', t.artifacts + ' artifacts · ' + t.rejected + ' rejected');
+    h += tile('not counted', t.artifacts + t.rejected, (t.artifacts + t.rejected) ? '#e8c07a' : 'var(--dim)',
+              t.artifacts + ' artifacts · ' + t.rejected + ' rejected' + (t.unseen ? ' · ' + t.unseen + ' unseen' : ''));
     h += '</div>';
 
     const sinceLbl = markerIsMidnight() ? 'today' : 'since reset';
@@ -10531,6 +10532,7 @@ document.addEventListener('click', function(e){
       + '<b>Only trades that reached their own stop or target are graded.</b> Positions closed by hand, ones where '
       + 'price went through both levels between two runs, and orders the venue refused are counted separately as '
       + '"not counted" — they are facts about the plumbing, not about whether the strategy works.'
+      + (t.unseen ? ' <b style="color:#e8c07a;">' + t.unseen + ' of those are "unseen"</b> — the bot had no price for the coin when it noticed the position had gone, so it cannot say what closed it. That is a gap in the bot\'s own data, not something the trade did.' : '')
       + (t.rUnknown ? ' ' + t.rUnknown + (t.rUnknown === 1 ? ' trade resolved' : ' trades resolved') + ' before 21 Aug '
         + (t.rUnknown === 1 ? 'carries' : 'carry') + ' no R, so ' + (t.rUnknown === 1 ? 'it is' : 'they are') + ' in the win rate but not in the total.' : '')
       + '</div>';

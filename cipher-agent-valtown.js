@@ -1577,6 +1577,21 @@ function classifyResolution(was, px, range) {
   // Gone, but at neither of its own levels. By elimination somebody closed it by hand (or the
   // venue did). Direction is recorded for information; it counts toward nothing, because the
   // exit price the bot can see is not the price it was closed at.
+  // ── NOT SEEING IS NOT THE SAME AS NOT HAPPENING (2026-08-21) ────────────────────────────
+  // With no range AND no price this function knows nothing whatsoever about the trade, and the
+  // old code still returned "closed_by_hand" — an assertion about what somebody DID. Five of
+  // seven trades on 2026-08-21 were written off that way while the real answer was "we did not
+  // look". They are both artifacts and neither counts, but they are different facts and the
+  // difference is the whole reason to keep a record: one says fix your exchange habits, the
+  // other says fix your bot.
+  if (!haveRange && !Number.isFinite(px)) {
+    return { how: "unseen", outcome: "unattributed", klass: "execution_artifact",
+             execution: "no_price_no_range",
+             why: "gone, and the bot had neither a price nor a range for this coin when it looked — "
+                + "so it cannot say whether the stop, the target, or something else closed it. "
+                + "This is a gap in OUR data, not a fact about the trade.",
+             countsForStreak: false, countsForStats: false };
+  }
   const dir = Number.isFinite(entry) && Number.isFinite(px)
     ? ((isLong ? px > entry : px < entry) ? "was in profit when we looked" : "was in loss when we looked")
     : "no entry recorded";
@@ -4414,19 +4429,43 @@ export default async function cipherAgent() {
     }
     // The range each resolved position traded through since we last saw it, so a target that was
     // hit and given back before the next run still reads as a target rather than as "closed".
-    const ranges = {};
+    // ── A TRADE CAN ONLY BE GRADED IF WE KNOW WHAT PRICE DID (2026-08-21, evening) ──────────
+    // John: "why do we only have two graded trades?" Five of seven resolutions came back
+    // "closed_by_hand — no entry recorded", and that phrase was the clue: it is printed when the
+    // classifier has NO PRICE for the coin. priceOf reads `lastPrice`, which is filled by the scan
+    // — and the scan only touches the 20 coins in this run's batch, rotating through 100. So a
+    // position whose coin was not in the batch of the run that noticed it had closed arrived at
+    // the classifier with no price at all, and fell through every test to "somebody closed this
+    // by hand". DOT and APT were opened at 15:38 while they WERE in the batch, and written off at
+    // 16:05 when the cursor had moved on. Nothing was wrong with the trades. We just looked away.
+    //
+    // The fix costs nothing: we are already fetching 15m candles for exactly these coins to build
+    // the range. The last close of those candles IS a price for the coin, current to the minute.
+    // Take it, and every resolution gets graded on what price actually did.
+    const ranges = {}, exitPx = {};
     for (const k of Object.keys(prevOpen || {})) {
       if (nowOpen[k]) continue;
       const coin = prevOpen[k].coin;
-      if (ranges[coin]) continue;
+      if (ranges[coin] || exitPx[coin]) continue;
       try {
         const c = await fetchCandles(coin, "15m", 96);        // ~24h, far more than any run gap
+        const last = c && c.length ? Number(c[c.length - 1].c) : NaN;
+        if (Number.isFinite(last) && last > 0) exitPx[coin] = last;
         const since = Number(prevOpen[k].lastSeen) || (Date.now() - 6 * 36e5);
         const win = (c || []).filter(b => b.t >= since - 36e5);
         if (win.length) ranges[coin] = { hi: Math.max(...win.map(b => b.h)), lo: Math.min(...win.map(b => b.l)) };
-      } catch { /* no range — classifyResolution falls back to the snapshot and says so */ }
+      } catch { /* no range and no price — classifyResolution says exactly that, and blames nobody */ }
     }
-    const resolved = resolvedSince(prevOpen, nowOpen, priceOf, c => ranges[c] || null);
+    // Prefer the scan's price when the coin happened to be in this batch; otherwise the one we
+    // just fetched. Either way the classifier is no longer at the mercy of the rotation cursor.
+    const priceForResolution = c => {
+      const scanned = priceOf(c);
+      return Number.isFinite(Number(scanned)) && Number(scanned) > 0 ? Number(scanned) : exitPx[c];
+    };
+    const blind = Object.keys(prevOpen || {}).filter(k => !nowOpen[k])
+      .map(k => prevOpen[k].coin).filter(c => !Number.isFinite(priceForResolution(c)));
+    if (blind.length) console.warn(`resolution: no price for ${[...new Set(blind)].join(", ")} — those cannot be graded and will say so`);
+    const resolved = resolvedSince(prevOpen, nowOpen, priceForResolution, c => ranges[c] || null);
     const queue = [];
     for (const r of resolved) {
       const line = `${r.coin} ${r.dir} ${r.how}${Number.isFinite(r.exit) ? " at " + formatPrice(r.exit) : ""}`;

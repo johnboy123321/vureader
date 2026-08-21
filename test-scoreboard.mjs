@@ -190,5 +190,24 @@ console.log('\n10. A day P&L you can zero');
   ok('a stale marker from yesterday rolls forward to midnight', pnlSince() === midnightMs());
 }
 
+console.log('\n11. "UNSEEN" is our fault, and reads as ours');
+{
+  const st = { cipher_ledger: [
+    { at: at('2026-08-21T05:00:00Z'), kind:'resolved', coin:'BTC', how:'target', klass:'strategy', R:2, countsForStats:true },
+    { at: at('2026-08-21T04:00:00Z'), kind:'resolved', coin:'DOT', how:'unseen', klass:'execution_artifact', countsForStats:false },
+    { at: at('2026-08-21T03:00:00Z'), kind:'resolved', coin:'APT', how:'unseen', klass:'execution_artifact', countsForStats:false },
+    { at: at('2026-08-21T02:00:00Z'), kind:'resolved', coin:'FIL', how:'closed_by_hand', klass:'execution_artifact', countsForStats:false },
+  ]};
+  const t = tallyLog(st.cipher_ledger);
+  ok('unseen ones are counted separately from other artifacts', t.unseen === 2, t.unseen);
+  ok('but still sit inside the not-counted total', t.artifacts === 3, t.artifacts);
+  ok('and never touch the graded record', t.graded === 1 && t.wins === 1 && t.losses === 0);
+  const h = botScoreboard(st, []);
+  ok('the tile breaks them out', /2 unseen/.test(h), h.match(/artifacts[^<]*/));
+  ok('and the note says it is the bot\'s gap, not the trade\'s', /gap in the bot's own data/.test(h));
+  ok('with no "unseen" line at all when there are none',
+     !/unseen/.test(botScoreboard({ cipher_ledger: [{ at: at('2026-08-21T05:00:00Z'), kind:'resolved', coin:'BTC', how:'target', klass:'strategy', R:1, countsForStats:true }] }, [])));
+}
+
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);

@@ -6,7 +6,7 @@ import { pathToFileURL } from 'node:url';
 const src = fs.readFileSync('cipher-agent-valtown.js','utf8');
 const out = path.join(process.cwd(), '.fixes-under-test.mjs');
 fs.writeFileSync(out, src.replace(/\n\/\/ ── Node \/ GitHub Actions entry point[\s\S]*$/, '\n') +
-  '\nexport { buildOrder, buildTradePlan, planValid, staleIds, CFG, roundPx };\nexport function __setRelayCap(v){ RELAY_CAP = v; }\n');
+  '\nexport { buildOrder, buildTradePlan, planValid, staleIds, CFG, roundPx, classifyResolution };\nexport function __setRelayCap(v){ RELAY_CAP = v; }\n');
 const M = await import(pathToFileURL(out).href);
 
 let pass=0, fail=0;
@@ -99,5 +99,44 @@ console.log('\n6. The expiry pass can only ever cancel');
 }
 
 fs.unlinkSync(out);
+console.log('\nZ. WHY ONLY TWO GRADED TRADES (2026-08-21)');
+{
+  const pos = { coin: 'DOT', dir: 'short', plan: { entry: 0.9015, stop: 0.9224, target: 0.8546 } };
+
+  // The 2026-08-21 shape: no price, no range. The old code called this a hand-close.
+  const blindV = M.classifyResolution(pos, undefined, null);
+  ok('with no price and no range it does NOT claim somebody closed it', blindV.how !== 'closed_by_hand', blindV.how);
+  ok('it says it could not see', blindV.how === 'unseen', blindV.how);
+  ok('and names the gap as ours, not the trade\'s', /gap in OUR data/.test(blindV.why));
+  ok('it still counts toward nothing', blindV.countsForStats === false && blindV.countsForStreak === false);
+  ok('and is still an execution artifact', blindV.klass === 'execution_artifact');
+  ok('with a distinguishable execution label', blindV.execution === 'no_price_no_range');
+
+  // A REAL off-plan close — price known, nowhere near either level — must still read as one.
+  const offPlan = M.classifyResolution(pos, 0.8900, null);
+  ok('a known price away from both levels is still a hand-close', offPlan.how === 'closed_by_hand', offPlan.how);
+  ok('and says which way it was going', /in profit when we looked/.test(offPlan.why));
+
+  // With a price, the snapshot path grades it — this is what was silently unreachable.
+  ok('a short at or below its target grades as a target',
+     M.classifyResolution(pos, 0.8500, null).how === 'target');
+  ok('a short at or above its stop grades as a stop',
+     M.classifyResolution(pos, 0.9300, null).how === 'stop');
+
+  // A range still wins over a snapshot, as before.
+  const ranged = M.classifyResolution(pos, 0.9000, { hi: 0.9100, lo: 0.8400 });
+  ok('a range that contains the target beats a mid-range snapshot', ranged.how === 'target', ranged.how);
+  ok('and a win carries its planned R', ranged.R > 0, ranged.R);
+
+  // The wiring: the price must come from the SAME fetch that builds the range, so it can never
+  // depend on whether the coin was in this run's 20-coin batch.
+  ok('the exit price is taken from the range fetch', /exitPx\[coin\] = last;/.test(src));
+  ok('the scan price is preferred when it exists', /const scanned = priceOf\(c\);/.test(src));
+  ok('and the fetched one is the fallback', /: exitPx\[c\];/.test(src));
+  ok('coins it still cannot price are named in the log', /no price for \$\{\[\.\.\.new Set\(blind\)\]/.test(src));
+  ok('the resolver is handed the combined price, not the scan-only one',
+     /resolvedSince\(prevOpen, nowOpen, priceForResolution/.test(src));
+}
+
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail?1:0);
