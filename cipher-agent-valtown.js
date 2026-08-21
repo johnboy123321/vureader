@@ -1327,14 +1327,26 @@ function classifyResolution(was, px, range) {
              why: "price traded through both the stop and the target between two runs — the order cannot be recovered",
              countsForStreak: false, countsForStats: false };
   }
+  // ── R, SO A RECORD CAN BE ADDED UP (2026-08-21) ─────────────────────────────────────────
+  // John asked the panel for "total trades, wins, total balance". It could not answer: a
+  // resolution was logged as a sentence of English and nothing else, so counting wins meant
+  // parsing prose, and there was no size to any win — three targets at 1.5R, 2R and 3R all
+  // read the same. R is the honest unit here: it is what the plan was worth when it was made,
+  // measured in the risk that was actually taken, so it adds up across coins and price levels.
+  //
+  // Deliberately the PLANNED R, not the exit price: the exit the bot can see is a snapshot from
+  // whenever it next woke, which is not the price the position left at. A number that pretends
+  // to a precision it does not have is the thing this whole codebase keeps having to undo.
+  const rr = (Number.isFinite(target) && Number.isFinite(entry) && Number.isFinite(stop) && Math.abs(entry - stop) > 0)
+    ? +Math.abs((target - entry) / (entry - stop)).toFixed(3) : null;
   if (hitTarget) {
-    return { how: "target", outcome: "win", klass: "strategy",
+    return { how: "target", outcome: "win", klass: "strategy", R: rr,
              execution: haveRange ? "filled" : "filled_snapshot_only",
              why: haveRange ? "price traded through the target" : "price was at or beyond the target when we looked",
              countsForStreak: true, countsForStats: true };
   }
   if (hitStop) {
-    return { how: "stop", outcome: "loss", klass: "strategy",
+    return { how: "stop", outcome: "loss", klass: "strategy", R: -1,
              execution: haveRange ? "filled" : "filled_snapshot_only",
              why: haveRange ? "price traded through the stop" : "price was at or beyond the stop when we looked",
              countsForStreak: true, countsForStats: true };
@@ -3942,7 +3954,14 @@ export default async function cipherAgent() {
     const queue = [];
     for (const r of resolved) {
       const line = `${r.coin} ${r.dir} ${r.how}${Number.isFinite(r.exit) ? " at " + formatPrice(r.exit) : ""}`;
+      // The four labels go ON the record, not just into the sentence. A panel that has to read
+      // English to know whether something was a win will eventually read it wrong.
       await pushLog({ coin: r.coin, dir: r.dir, book: r.book || undefined,
+        how: r.how, outcome: r.outcome, klass: r.klass, execution: r.execution,
+        R: Number.isFinite(r.R) ? r.R : undefined,
+        entry: r.plan && Number.isFinite(r.plan.entry) ? r.plan.entry : undefined,
+        exit: Number.isFinite(r.exit) ? r.exit : undefined,
+        countsForStats: !!r.countsForStats, countsForStreak: !!r.countsForStreak,
         result: r.klass === "execution_artifact" ? "RESOLVED (not counted)" : "RESOLVED",
         skipped: `${line} — ${r.why}` +
           (r.klass === "execution_artifact"

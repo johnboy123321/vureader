@@ -10311,6 +10311,100 @@ document.addEventListener('click', function(e){
     el.innerHTML = h;
   }
 
+  // ── THE SCOREBOARD (2026-08-21) ─────────────────────────────────────────────────────────────
+  // John: "can you make this panel easier to read, total trades wins with total balance etc."
+  // Fair. The panel listed twenty-five decisions in reverse order and never once said how the
+  // bot was actually DOING. You had to read it like a diary and keep score in your head.
+  //
+  // Two rules this obeys, because getting them wrong is how a scoreboard starts lying:
+  //
+  //   1. Only graded strategy outcomes count. A hand-closed position, an ambiguous one, or an
+  //      order the venue rejected is an EXECUTION ARTIFACT — it is shown, on its own line, and
+  //      it never touches the win rate. Half of the order attempts in this bot's first live
+  //      window were rejections; folding those into a record would have made the strategy look
+  //      like it was losing when it had not been asked a question yet.
+  //   2. The window is stated. The bot keeps the last 300 decisions and no more, so "12 wins"
+  //      without "since Wednesday" is a number with no denominator.
+  function tallyLog(log){
+    const t = { wins:0, losses:0, R:0, rUnknown:0, artifacts:0, rejected:0, placed:0, graded:0, risk:null };
+    for(const e of (log||[])){
+      const res = String(e.result||'');
+      if(/^PLACED/.test(res)) t.placed++;
+      if(/^(REJECTED|ERR)/.test(res)) t.rejected++;
+      if(t.risk === null && Number.isFinite(Number(e.risk))) t.risk = Number(e.risk);
+      if(!/^RESOLVED/.test(res)) continue;
+      // Records written before the labels existed carry only a sentence: "COIN dir how at px — why".
+      // Read the label when it is there and fall back to the sentence when it is not, but never
+      // let a fallback invent an R it cannot know.
+      let how = e.how, counts = e.countsForStats;
+      if(how === undefined){
+        const m = /^\S+\s+\S+\s+(\S+)/.exec(String(e.skipped||''));
+        how = m ? m[1] : '';
+        counts = (how === 'target' || how === 'stop');
+      }
+      if(!counts){ t.artifacts++; continue; }
+      t.graded++;
+      if(how === 'target') t.wins++; else if(how === 'stop') t.losses++;
+      if(Number.isFinite(Number(e.R))) t.R += Number(e.R); else t.rUnknown++;
+    }
+    return t;
+  }
+
+  function botScoreboard(st, log){
+    const t = tallyLog(log);
+    const open = st && st.cipher_open ? Object.values(st.cipher_open).filter(Boolean) : [];
+    const br = (st && st.cipher_breaker) || {};
+    const risk = t.risk || 10;
+    const rate = t.graded ? (t.wins / t.graded * 100) : null;
+    const gbp = t.R * risk;
+    const rCol = t.R > 0 ? '#9c9' : t.R < 0 ? '#e88' : 'var(--muted)';
+    const first = log && log.length ? log[log.length-1].at : null;
+    const since = first ? new Date(first).toLocaleString(undefined,{month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'}) : '—';
+
+    const tile = (label, value, colour, note) =>
+      '<div style="flex:1 1 90px;min-width:90px;padding:8px 10px;border:1px solid var(--line);border-radius:6px;">'
+      + '<div style="font-size:10px;color:var(--dim);text-transform:uppercase;letter-spacing:.4px;">'+esc(label)+'</div>'
+      + '<div style="font-size:18px;font-weight:700;margin-top:2px;color:'+(colour||'var(--fg,#ddd)')+';">'+value+'</div>'
+      + (note ? '<div style="font-size:10px;color:var(--dim);margin-top:1px;">'+esc(note)+'</div>' : '')
+      + '</div>';
+
+    let h = '<div style="font-size:11px;font-weight:700;color:var(--muted);margin:0 0 6px;">THE RECORD — GRADED TRADES ONLY</div>';
+    h += '<div style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:6px;">';
+    h += tile('trades', t.graded, t.graded ? null : 'var(--dim)', 'reached a stop or target');
+    h += tile('won', t.wins, t.wins ? '#9c9' : 'var(--dim)');
+    h += tile('lost', t.losses, t.losses ? '#e88' : 'var(--dim)');
+    h += tile('win rate', rate === null ? '—' : rate.toFixed(0)+'%', rate === null ? 'var(--dim)' : rate >= 50 ? '#9c9' : '#e88');
+    h += '</div><div style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:6px;">';
+    const noR = t.graded > 0 && t.rUnknown === t.graded;   // nothing graded since the stamp existed
+    h += tile('total R', noR ? '—' : (t.R > 0 ? '+' : '') + t.R.toFixed(2), noR ? 'var(--dim)' : rCol, t.rUnknown ? t.rUnknown + (t.rUnknown === 1 ? ' older trade has' : ' older trades have') + ' no R' : 'risk multiples, added up');
+    h += tile('at £'+risk+'/trade', noR ? '—' : (gbp >= 0 ? '+£' : '−£') + Math.abs(gbp).toFixed(2),
+              noR ? 'var(--dim)' : rCol, noR ? 'no R on record yet' : 'what that R is worth');
+    h += tile('open now', open.length, open.length ? '#8bd' : 'var(--dim)', open.length ? (open.map(o=>o.coin).slice(0,4).join(' ') + (open.length > 4 ? ' +' + (open.length - 4) + ' more' : '')) : 'nothing at risk');
+    h += tile('not counted', t.artifacts + t.rejected, (t.artifacts + t.rejected) ? '#e8c07a' : 'var(--dim)', t.artifacts + ' artifacts · ' + t.rejected + ' rejected');
+    h += '</div>';
+
+    // Every number above has a denominator, and here it is. A record without its window is a
+    // boast, not a measurement.
+    h += '<div class="bot-why" style="color:var(--dim);">Counted from the bot\'s last '
+      + (log ? log.length : 0) + ' decisions, back to <b>' + esc(since) + '</b> — it keeps 300 and then forgets. '
+      + '<b>Only trades that reached their own stop or target are graded.</b> Positions closed by hand, ones where '
+      + 'price went through both levels between two runs, and orders the venue refused are counted separately as '
+      + '"not counted" — they are facts about the plumbing, not about whether the strategy works.'
+      + (t.rUnknown ? ' ' + t.rUnknown + (t.rUnknown === 1 ? ' trade resolved' : ' trades resolved') + ' before 21 Aug '
+        + (t.rUnknown === 1 ? 'carries' : 'carry') + ' no R, so ' + (t.rUnknown === 1 ? 'it is' : 'they are') + ' in the win rate but not in the total.' : '')
+      + '</div>';
+
+    if(Number.isFinite(Number(br.dayEq))){
+      h += '<div class="bot-why" style="color:var(--dim);">Drawdown guard is measuring today from <b>'
+        + Number(br.dayEq).toLocaleString(undefined,{maximumFractionDigits:0}) + ' USDT</b>'
+        + (Number.isFinite(Number(br.weekEq)) ? ' and this week from <b>' + Number(br.weekEq).toLocaleString(undefined,{maximumFractionDigits:0}) + ' USDT</b>' : '')
+        + '. That is the anchor it compares against, not your balance right now — the balance lives at the exchange.'
+        + (br.streak ? ' Current losing streak: <b>' + br.streak + '</b>.' : '')
+        + '</div>';
+    }
+    return h + '<div style="height:10px;"></div>';
+  }
+
   async function loadServerLog(){
     const el = document.getElementById('srv-log'); if(!el) return;
     try{
@@ -10341,6 +10435,7 @@ document.addEventListener('click', function(e){
              ' · scanned ' + esc(hb.scanned) + ' · ' + esc(hb.candidates) + ' candidates · ' + esc(hb.placed) + ' placed · ' + esc(hb.mode||'') +
              (hb.via ? ' · via ' + esc(hb.via) : '') + '</div>';
       }
+      h += botScoreboard(st, log);
       if(!log.length){ el.innerHTML = h + '<div style="font-size:11px;color:var(--dim);">no decisions logged yet</div>'; return; }
       h += log.slice(0,25).map(e => {
         const when = new Date(e.at).toLocaleString(undefined,{month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'});
