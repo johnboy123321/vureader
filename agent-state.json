@@ -1,6 +1,216 @@
 {
-  "cipher_cursor": 3,
+  "cipher_cursor": 23,
   "cipher_log": [
+    {
+      "at": "2026-08-22T17:01:57.521Z",
+      "coin": "BTC",
+      "result": "FLIP OUT OF SYNC",
+      "skipped": "the strategy's book holds 0.00706395 BTC but the SPOT wallet has 0.00011450 — about 8.97 USDT, under the 10 minimum. Nothing can be traded until the two agree — check whether the balance was moved off the spot wallet, then re-arm to reseed from what is actually there."
+    },
+    {
+      "at": "2026-08-22T17:01:54.535Z",
+      "coin": "DOT",
+      "dir": "short",
+      "book": "fast",
+      "how": "closed_by_hand",
+      "outcome": "unattributed",
+      "klass": "execution_artifact",
+      "execution": "closed_off_plan",
+      "entry": 0.9237,
+      "exit": 0.936,
+      "countsForStats": false,
+      "countsForStreak": false,
+      "result": "RESOLVED (not counted)",
+      "skipped": "DOT short closed_by_hand at 0.936000 — closed at neither the stop nor the target — was in loss when we looked. Not the bot's exit, so it grades nothing. This is an EXECUTION ARTIFACT: it does not count toward the loss streak or the strategy's record."
+    },
+    {
+      "at": "2026-08-22T17:01:54.526Z",
+      "coin": "AVAX",
+      "dir": "short",
+      "book": "fast",
+      "how": "closed_by_hand",
+      "outcome": "unattributed",
+      "klass": "execution_artifact",
+      "execution": "closed_off_plan",
+      "entry": 7.45,
+      "exit": 7.6,
+      "countsForStats": false,
+      "countsForStreak": false,
+      "result": "RESOLVED (not counted)",
+      "skipped": "AVAX short closed_by_hand at 7.6000 — closed at neither the stop nor the target — was in loss when we looked. Not the bot's exit, so it grades nothing. This is an EXECUTION ARTIFACT: it does not count toward the loss streak or the strategy's record."
+    },
+    {
+      "at": "2026-08-22T17:01:34.989Z",
+      "coin": "ARB",
+      "dir": "long",
+      "entry": 0.09934,
+      "sl": 0.09495356266536205,
+      "tp1": 0.10372643733463795,
+      "tp2": 0.10920948400293538,
+      "score": 6,
+      "stopKind": "swing10",
+      "trend": "none",
+      "zone": {
+        "src": "OB",
+        "top": 0.09203,
+        "bottom": 0.09153,
+        "awayPct": 7.36
+      },
+      "result": "SKIPPED (venue)",
+      "skipped": "ARBUSDT is benched — the venue has this symbol switched off (TE_SEQ_TURN_OFF). Refused 2×; trying again in 2h.",
+      "rejection": {
+        "label": "the venue has this symbol switched off (TE_SEQ_TURN_OFF)",
+        "klass": "execution_artifact",
+        "cause": "venue",
+        "code": "20005"
+      },
+      "countsForStats": false
+    },
+    {
+      "at": "2026-08-22T17:01:33.992Z",
+      "coin": "DOT",
+      "dir": "long",
+      "entry": 0.936,
+      "sl": 0.8946879665954639,
+      "tp1": 0.9773120334045362,
+      "tp2": 1.0289520751602064,
+      "score": 6,
+      "stopKind": "swing10",
+      "trend": "none",
+      "zone": {
+        "src": "OB",
+        "top": 0.9085,
+        "bottom": 0.8902,
+        "awayPct": 2.94
+      },
+      "result": "SKIPPED (aged out)",
+      "skipped": "LONG stop 0.8946879665954639 vs mark 0.868 (3.07% away, wrong side). Phemex validates the stop against the MARK price, not our planned entry, and would refuse this. Declined here instead so the coin is not burned on an order that was never going to be accepted.",
+      "rejection": {
+        "label": "aged out — the stop is on the wrong side of the live mark",
+        "detail": "LONG stop 0.8946879665954639 vs mark 0.868 (3.07% away, wrong side). Phemex validates the stop against the MARK price, not our planned entry, and would refuse this. Declined here instead so the coin is not burned on an order that was never going to be accepted.",
+        "klass": "execution_artifact",
+        "cause": "cadence",
+        "mark": 0.868,
+        "stop": 0.8946879665954639
+      },
+      "countsForStats": false
+    },
+    {
+      "at": "2026-08-22T17:01:32.537Z",
+      "coin": "POL",
+      "dir": "long",
+      "entry": 0.11096,
+      "sl": 0.1084532408256816,
+      "tp1": 0.11346675917431841,
+      "tp2": 0.11660020814221642,
+      "score": 6,
+      "stopKind": "FVG",
+      "trend": "up",
+      "zone": {
+        "src": "FVG",
+        "top": 0.10958,
+        "bottom": 0.10913,
+        "awayPct": 1.24
+      },
+      "result": "SKIPPED (venue)",
+      "skipped": "POLUSDT is benched — the venue does not list this symbol at all. Refused 1×; trying again in 139h.",
+      "rejection": {
+        "label": "the venue does not list this symbol at all",
+        "klass": "execution_artifact",
+        "cause": "venue",
+        "code": "39999"
+      },
+      "countsForStats": false
+    },
+    {
+      "at": "2026-08-22T17:01:28.584Z",
+      "coin": "FIL",
+      "dir": "long",
+      "entry": 0.7783,
+      "sl": 0.7458359660649729,
+      "tp1": 0.810764033935027,
+      "tp2": 0.8513440763538109,
+      "score": 6,
+      "stopKind": "swing10",
+      "trend": "none",
+      "zone": null,
+      "qty": 308,
+      "risk": 10,
+      "mode": "armed",
+      "orderID": "4f9d224d-58cf-4e8e-b916-c5334bee3b39",
+      "entryKind": "immediate",
+      "book": "fast",
+      "via": "direct",
+      "attempt": 1,
+      "result": "PLACED",
+      "countsForStats": true,
+      "thesis": "Daily & 4H agree (up); 1H bullish WT cross; Money flow positive; RSI healthy (48) · plan from 1H · confluence"
+    },
+    {
+      "at": "2026-08-22T17:01:24.104Z",
+      "coin": "LTC",
+      "dir": "long",
+      "score": 6,
+      "skipped": "could not build a trade plan"
+    },
+    {
+      "at": "2026-08-22T17:01:22.157Z",
+      "coin": "ADA",
+      "dir": "long",
+      "score": 6,
+      "skipped": "could not build a trade plan"
+    },
+    {
+      "at": "2026-08-22T17:01:20.177Z",
+      "coin": "UNI",
+      "dir": "long",
+      "entry": 4.274,
+      "sl": 4.1307737515696745,
+      "tp1": 4.4172262484303255,
+      "tp2": 4.596259058968233,
+      "score": 6,
+      "stopKind": "FVG",
+      "trend": "none",
+      "zone": {
+        "src": "FVG",
+        "top": 4.189,
+        "bottom": 4.15,
+        "awayPct": 1.99
+      },
+      "result": "SKIPPED (aged out)",
+      "skipped": "LONG stop 4.1307737515696745 vs mark 4.077 (1.32% away, wrong side). Phemex validates the stop against the MARK price, not our planned entry, and would refuse this. Declined here instead so the coin is not burned on an order that was never going to be accepted.",
+      "rejection": {
+        "label": "aged out — the stop is on the wrong side of the live mark",
+        "detail": "LONG stop 4.1307737515696745 vs mark 4.077 (1.32% away, wrong side). Phemex validates the stop against the MARK price, not our planned entry, and would refuse this. Declined here instead so the coin is not burned on an order that was never going to be accepted.",
+        "klass": "execution_artifact",
+        "cause": "cadence",
+        "mark": 4.077,
+        "stop": 4.1307737515696745
+      },
+      "countsForStats": false
+    },
+    {
+      "at": "2026-08-22T17:01:17.896Z",
+      "coin": "DOGE",
+      "dir": "long",
+      "entry": 0.09169,
+      "sl": 0.08700814791305098,
+      "tp1": 0.09637185208694901,
+      "tp2": 0.10222416719563529,
+      "score": 6,
+      "stopKind": "swing10",
+      "trend": "none",
+      "zone": null,
+      "result": "SKIPPED (venue)",
+      "skipped": "DOGEUSDT is benched — the venue does not list this symbol at all. Refused 1×; trying again in 139h.",
+      "rejection": {
+        "label": "the venue does not list this symbol at all",
+        "klass": "execution_artifact",
+        "cause": "venue",
+        "code": "39999"
+      },
+      "countsForStats": false
+    },
     {
       "at": "2026-08-22T16:36:26.684Z",
       "coin": "BTC",
@@ -3260,126 +3470,6 @@
       "dir": "long",
       "score": 6,
       "skipped": "could not build a trade plan"
-    },
-    {
-      "at": "2026-08-22T01:52:07.314Z",
-      "coin": "POL",
-      "dir": "short",
-      "skipped": "signal too weak — rollover on 15m (quality 3.5 < 5)"
-    },
-    {
-      "at": "2026-08-22T01:52:06.570Z",
-      "coin": "APT",
-      "dir": "long",
-      "score": 6,
-      "skipped": "could not build a trade plan"
-    },
-    {
-      "at": "2026-08-22T01:52:05.806Z",
-      "coin": "ARB",
-      "dir": "short",
-      "entry": 0.09865,
-      "sl": 0.10080798245393377,
-      "tp1": 0.09649201754606623,
-      "tp2": 0.09379453947864902,
-      "score": 6,
-      "stopKind": "swing10",
-      "trend": "up",
-      "zone": null,
-      "skipped": "REFUSED — stop only 2.19% from entry — below the 2.2% floor, costs would eat 10% of the risk"
-    },
-    {
-      "at": "2026-08-22T01:52:05.143Z",
-      "coin": "DOT",
-      "dir": "long",
-      "book": "swing",
-      "score": 6,
-      "skipped": "already holding DOT in the swing book"
-    },
-    {
-      "at": "2026-08-22T01:52:03.912Z",
-      "coin": "FIL",
-      "dir": "long",
-      "score": 6,
-      "skipped": "could not build a trade plan"
-    },
-    {
-      "at": "2026-08-22T01:52:03.298Z",
-      "coin": "AVAX",
-      "dir": "long",
-      "entry": 7.841,
-      "sl": 6.830582541597265,
-      "tp1": 8.851417458402736,
-      "tp2": 10.114439281406153,
-      "score": 6,
-      "stopKind": "FVG",
-      "trend": "none",
-      "zone": {
-        "src": "FVG",
-        "top": 7.218,
-        "bottom": 6.883,
-        "awayPct": 7.95
-      },
-      "result": "SKIPPED (aged out)",
-      "skipped": "LONG stop 6.830582541597265 vs mark 6.83 (0.01% away, wrong side). Phemex validates the stop against the MARK price, not our planned entry, and would refuse this. Declined here instead so the coin is not burned on an order that was never going to be accepted.",
-      "rejection": {
-        "label": "aged out — the stop is on the wrong side of the live mark",
-        "detail": "LONG stop 6.830582541597265 vs mark 6.83 (0.01% away, wrong side). Phemex validates the stop against the MARK price, not our planned entry, and would refuse this. Declined here instead so the coin is not burned on an order that was never going to be accepted.",
-        "klass": "execution_artifact",
-        "cause": "cadence",
-        "mark": 6.83,
-        "stop": 6.830582541597265
-      },
-      "countsForStats": false
-    },
-    {
-      "at": "2026-08-22T01:52:02.312Z",
-      "coin": "NEAR",
-      "dir": "short",
-      "entry": 1.967,
-      "sl": 2.0022131989954555,
-      "tp1": 1.9317868010045447,
-      "tp2": 1.8877703022602255,
-      "score": 6,
-      "stopKind": "swing10",
-      "trend": "up",
-      "zone": null,
-      "skipped": "REFUSED — stop only 1.79% from entry — below the 2.2% floor, costs would eat 12% of the risk"
-    },
-    {
-      "at": "2026-08-22T01:52:01.688Z",
-      "coin": "AAVE",
-      "dir": "long",
-      "score": 6,
-      "skipped": "could not build a trade plan"
-    },
-    {
-      "at": "2026-08-22T01:52:01.057Z",
-      "coin": "LTC",
-      "dir": "long",
-      "score": 6,
-      "skipped": "could not build a trade plan"
-    },
-    {
-      "at": "2026-08-22T01:52:00.350Z",
-      "coin": "BNB",
-      "dir": "short",
-      "entry": 686.9,
-      "sl": 694.6701069366984,
-      "tp1": 679.1298930633016,
-      "tp2": 669.4172593924285,
-      "score": 6,
-      "stopKind": "swing10",
-      "trend": "up",
-      "zone": null,
-      "skipped": "REFUSED — stop only 1.13% from entry — below the 2.2% floor, costs would eat 19% of the risk"
-    },
-    {
-      "at": "2026-08-22T01:51:59.676Z",
-      "coin": "UNI",
-      "dir": "long",
-      "score": 6,
-      "skipped": "could not build a trade plan"
     }
   ],
   "cipher_fired": {
@@ -3401,16 +3491,17 @@
     "BCH|long|2026-08-22": 1787407212657,
     "ETH|long|2026-08-22": 1787409157775,
     "AVAX|short|2026-08-22": 1787416555109,
-    "DOT|short|2026-08-22": 1787416560010
+    "DOT|short|2026-08-22": 1787416560010,
+    "FIL|long|2026-08-22": 1787418088094
   },
   "cipher_heartbeat": {
-    "at": "2026-08-22T16:36:26.708Z",
-    "scanned": 16,
-    "candidates": 13,
-    "placed": 2,
+    "at": "2026-08-22T17:01:57.550Z",
+    "scanned": 17,
+    "candidates": 17,
+    "placed": 1,
     "mode": "armed",
     "via": "direct",
-    "ms": 67901
+    "ms": 68400
   },
   "cipher_attempts": {
     "LINK|short|2026-08-22": 1,
@@ -3431,82 +3522,12 @@
     "BCH|long|2026-08-22": 1,
     "ETH|long|2026-08-22": 1,
     "AVAX|short|2026-08-22": 1,
-    "DOT|short|2026-08-22": 1
+    "DOT|short|2026-08-22": 1,
+    "FIL|long|2026-08-22": 1
   },
   "cipher_shadow": {
     "rank_vs_threshold": {
       "records": [
-        {
-          "at": 1787258073970,
-          "arm": "baseline",
-          "coin": "AAVE",
-          "dir": "long",
-          "tf": "1D",
-          "entry": 95.34,
-          "stop": 84.06595843837746,
-          "target": 120.70659351365072,
-          "quality": 6,
-          "note": "rollover",
-          "reg": "bull",
-          "rs": 0.682,
-          "regDist": 0.4,
-          "breadth": 0.4,
-          "R": 2.25,
-          "gtf": "4H"
-        },
-        {
-          "at": 1787258074361,
-          "arm": "baseline",
-          "coin": "OP",
-          "dir": "short",
-          "tf": "1H",
-          "entry": 0.0933,
-          "stop": 0.095788006359392,
-          "target": 0.08770198569136799,
-          "quality": 5,
-          "note": "divergence",
-          "reg": "bull",
-          "rs": 0.5,
-          "regDist": 0.4,
-          "breadth": 0.4,
-          "R": -1,
-          "gtf": "30m"
-        },
-        {
-          "at": 1787258074540,
-          "arm": "baseline",
-          "coin": "INJ",
-          "dir": "long",
-          "tf": "1D",
-          "entry": 4.585,
-          "stop": 3.8929965810383327,
-          "target": 6.142007692663752,
-          "quality": 6,
-          "note": "rollover",
-          "reg": "bull",
-          "rs": 0,
-          "regDist": 0.4,
-          "breadth": 0.4,
-          "R": null
-        },
-        {
-          "at": 1787258074740,
-          "arm": "baseline",
-          "coin": "APT",
-          "dir": "long",
-          "tf": "1D",
-          "entry": 0.5623,
-          "stop": 0.5096785980446992,
-          "target": 0.6806981543994269,
-          "quality": 6,
-          "note": "rollover",
-          "reg": "bull",
-          "rs": 0.136,
-          "regDist": 0.4,
-          "breadth": 0.4,
-          "R": 2.25,
-          "gtf": "4H"
-        },
         {
           "at": 1787258075277,
           "arm": "baseline",
@@ -13966,6 +13987,74 @@
           "regDist": 13.5,
           "breadth": 0.5,
           "R": null
+        },
+        {
+          "at": 1787418095399,
+          "arm": "baseline",
+          "coin": "BNB",
+          "dir": "short",
+          "tf": "4H",
+          "entry": 688.4,
+          "stop": 730.0875142956143,
+          "target": 594.6030928348679,
+          "quality": 5.5,
+          "note": "rollover",
+          "reg": "bull",
+          "rs": 0.913,
+          "regDist": 13.5,
+          "breadth": 0.65,
+          "R": null
+        },
+        {
+          "at": 1787418095779,
+          "arm": "baseline",
+          "coin": "NEAR",
+          "dir": "short",
+          "tf": "4H",
+          "entry": 1.868,
+          "stop": 2.0022928872286214,
+          "target": 1.565841003735602,
+          "quality": 5.5,
+          "note": "rollover",
+          "reg": "bull",
+          "rs": 0.739,
+          "regDist": 13.5,
+          "breadth": 0.65,
+          "R": null
+        },
+        {
+          "at": 1787418096352,
+          "arm": "baseline",
+          "coin": "LINK",
+          "dir": "short",
+          "tf": "4H",
+          "entry": 11.607,
+          "stop": 12.523314586947983,
+          "target": 9.545292179367037,
+          "quality": 5.5,
+          "note": "divergence",
+          "reg": "bull",
+          "rs": 0.174,
+          "regDist": 13.5,
+          "breadth": 0.65,
+          "R": null
+        },
+        {
+          "at": 1787418096747,
+          "arm": "baseline",
+          "coin": "TRX",
+          "dir": "short",
+          "tf": "4H",
+          "entry": 0.34387,
+          "stop": 0.3515468001448698,
+          "target": 0.32659719967404305,
+          "quality": 5.5,
+          "note": "rollover",
+          "reg": "bull",
+          "rs": 1,
+          "regDist": 13.5,
+          "breadth": 0.65,
+          "R": null
         }
       ],
       "promoted": false,
@@ -17679,7 +17768,7 @@
       },
       "since": 1787349769745,
       "avgEntry": 78240.2,
-      "lastSeen": 1787416583490
+      "lastSeen": 1787418114543
     },
     "DOT|long": {
       "coin": "DOT",
@@ -17693,40 +17782,26 @@
       },
       "since": 1787280627798,
       "avgEntry": 0.855,
-      "lastSeen": 1787416583490
+      "lastSeen": 1787418114543
     },
-    "AVAX|short": {
-      "coin": "AVAX",
-      "dir": "short",
+    "FIL|long": {
+      "coin": "FIL",
+      "dir": "long",
       "size": 0,
       "book": "fast",
-      "since": 1787416583486,
+      "since": 1787418114154,
       "plan": {
-        "entry": 7.45,
-        "stop": 7.93705409776384,
-        "target": 6.354128280031359
+        "entry": 0.7783,
+        "stop": 0.7458359660649729,
+        "target": 0.8513440763538109
       },
-      "lastSeen": 1787416583490
-    },
-    "DOT|short": {
-      "coin": "DOT",
-      "dir": "short",
-      "size": 0,
-      "book": "fast",
-      "since": 1787416583486,
-      "plan": {
-        "entry": 0.9237,
-        "stop": 1.0175599891020057,
-        "target": 0.712515024520487
-      },
-      "lastSeen": 1787416583490
+      "lastSeen": 1787418114543
     }
   },
   "cipher_books": {
     "DOT|long": "swing",
     "BTC|long": "fast",
-    "AVAX|short": "fast",
-    "DOT|short": "fast"
+    "FIL|long": "fast"
   },
   "cipher_resting": {
     "agentATOM1787058783139": {
@@ -17960,6 +18035,14 @@
       "coin": "DOT",
       "dir": "short",
       "at": 1787416560527
+    },
+    "agentFIL1787418086985": {
+      "symbol": "FILUSDT",
+      "clOrdID": "agentFIL1787418086985",
+      "orderID": "4f9d224d-58cf-4e8e-b916-c5334bee3b39",
+      "coin": "FIL",
+      "dir": "long",
+      "at": 1787418088592
     }
   },
   "cipher_breaker": {
@@ -17982,7 +18065,7 @@
     "coreUnits": 0,
     "highWater": 0.00767931,
     "startPx": 64730.8,
-    "unitsNow": 0.006969,
+    "unitsNow": 0.007064,
     "pxNow": 78339.3,
     "trigger": "pump1",
     "spot": {
@@ -18001,29 +18084,29 @@
       "baseBalance": 0.0001145,
       "quoteBalance": 550.33136946,
       "exec": "armed",
-      "checkedAt": 1787416584494
+      "checkedAt": 1787418115708
     },
     "seededReal": true,
     "seededAt": "2026-08-19T13:59:51.035Z",
     "exec": "armed",
     "flips": {
       "5m": {
-        "units": 0.9041913258137537,
-        "cash": 0,
+        "units": 0,
+        "cash": 69917.10664664711,
         "trips": 113,
-        "sells": 113,
-        "lastT": 1787416500000,
+        "sells": 114,
+        "lastT": 1787418000000,
         "startUnits": 1,
-        "unitsNow": 0.90419133,
-        "gainPct": -9.58,
-        "holding": true
+        "unitsNow": 0.90411611,
+        "gainPct": -9.59,
+        "holding": false
       },
       "15m": {
         "units": 0.8889881408968909,
         "cash": 0,
         "trips": 59,
         "sells": 59,
-        "lastT": 1787415300000,
+        "lastT": 1787417100000,
         "startUnits": 1,
         "unitsNow": 0.88898814,
         "gainPct": -11.1,
@@ -18034,22 +18117,22 @@
         "cash": 0,
         "trips": 40,
         "sells": 40,
-        "lastT": 1787414400000,
+        "lastT": 1787416200000,
         "startUnits": 1,
         "unitsNow": 0.93288527,
         "gainPct": -6.71,
         "holding": true
       },
       "1H": {
-        "units": 0,
-        "cash": 72298.57155585439,
-        "trips": 35,
+        "units": 0.935269063709398,
+        "cash": 0,
+        "trips": 36,
         "sells": 36,
-        "lastT": 1787410800000,
+        "lastT": 1787414400000,
         "startUnits": 1,
-        "unitsNow": 0.93905225,
-        "gainPct": -6.09,
-        "holding": false
+        "unitsNow": 0.93526906,
+        "gainPct": -6.47,
+        "holding": true
       },
       "2H": {
         "units": 0,
@@ -18058,8 +18141,8 @@
         "sells": 35,
         "lastT": 1787414400000,
         "startUnits": 1,
-        "unitsNow": 0.89160726,
-        "gainPct": -10.84,
+        "unitsNow": 0.89119104,
+        "gainPct": -10.88,
         "holding": false
       },
       "3H": {
@@ -18067,10 +18150,10 @@
         "cash": 68214.66771669434,
         "trips": 13,
         "sells": 14,
-        "lastT": 1787396400000,
+        "lastT": 1787400000000,
         "startUnits": 1,
-        "unitsNow": 0.882663,
-        "gainPct": -11.73,
+        "unitsNow": 0.88580124,
+        "gainPct": -11.42,
         "holding": false
       },
       "4H": {
@@ -18097,17 +18180,10 @@
       }
     },
     "liveFlip": {
-      "tf": "30m",
-      "blocked": false,
-      "armedAt": "2026-08-22T08:36:28.887Z",
-      "units": 0.00706395096926829,
-      "cash": 0,
-      "unitsNow": 0.00706395,
-      "startUnits": 0.007082341252424127,
-      "gainPct": -0.26,
-      "holding": true,
-      "trips": 2,
-      "sells": 2
+      "tf": null,
+      "want": "30m",
+      "blocked": true,
+      "why": "the strategy's book holds 0.00706395 BTC but the SPOT wallet has 0.00011450 — about 8.97 USDT, under the 10 minimum. Nothing can be traded until the two agree — check whether the balance was moved off the spot wallet, then re-arm to reseed from what is actually there."
     }
   },
   "cipher_accum_liveflip": {
@@ -18127,6 +18203,59 @@
   },
   "cipher_unprotected": [],
   "cipher_ledger": [
+    {
+      "at": "2026-08-22T17:01:54.539Z",
+      "kind": "resolved",
+      "coin": "DOT",
+      "dir": "short",
+      "book": "fast",
+      "how": "closed_by_hand",
+      "outcome": "unattributed",
+      "klass": "execution_artifact",
+      "execution": "closed_off_plan",
+      "entry": 0.9237,
+      "stop": 1.0175599891020057,
+      "target": 0.712515024520487,
+      "exit": 0.936,
+      "opened": 1787416583486,
+      "countsForStats": false,
+      "countsForStreak": false
+    },
+    {
+      "at": "2026-08-22T17:01:54.531Z",
+      "kind": "resolved",
+      "coin": "AVAX",
+      "dir": "short",
+      "book": "fast",
+      "how": "closed_by_hand",
+      "outcome": "unattributed",
+      "klass": "execution_artifact",
+      "execution": "closed_off_plan",
+      "entry": 7.45,
+      "stop": 7.93705409776384,
+      "target": 6.354128280031359,
+      "exit": 7.6,
+      "opened": 1787416583486,
+      "countsForStats": false,
+      "countsForStreak": false
+    },
+    {
+      "at": "2026-08-22T17:01:28.588Z",
+      "kind": "placed",
+      "coin": "FIL",
+      "dir": "long",
+      "book": "fast",
+      "entry": 0.7783,
+      "stop": 0.7458359660649729,
+      "target": 0.810764033935027,
+      "qty": 308,
+      "risk": 10,
+      "mode": "armed",
+      "via": "direct",
+      "orderID": "4f9d224d-58cf-4e8e-b916-c5334bee3b39",
+      "dryRun": false,
+      "countsForStats": true
+    },
     {
       "at": "2026-08-22T16:36:00.523Z",
       "kind": "placed",
