@@ -1,3 +1,5 @@
+
+
 // ═══════════════════════════════════════════════════════════════════════════════
 //  CIPHER AGENT — the 24/7 half of MarketCipherAI
 //
@@ -70,6 +72,8 @@ const CFG = {
   // balance instead, and the ladder stands down. Set from the app panel via the relay; the env
   // var is the fallback for when the relay cannot be reached.
   accumFlipTf: () => String(env("ACCUM_FLIP_TF", "off")),
+  // The extra accumulator books, as "XRP:ladder,SOL:30m". Empty means BTC only, exactly as before.
+  accumBooks: () => String(env("ACCUM_BOOKS", "")),
 };
 // The relay's own default list, duplicated here so direct mode enforces the SAME gate. If these
 // two ever need to differ, that must be a deliberate decision, not drift.
@@ -192,6 +196,97 @@ async function fetchCandles(sym, tf, bars = 260) {
   } catch { /* no data */ }
   return null;
 }
+// ── THE VENUE'S OWN CANDLES (2026-08-22) ──────────────────────────────────────────────────────
+// Used ONLY for grading, never for signals. Signals stay on Binance/OKX deliberately: those are
+// the deep books where the structure this bot reads actually means something, and a signal taken
+// from a thin testnet book would be noise. But a POSITION lives and dies on the venue, so the
+// question "did price trade through the stop" has to be asked of the venue.
+//
+// ── PROBED AGAINST THE REAL API, 2026-08-23 ──────────────────────────────────────────────────
+// The shape is confirmed, not assumed. GET /exchange/public/md/v2/kline/last returns
+//   { code, msg, data: { total, rows: [ [ t(sec), interval, lastClose, open, high, low, close,
+//                                         volume, turnover, symbol ], ... ] } }
+// with prices as STRINGS in real units — no scaling on USDT-M contracts — and rows NEWEST FIRST.
+// The scale check is kept anyway, because "no scaling today" is not a promise, and it costs one
+// division to be sure. Nothing here can throw into the caller.
+//
+// ── AND THE REASON THIS WILL REFUSE ON TESTNET ───────────────────────────────────────────────
+// Measured the same minute, same call:
+//     mainnet newest BTC 15m bar : 2026-08-23 18:45   (0.5h old)   close 77317.6
+//     TESTNET newest BTC 15m bar : 2026-07-16 06:45   (38.5d old)  close 64748.6   −16.3%
+// Testnet SOL was worse: o=h=l=c=81.14 at zero volume, after a jump from 208.13. Grading a trade
+// from today against a candle from last month is a far larger error than the mainnet-vs-venue
+// basis this whole change exists to remove — and the scale check does NOT catch it, because
+// 64748/78511 is 0.82 and sails through a factor-of-three window. Hence the freshness gate.
+// On testnet this reader will therefore return null every time and the pass will fall back,
+// labelled "reference". That is the correct answer: this venue publishes no usable history, so
+// the grading question cannot be settled here. It becomes real on a venue whose feed is alive.
+const PHEMEX_RES = { "1m": 60, "5m": 300, "15m": 900, "30m": 1800, "1H": 3600, "4H": 14400, "1D": 86400 };
+const PX_SCALES = [1, 1e2, 1e4, 1e8];
+// Phemex rejects anything else with a 400. Snap UP so we never ask for fewer bars than we need.
+const PHEMEX_LIMITS = [5, 10, 50, 100, 500, 1000];
+// How old the newest bar may be before the feed counts as dead. The agent wakes every 15–40
+// minutes, so three hours is generous for a live venue and instant for a frozen one.
+const VENUE_MAX_AGE_MS = 3 * 36e5;
+
+// PURE, so the scale logic can be tested without a venue. Returns bars or null — never partial.
+function parsePhemexKlines(body, tf, refPx, nowMs = Date.now()) {
+  const rows = (body && body.data && (body.data.rows || body.data.klines || body.data)) || null;
+  if (!Array.isArray(rows) || !rows.length) return null;
+  const num = v => { const n = Number(v); return Number.isFinite(n) ? n : NaN; };
+  // Locate the OHLC block. The documented layout puts open/high/low/close at 3..6; accept a row
+  // that is at least that long and whose four candidates are finite and ordered like a candle.
+  const cand = rows.filter(r => Array.isArray(r) && r.length >= 7);
+  if (!cand.length) return null;
+  const raw = cand.map(r => ({ t: num(r[0]), o: num(r[3]), h: num(r[4]), l: num(r[5]), c: num(r[6]) }))
+                  .filter(b => Number.isFinite(b.o) && Number.isFinite(b.h) && Number.isFinite(b.l) && Number.isFinite(b.c)
+                            && b.h >= b.l && b.h >= b.c && b.l <= b.c);
+  if (!raw.length) return null;
+  // Timestamps: seconds or milliseconds. Anything before 2001 in ms is really seconds.
+  const toMs = t => (t > 0 && t < 1e12) ? t * 1000 : t;
+  // ── THE SCALE CHECK ─────────────────────────────────────────────────────────────────────────
+  // Without a reference we cannot tell 78240 from 7824000000 with any confidence, and guessing
+  // wrong grades every open position as a stop-out. With one, only one scale can be right.
+  if (!(Number.isFinite(refPx) && refPx > 0)) return null;
+  const mid = raw[raw.length - 1].c;
+  let scale = null;
+  for (const s of PX_SCALES) {
+    const r = (mid / s) / refPx;
+    if (r > 0.33 && r < 3) { scale = s; break; }
+  }
+  if (scale === null) return null;                    // refuse rather than invent a range
+  // Oldest first, to match every other candle source in this file. Phemex returns newest first,
+  // and the resolution pass reads the LAST element as "the price now".
+  const out = raw.map(b => ({ t: toMs(b.t), o: b.o / scale, h: b.h / scale, l: b.l / scale, c: b.c / scale }))
+                 .sort((x, y) => x.t - y.t);
+
+  // ── IS THIS FEED ALIVE? ─────────────────────────────────────────────────────────────────────
+  // Phemex testnet's klines were 38.5 days behind mainnet when this was written, and its SOL
+  // series was a flat line at zero volume. Grading a trade from today against a candle from last
+  // month is far worse than the mainnet-vs-venue basis this whole change exists to remove, and
+  // nothing above would have caught it — a 16% price difference sails through the scale check.
+  const newest = out[out.length - 1];
+  if (!newest || !(Number.isFinite(newest.t))) return null;
+  if (nowMs - newest.t > VENUE_MAX_AGE_MS) return null;          // frozen feed
+  if (out.every(b => b.h === b.l)) return null;                  // dead market, not a quiet one
+  return out;
+}
+
+async function phemexCandles(coin, tf, bars, refPx) {
+  const res = PHEMEX_RES[tf];
+  if (!res) return null;
+  try {
+    const sym = String(coin).toUpperCase().replace(/USDT$/, "") + "USDT";
+    const want = Number(bars) || 100;
+    const limit = PHEMEX_LIMITS.find(x => x >= want) || 1000;
+    // /kline (without /last) takes from+to and 400s on a limit. This is the one that takes a limit.
+    const r = await phemexPublic("/exchange/public/md/v2/kline/last",
+      `symbol=${encodeURIComponent(sym)}&resolution=${res}&limit=${limit}`);
+    if (!r || r.status !== 200) return null;
+    return parsePhemexKlines(r.data, tf, refPx);
+  } catch { return null; }
+}
+
 async function topUniverse(n) {
   const EXCL = /(UP|DOWN|BULL|BEAR)$/;
   const STABLE = new Set(["USDC", "BUSD", "FDUSD", "TUSD", "DAI", "USDP", "USTC", "EUR", "GBP", "AEUR", "PAXG", "USDT", "EURI"]);
@@ -1145,6 +1240,16 @@ function applyLiveConfig(c) {
     const hit = want === "off" ? "off" : FLIP_TFS.find(t => t.toLowerCase() === want);
     if (hit) { CFG.accumFlipTf = () => hit; applied.push("accumFlipTf=" + hit); }
     else console.log(`live config: ignoring accumFlipTf=${c.accumFlipTf}`);
+  }
+  // The extra accumulator books. Re-parsed and re-validated on this side as well as in the
+  // relay, for the same reason accumFlipTf is: this string decides which coins a strategy is
+  // allowed to touch, and "the other end checked it" is not worth betting a wallet on. An
+  // unparseable entry is dropped by parseAccumBooks with a log line; an empty string leaves the
+  // env value alone, which means BTC only — the conservative direction to fail in.
+  if (c.accumBooks !== undefined && c.accumBooks !== null) {
+    const want = String(c.accumBooks).slice(0, 200);
+    if (/^[A-Za-z0-9:,\s]*$/.test(want)) { CFG.accumBooks = () => want; applied.push("accumBooks=" + (want || "(none)")); }
+    else console.log(`live config: ignoring accumBooks=${c.accumBooks}`);
   }
   // KILL from the panel stops the agent placing at all. The relay enforces it independently on
   // the order path, so this is the polite half of the switch, not the whole of it.
@@ -2817,7 +2922,14 @@ async function sendSpotOrder(order, notionalUsdt, opts = {}) {
   // DEFAULT IS DRY (2026-08-20). It was "armed", which meant any deploy of this file anywhere
   // started able to place real spot orders with nothing stating that intent. Arming is now an
   // explicit ACCUM_EXEC=armed in the workflow — one place, auditable, greppable.
-  const armed = String(env("ACCUM_EXEC", "dry")) === "armed";
+  // ── ARMING IS PER BOOK (2026-08-22) ────────────────────────────────────────────────────────
+  // This used to read the global ACCUM_EXEC and nothing else. That was correct while there was
+  // exactly one accumulator. The moment a second book exists on a second coin it is actively
+  // dangerous: the BTC book is armed, so a newly added XRP book would inherit permission to place
+  // real orders without anyone arming it. opts.exec lets each book carry its own answer, and a
+  // book that does not supply one still falls back to the global, so every existing caller is
+  // unchanged. Absent opts.exec the behaviour is identical to before this line was touched.
+  const armed = String(opts.exec != null ? opts.exec : env("ACCUM_EXEC", "dry")) === "armed";
   const cap = opts.cap != null ? opts.cap : num("ACCUM_MAX_USDT", 200);
   if (CFG.kill()) return { dry: true, why: "KILL switch is on", order };
   if (!(notionalUsdt <= cap)) return { dry: true, why: `notional ${notionalUsdt.toFixed(2)} over the ACCUM_MAX_USDT cap ${cap}`, order };
@@ -3376,7 +3488,127 @@ function shadowJudge(sh, id) {
 // These are two different strategies on two different products. The futures scanner is governed
 // by MODE; the accumulator is governed by ACCUM and ACCUM_EXEC. KILL still stops both, because
 // sendSpotOrder checks it on the order path where it cannot be missed.
-async function runAccumulator() {
+
+// ═══════════════ ACCUMULATOR BOOKS (2026-08-22) ═══════════════
+// John: "the rails work really well with the spot so we just make a button for it and test it."
+//
+// The rails are the good part — buildSpotOrder's scale handling, sendSpotOrder's three brakes,
+// the book-follows-the-wallet rollback. None of that is coin-specific. What WAS coin-specific was
+// everything around it: one storage key, one coin from env, one arming flag. So the accumulator
+// could only ever be one thing on one coin.
+//
+// A "book" is that missing noun. Each one is a completely separate strategy instance with its own
+// coin, its own storage, its own arming and its own scoreboard. They cannot see each other and
+// cannot spend each other's balance.
+//
+// ── WHY THIS IS WORTH DOING AT ALL ────────────────────────────────────────────────────────────
+// Measured 2026-08-22 across 12 symbols, 3 years, unit-denominated against buy-and-hold:
+//   BTC −2.0%  ETH −7.1%  DOGE −7.5%   ← the losers, and BTC is the only coin deployed
+//   XRP +67.9%  BNB +11.8%  ADA +51.8%  LINK +38.0%  AVAX +55.1%  DOT +60.7%  ATOM +68.4%
+// Correlation of unit gain with realised volatility: +0.44. BTC has the LOWEST vol in the set
+// (47% against 76–91% for the alts) and is close to the worst performer. Sell-the-pump-buy-the-dip
+// needs pumps to sell and dips to buy back; it has been deployed on the trendiest, quietest coin
+// available.
+//
+// The honest caveat, carried here so it cannot get lost: correlation with PRICE change is −0.48,
+// and all six coins whose price FELL accumulated units. Ending with 68% more ATOM while ATOM fell
+// 83% is not a win. Only XRP (+106% price, +67.9% units) and BNB (+174% price, +11.8% units) both
+// rose AND accumulated. Those two are the honest candidates; the rest of that column is a
+// downtrend harvester.
+//
+// ── EVERY NEW BOOK IS MEASURE-ONLY UNTIL EXPLICITLY ARMED ─────────────────────────────────────
+// Not a default that can be flipped by accident. A book arms only when its own spec says "armed"
+// AND the global ACCUM_EXEC is armed — two independent switches, because the failure that costs
+// real money here is a book quietly inheriting permission it was never given. It also cannot do
+// anything useful armed without that coin funded in the SPOT wallet, which is a third, physical
+// brake.
+const ACCUM_BOOK_COINS = ["BTC","ETH","SOL","XRP","BNB","DOGE","ADA","LINK","AVAX","LTC","DOT","ATOM"];
+
+// Storage keys. BTC keeps the original unsuffixed keys on purpose: the live book has real history
+// in them, and renaming it would orphan that and reseed from the wallet as if it were new.
+const accumKeyFor = coin => coin === "BTC" ? ACCUM_KEY : `${ACCUM_KEY}_${coin}`;
+const flipKeyFor = coin => coin === "BTC" ? LIVE_FLIP_KEY : `${LIVE_FLIP_KEY}_${coin}`;
+
+// The BTC book, defined exactly by the env vars that define it today, so nothing changes for it.
+function primaryAccumBook() {
+  return {
+    coin: ACCUM_COIN(),
+    key: accumKeyFor(ACCUM_COIN()),
+    flipKey: flipKeyFor(ACCUM_COIN()),
+    enabled: String(env("ACCUM", "1")) === "1",
+    exec: String(env("ACCUM_EXEC", "dry")),
+    flipTf: String((CFG.accumFlipTf && CFG.accumFlipTf()) || "off"),
+    trigger: env("ACCUM_TRIGGER", "pump1"),
+    primary: true,
+    virtualUsdt: 0,          // never virtual — this book tracks the real wallet
+    cfg: {},
+  };
+}
+
+// Extra books, parsed from "XRP:ladder,SOL:30m" — coin, then either "ladder" or a flip timeframe.
+// An optional third field arms it: "XRP:ladder:armed". Anything unrecognised is dropped with a
+// line in the log rather than guessed at, and the parse never throws.
+function parseAccumBooks(spec) {
+  const out = [];
+  if (!spec) return out;
+  for (const raw of String(spec).split(",")) {
+    const part = raw.trim();
+    if (!part) continue;
+    const [coinRaw, stratRaw, armRaw] = part.split(":").map(s => (s || "").trim());
+    const coin = String(coinRaw || "").toUpperCase();
+    if (!ACCUM_BOOK_COINS.includes(coin)) { console.log(`accum books: ignoring unknown coin "${coinRaw}"`); continue; }
+    if (coin === ACCUM_COIN()) { console.log(`accum books: ignoring ${coin} — that is the primary book`); continue; }
+    if (out.some(b => b.coin === coin)) { console.log(`accum books: ignoring duplicate ${coin}`); continue; }
+    const strat = String(stratRaw || "ladder").toLowerCase();
+    let flipTf = "off";
+    if (strat !== "ladder") {
+      const hit = FLIP_TFS.find(t => t.toLowerCase() === strat);
+      if (!hit) { console.log(`accum books: ignoring ${coin} — "${stratRaw}" is not "ladder" or a flip timeframe`); continue; }
+      flipTf = hit;
+    }
+    // Two switches, both required. A book asking to be armed while the global is dry stays dry.
+    const wantsArm = String(armRaw || "").toLowerCase() === "armed";
+    const globalArmed = String(env("ACCUM_EXEC", "dry")) === "armed";
+    const exec = wantsArm && globalArmed ? "armed" : "dry";
+    if (wantsArm && !globalArmed) console.log(`accum books: ${coin} asked to be armed but ACCUM_EXEC is dry — staying measure-only`);
+    out.push({
+      coin, key: accumKeyFor(coin), flipKey: flipKeyFor(coin),
+      enabled: true, exec, flipTf,
+      trigger: env("ACCUM_TRIGGER", "pump1"),
+      primary: false,
+      // A measure-only book has no wallet to seed from, and the accumStep default of 1 unit is
+      // worthless on a sub-dollar coin — a 20% slice lands under the venue minimum and every sell
+      // is refused, so the book reports healthy while doing nothing at all. Seed a NOTIONAL.
+      virtualUsdt: num("ACCUM_BOOK_USDT", 1000),
+      cfg: {},
+    });
+  }
+  return out;
+}
+
+function accumBooks() {
+  const books = [];
+  const p = primaryAccumBook();
+  if (p.enabled) books.push(p);
+  const spec = (CFG.accumBooks && CFG.accumBooks()) || env("ACCUM_BOOKS", "");
+  for (const b of parseAccumBooks(spec)) books.push(b);
+  return books;
+}
+
+// Run every book in turn. One book throwing must never stop the others — they are independent
+// strategies that happen to share a process, and a bad symbol on one should not silence the rest.
+async function runAccumulators() {
+  const books = accumBooks();
+  if (books.length > 1) {
+    console.log(`accumulator books: ${books.map(b => `${b.coin}/${b.flipTf === "off" ? "ladder" : b.flipTf}${b.exec === "armed" ? " ARMED" : ""}`).join(" · ")}`);
+  }
+  for (const b of books) {
+    try { await runAccumulator(b); }
+    catch (e) { console.error(`accumulator book ${b.coin} failed (isolated, the others still ran):`, e && e.message); }
+  }
+}
+
+async function runAccumulator(book = primaryAccumBook()) {
   // ── A SECOND OBJECTIVE: UNITS, NOT MONEY ────────────────────────────────────────────────────
   // Everything else in this file is trying to make pounds. This is trying to end the year with
   // more BTC than it started with, which is a different question with a different scoreboard —
@@ -3386,9 +3618,9 @@ async function runAccumulator() {
   // thing that can happen. Its decision core (accumStep, accumFlipStep, liveFlipStep) is pure —
   // bars in, state and events out, no venue and no clock. Only the spot rails below it can put
   // an order on the wire, and every one of those goes through sendSpotOrder's three brakes.
-  if (String(env("ACCUM", "1")) === "1") {
+  if (book.enabled) {
     try {
-      const coin = ACCUM_COIN();
+      const coin = book.coin;
       // Read-only preflight: report whether spot is actually usable here. No orders.
       let PF = null;
       if (String(env("ACCUM_PREFLIGHT", "1")) === "1") {
@@ -3413,14 +3645,14 @@ async function runAccumulator() {
       }
       const bars = await fetchCandles(coin, "1D", 260);
       if (bars && bars.length >= 60) {
-        let state = await getJSON(ACCUM_KEY, null);
+        let state = await getJSON(book.key, null);
         // ── SEED FROM THE REAL WALLET (2026-08-19) ─────────────────────────────────────────────
         // Until the spot wallet was funded this held a virtual 1.0 unit so the maths could be
         // watched. Now there is a real balance, so the strategy tracks THAT — otherwise the
         // panel reports a fiction and the order sizes bear no relation to what is actually there.
         // Seeded once; after that the strategy's own bookkeeping owns the number, because a
         // mid-cycle wallet read would double-count a slice that is currently sitting in cash.
-        if (PF && Number.isFinite(PF.baseBalance) && PF.baseBalance > 0 && (!state || !state.seededReal)) {
+        if (book.primary && PF && Number.isFinite(PF.baseBalance) && PF.baseBalance > 0 && (!state || !state.seededReal)) {
           const carried = state || {};
           state = { ...carried, units: PF.baseBalance, cash: Number.isFinite(PF.quoteBalance) ? PF.quoteBalance : 0,
                     startUnits: PF.baseBalance, coreUnits: null, highWater: PF.baseBalance,
@@ -3431,10 +3663,25 @@ async function runAccumulator() {
           await pushLog({ coin, result: "ACCUM SEEDED",
             skipped: `spot wallet funded — tracking the real balance of ${PF.baseBalance} ${coin} from here. Benchmark is that same number held and never traded.` });
         }
+        // ── A VIRTUAL BOOK NEEDS A REALISTIC STACK, NOT ONE UNIT ──────────────────────────────
+        // accumStep defaults to units:1. On BTC that is a $65k stack and everything works. On XRP
+        // it is fifty cents, a 20% slice is a ten-cent order, and buildSpotOrder/the venue minimum
+        // refuse every one — the book then reports itself healthy while never trading. That exact
+        // bug invalidated seven of twelve symbols in the backtest before it was caught, so the
+        // measure-only books are seeded to a dollar notional instead.
+        if (!book.primary && book.virtualUsdt > 0 && (!state || !state.seededVirtual)) {
+          const px0 = bars[bars.length - 1].c;
+          const carried = state || {};
+          const u0 = book.virtualUsdt / px0;
+          state = { ...carried, units: u0, cash: 0, startUnits: u0, coreUnits: null, highWater: u0,
+                    open: [], sells: 0, fills: 0, seededVirtual: true, virtualUsdt: book.virtualUsdt,
+                    seededAt: new Date().toISOString(), startedAt: carried.startedAt || null };
+          console.log(`accumulator book ${coin}: seeded a VIRTUAL ${book.virtualUsdt} USDT stack = ${u0.toFixed(8)} ${coin} at ${formatPrice(px0)} (measure only)`);
+        }
         const all = [];
         // The book must follow the wallet. Snapshot before anything is applied, so an armed buy
         // that never reached the venue can be unwound rather than absorbed.
-        const ladderArmed = String(env("ACCUM_EXEC", "dry")) === "armed";
+        const ladderArmed = book.exec === "armed";
         const stateBefore = JSON.parse(JSON.stringify(state));
         let ladderUnplaced = null;
 
@@ -3443,7 +3690,7 @@ async function runAccumulator() {
         try {
           const fine = await fetchCandles(coin, "15m", 200);
           if (fine && fine.length) {
-            const f = accumFillPass(state, fine);
+            const f = accumFillPass(state, fine, book.cfg);
             state = f.st; all.push(...f.events);
           }
         } catch (e) { console.error("accumulator intraday fills skipped:", e && e.message); }
@@ -3453,7 +3700,7 @@ async function runAccumulator() {
         // before. A timeframe means the dot flip — but only once the ladder's resting rungs have
         // all filled, because until then the ladder still has cash out against those coins and
         // handing the same balance to a second strategy would sell it twice.
-        const flipWant = String((CFG.accumFlipTf && CFG.accumFlipTf()) || "off");
+        const flipWant = String(book.flipTf || "off");
         const flipTf = flipWant.toLowerCase() === "off" ? null
                      : (FLIP_TFS.find(t => t.toLowerCase() === flipWant.toLowerCase()) || null);
         if (flipWant.toLowerCase() !== "off" && !flipTf) console.log(`accumulator: unknown flip timeframe "${flipWant}" — ladder keeps the coins`);
@@ -3461,14 +3708,14 @@ async function runAccumulator() {
         const flipOwns = !!flipTf && !flipBlocked;
 
         const d = accumStep(state, bars, flipOwns
-          ? { paused: true, pausedWhy: `the ${flipTf} dot flip holds the coins — ladder stood down` }
-          : {});
+          ? { ...book.cfg, paused: true, pausedWhy: `the ${flipTf} dot flip holds the coins — ladder stood down` }
+          : { ...book.cfg });
         state = d.st; all.push(...d.events);
 
         const px = bars[bars.length - 1].c;
         const units = accumUnits(state, px);
         if (all.length) {
-          await setJSON(ACCUM_KEY, state);
+          await setJSON(book.key, state);
           for (const e of all) {
             if (e.kind === "sell") {
               // SPOT, never futures: you cannot accumulate coins on a perpetual. Dry unless armed.
@@ -3478,7 +3725,7 @@ async function runAccumulator() {
                 const built = buildSpotOrder(coin, "Sell", { price: e.px, baseQty: e.units }, prods);
                 if (built.err) execNote = `Spot order NOT built: ${built.err}`;
                 else {
-                  const r = await sendSpotOrder(built.order, e.units * e.px);
+                  const r = await sendSpotOrder(built.order, e.units * e.px, { exec: book.exec });
                   execNote = r.ok ? `SPOT SELL PLACED (${built.order.clOrdID})`
                           : r.dry ? `dry run — would have sent a SPOT sell (${r.why})`
                                   : `spot sell refused: ${r.error}`;
@@ -3511,7 +3758,7 @@ async function runAccumulator() {
                   const built = buildSpotOrder(coin, "Buy", { price: e.px, quoteQty: spend }, prods);
                   if (built.err) { execNote = `Spot order NOT built: ${built.err}`; if (ladderArmed) ladderUnplaced = built.err; }
                   else {
-                    const r2 = await sendSpotOrder(built.order, spend);
+                    const r2 = await sendSpotOrder(built.order, spend, { exec: book.exec });
                     execNote = r2.ok ? `SPOT BUY PLACED (${built.order.clOrdID})`
                              : r2.dry ? `dry run — would have sent a SPOT buy (${r2.why})`
                                       : `spot buy refused: ${r2.error}`;
@@ -3534,7 +3781,7 @@ async function runAccumulator() {
           }
           if (ladderUnplaced) {
             state = stateBefore;
-            await setJSON(ACCUM_KEY, state);
+            await setJSON(book.key, state);
             console.error(`accumulator: a BUY did not reach the venue (${ladderUnplaced}) — book rolled back, the rung will be retried next run`);
             await pushLog({ coin, result: "ACCUM UNPLACED", countsForStats: false,
               skipped: `a ladder buy-back did not reach the venue (${ladderUnplaced}). The strategy's book has been rolled back to match the wallet — nothing was bought. The rung is still resting and will be retried next run.` });
@@ -3568,7 +3815,7 @@ async function runAccumulator() {
           console.log(`dot flip @${num("FLIP_FEE_BPS", 1)}bps maker, paper: ${line}`);
 
           // ── AND THE ONE THAT IS REAL ───────────────────────────────────────────────────────
-          let lf = await getJSON(LIVE_FLIP_KEY, null);
+          let lf = await getJSON(book.flipKey, null);
           if (flipBlocked) {
             state.liveFlip = { tf: null, want: flipTf, blocked: true,
               why: `waiting for ${state.open.length} resting ladder rung${state.open.length === 1 ? "" : "s"} to fill before the flip can take the coins` };
@@ -3582,7 +3829,7 @@ async function runAccumulator() {
             // with the wallet still holding coins the strategy thinks it converted to cash.
             // So an arm that cannot possibly execute is refused up front and said out loud.
             const capUsdt = num("ACCUM_FLIP_MAX_USDT", 1500);
-            const armedExec = String(env("ACCUM_EXEC", "dry")) === "armed";
+            const armedExec = book.exec === "armed";
             let outOfSync = false;
             // ── THE WALLET IS THE ARBITER (2026-08-19) ──────────────────────────────────────
             // Found live: the book said 0.00767931 BTC while the spot wallet held 0.00000031.
@@ -3667,7 +3914,7 @@ async function runAccumulator() {
                   if (armedExec) placeFailed = built.err;
                 } else {
                   const notional = isSell ? sellQty * e.px : buyQty;
-                  const sr = await sendSpotOrder(built.order, notional, { cap: capUsdt });
+                  const sr = await sendSpotOrder(built.order, notional, { cap: capUsdt, exec: book.exec });
                   execNote = sr.ok ? `SPOT ${isSell ? "SELL" : "BUY"} PLACED (${built.order.clOrdID})`
                            : sr.dry ? `dry run — would have sent a SPOT ${isSell ? "sell" : "buy"} (${sr.why})`
                                     : `spot ${isSell ? "sell" : "buy"} refused: ${sr.error}`;
@@ -3703,7 +3950,7 @@ async function runAccumulator() {
             // "Holding" means the coins are what it owns, not that its cash is exactly zero —
             // a cent of leftover USDT does not make a stack of BTC into a cash position.
             lf.holding = (lf.units || 0) * lpx > (lf.cash || 0);
-            await setJSON(LIVE_FLIP_KEY, lf);
+            await setJSON(book.flipKey, lf);
             // ONE TRUTH about what is actually held. While the flip owns the coins the ladder's
             // own book would otherwise sit frozen at the handover figures, and every downstream
             // reader — the panel, the console line, the benchmark — would quietly report a
@@ -3729,7 +3976,7 @@ async function runAccumulator() {
                           (state.cash > 0 ? ` + ${state.cash.toFixed(2)} USDT still to be bought back` : ""));
               await pushLog({ coin, result: "FLIP OFF",
                 skipped: `${lf.tf} dot flip switched off after ${lf.trips} round trip${lf.trips === 1 ? "" : "s"} — the pump ladder has the coins again: ${state.units.toFixed(8)} ${coin}${state.cash > 0 ? ` plus ${state.cash.toFixed(2)} USDT still in cash` : ""}.` });
-              lf.tf = null; await setJSON(LIVE_FLIP_KEY, lf);
+              lf.tf = null; await setJSON(book.flipKey, lf);
             }
             state.liveFlip = { tf: null, blocked: false, why: "off — the pump ladder holds the coins" };
           }
@@ -3741,17 +3988,17 @@ async function runAccumulator() {
           // Benchmark is the STARTING balance, not 1.0 — see the same fix in the app panel.
           const startU = Number(state.startUnits) > 0 ? Number(state.startUnits) : 1;
           const gainPct = (units / startU - 1) * 100;
-          console.log(`accumulator (${coin} SPOT, core ${(state.coreUnits || 0).toFixed(8)}, ${String(env("ACCUM_EXEC", "dry")) === "armed" ? "ARMED" : "measure only"}): ${units.toFixed(8)} units vs buy-and-hold ${startU.toFixed(8)} — ${gainPct >= 0 ? "+" : ""}${gainPct.toFixed(2)}% since ${since} · ${state.sells} sells, ${state.fills} fills · resting: ${resting}`);
+          console.log(`accumulator (${coin} SPOT, core ${(state.coreUnits || 0).toFixed(8)}, ${book.exec === "armed" ? "ARMED" : "measure only"}): ${units.toFixed(8)} units vs buy-and-hold ${startU.toFixed(8)} — ${gainPct >= 0 ? "+" : ""}${gainPct.toFixed(2)}% since ${since} · ${state.sells} sells, ${state.fills} fills · resting: ${resting}`);
           state.unitsNow = +units.toFixed(6); state.pxNow = px;
-          state.trigger = env("ACCUM_TRIGGER", "pump1");
-          state.exec = String(env("ACCUM_EXEC", "dry"));
+          state.trigger = book.trigger;
+          state.exec = book.exec;
           if (PF) state.spot = { ready: PF.ready, why: PF.why, symbol: PF.symbol, hasProduct: !!PF.product,
                                  scales: PF.product ? `${PF.product.priceScale}/${PF.product.baseValueScale}/${PF.product.quoteValueScale}` : null,
                                  spotSymbols: PF.spotSymbolCount || 0, walletStatus: PF.walletStatus ?? null,
                                  balances: PF.balances || [], err: PF.walletErr || PF.productsErr || null,
                                  baseBalance: Number.isFinite(PF.baseBalance) ? PF.baseBalance : null,
                                  quoteBalance: Number.isFinite(PF.quoteBalance) ? PF.quoteBalance : null,
-                                 exec: String(env("ACCUM_EXEC", "dry")), checkedAt: PF.checkedAt };
+                                 exec: book.exec, checkedAt: PF.checkedAt };
 
           // ── brain oversight: weekly, cheap, and it cannot change anything ──────────────────
           // Only when something has actually happened (a sell or a fill), at most once every
@@ -3778,7 +4025,7 @@ async function runAccumulator() {
             }
           } catch (e) { console.error("accumulator review skipped (harmless, changes nothing):", e && e.message); }
 
-          await setJSON(ACCUM_KEY, state);
+          await setJSON(book.key, state);
         }
       }
     } catch (e) { console.error("accumulator failed (harmless, measures only):", e && e.message); }
@@ -3798,7 +4045,7 @@ export default async function cipherAgent() {
     // Letting the futures mode silently disable it is what cost 2026-08-19 an afternoon: the
     // relay read timed out, MODE fell back to off, and the spot strategy never ran. KILL still
     // stops it — that check lives on the order path in sendSpotOrder, where it cannot be missed.
-    await runAccumulator();
+    await runAccumulators();
     return;
   }
 
@@ -4442,19 +4689,47 @@ export default async function cipherAgent() {
     // The fix costs nothing: we are already fetching 15m candles for exactly these coins to build
     // the range. The last close of those candles IS a price for the coin, current to the minute.
     // Take it, and every resolution gets graded on what price actually did.
-    const ranges = {}, exitPx = {};
+    // ── GRADE ON THE VENUE THAT HELD THE POSITION (2026-08-22) ────────────────────────────────
+    // This used to build the range from Binance/OKX — mainnet — for a position that lived on
+    // Phemex testnet. Measured basis between the two on 2026-08-22 was 0.35% on BTC and 0.78% on
+    // DOT, against stops placed 2.2–2.5% away. A third of the stop distance, before the basis has
+    // moved. So real stop-outs landed at prices the reference market never printed, the range said
+    // "never touched", and 18 of 24 resolutions were written off as closed-by-hand.
+    //
+    // The venue is asked first. The reference market remains the fallback, because a grade from
+    // the wrong book still beats no grade at all — but which one answered is now RECORDED, so the
+    // two can never again be mistaken for each other.
+    const ranges = {}, exitPx = {}, gradedOn = {};
     for (const k of Object.keys(prevOpen || {})) {
       if (nowOpen[k]) continue;
       const coin = prevOpen[k].coin;
       if (ranges[coin] || exitPx[coin]) continue;
-      try {
-        const c = await fetchCandles(coin, "15m", 96);        // ~24h, far more than any run gap
-        const last = c && c.length ? Number(c[c.length - 1].c) : NaN;
+      const since = Number(prevOpen[k].lastSeen) || (Date.now() - 6 * 36e5);
+      // The reference the scale check is measured against: what we believed the price was when
+      // the position was opened. It is the one number here that is certainly the right order of
+      // magnitude for this coin.
+      const refPx = Number((prevOpen[k].plan && prevOpen[k].plan.entry) || prevOpen[k].avgEntry) || null;
+      const useBars = (c, src) => {
+        if (!c || !c.length) return false;
+        const last = Number(c[c.length - 1].c);
+        const win = c.filter(b => b.t >= since - 36e5);
+        if (!win.length) return false;
         if (Number.isFinite(last) && last > 0) exitPx[coin] = last;
-        const since = Number(prevOpen[k].lastSeen) || (Date.now() - 6 * 36e5);
-        const win = (c || []).filter(b => b.t >= since - 36e5);
-        if (win.length) ranges[coin] = { hi: Math.max(...win.map(b => b.h)), lo: Math.min(...win.map(b => b.l)) };
+        ranges[coin] = { hi: Math.max(...win.map(b => b.h)), lo: Math.min(...win.map(b => b.l)) };
+        gradedOn[coin] = src;
+        return true;
+      };
+      try {
+        if (!useBars(await phemexCandles(coin, "15m", 96, refPx), "venue")) {
+          useBars(await fetchCandles(coin, "15m", 96), "reference");   // ~24h, far more than any run gap
+        }
       } catch { /* no range and no price — classifyResolution says exactly that, and blames nobody */ }
+    }
+    {
+      const v = Object.values(gradedOn).filter(x => x === "venue").length;
+      const r = Object.values(gradedOn).filter(x => x === "reference").length;
+      if (v || r) console.log(`resolution graded on: ${v} from the venue, ${r} from the reference market` +
+        (r ? " — reference grades cannot see a venue-only stop-out and are marked as such" : ""));
     }
     // Prefer the scan's price when the coin happened to be in this batch; otherwise the one we
     // just fetched. Either way the classifier is no longer at the mercy of the rotation cursor.
@@ -4465,13 +4740,17 @@ export default async function cipherAgent() {
     const blind = Object.keys(prevOpen || {}).filter(k => !nowOpen[k])
       .map(k => prevOpen[k].coin).filter(c => !Number.isFinite(priceForResolution(c)));
     if (blind.length) console.warn(`resolution: no price for ${[...new Set(blind)].join(", ")} — those cannot be graded and will say so`);
-    const resolved = resolvedSince(prevOpen, nowOpen, priceForResolution, c => ranges[c] || null);
+    const resolved = resolvedSince(prevOpen, nowOpen, priceForResolution, c => ranges[c] || null)
+      // Which market judged this. A resolution graded on the reference book carries strictly less
+      // authority than one graded on the venue, and the ledger has to be able to say which it was
+      // — otherwise the next person reading the record cannot tell a fact from an approximation.
+      .map(r => ({ ...r, gradedOn: gradedOn[r.coin] || "none" }));
     const queue = [];
     for (const r of resolved) {
       const line = `${r.coin} ${r.dir} ${r.how}${Number.isFinite(r.exit) ? " at " + formatPrice(r.exit) : ""}`;
       // The four labels go ON the record, not just into the sentence. A panel that has to read
       // English to know whether something was a win will eventually read it wrong.
-      await pushLog({ coin: r.coin, dir: r.dir, book: r.book || undefined,
+      await pushLog({ coin: r.coin, dir: r.dir, book: r.book || undefined, gradedOn: r.gradedOn,
         how: r.how, outcome: r.outcome, klass: r.klass, execution: r.execution,
         R: Number.isFinite(r.R) ? r.R : undefined,
         entry: r.plan && Number.isFinite(r.plan.entry) ? r.plan.entry : undefined,
@@ -4524,7 +4803,7 @@ export default async function cipherAgent() {
   // ── THE ACCUMULATOR ─────────────────────────────────────────────────────────────────────────
   // The second objective: units, not money. It also runs on the MODE=off path above, so this
   // call is for the normal scan path only. See runAccumulator for why the two are separate.
-  await runAccumulator();
+  await runAccumulators();
 
   await setJSON(BOOKMAP_KEY, bookMap);
   await setJSON(KEY.fired, fired);

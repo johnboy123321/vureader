@@ -837,7 +837,7 @@ header { position:relative; }
 
 @media (min-width:1150px) {
   .menu-toggle { display:none; }
-  #app.on { display:grid; grid-template-columns:218px minmax(0,1fr) 274px; grid-template-rows:auto minmax(0,1fr); }
+  #app.on { display:grid; grid-template-columns:218px minmax(0,1fr) 274px; grid-template-rows:auto minmax(0,1fr) auto; }
   header { grid-column:1/-1; grid-row:1; }
   #left-rail { grid-column:1; grid-row:2; display:flex; flex-direction:column; gap:2px; padding:16px 10px;
     border-right:1px solid rgba(255,255,255,0.06); overflow-y:auto; }
@@ -845,9 +845,35 @@ header { position:relative; }
   #right-rail { grid-column:3; grid-row:2; display:flex; flex-direction:column; padding:16px 14px;
     border-left:1px solid rgba(255,255,255,0.06); overflow-y:auto; }
   .h-actions { display:none; } /* tools live in the left rail on desktop */
+  /* The dock takes its OWN row rather than floating over the chat — the composer is the one
+     control that must never be covered, and a fixed bar would sit right on it. */
+  #desk-dock { grid-column:1/-1; grid-row:3; display:flex; gap:8px; padding:8px 12px 10px;
+    border-top:1px solid rgba(255,255,255,0.07); }
   .kb-box { width:min(660px, calc(100% - 28px)); max-height:calc(100vh - var(--hdrh,58px) - 64px); }
   .scan-box { width:min(820px, calc(100% - 28px)) !important; max-height:calc(100vh - var(--hdrh,58px) - 64px) !important; }
 }
+
+/* ═══ The permanent dock (desktop ≥1150px) — accumulator + bot trades, always visible ═══ */
+/* Hidden by default so narrow screens never pay for it, and so a browser that never matches the
+   media query below simply behaves exactly as it did before this existed. */
+#desk-dock { display:none; }
+#desk-dock .dock-card {
+  flex:1 1 0; min-width:0; display:flex; flex-direction:column; gap:5px; cursor:pointer;
+  background:rgba(20,19,17,0.55); border:1px solid rgba(255,255,255,0.07); border-radius:9px;
+  padding:8px 11px; text-align:left; font-family:inherit; transition:border-color .15s, background .15s;
+}
+#desk-dock .dock-card:hover { border-color:rgba(255,255,255,0.18); background:rgba(20,19,17,0.75); }
+#desk-dock .dock-head {
+  display:flex; align-items:baseline; justify-content:space-between; gap:8px;
+  font-size:10px; font-weight:700; letter-spacing:.5px; text-transform:uppercase; color:var(--muted);
+}
+#desk-dock .dock-open { font-size:9px; font-weight:500; letter-spacing:.3px; color:var(--dim); text-transform:none; }
+#desk-dock .dock-row { display:flex; gap:14px; flex-wrap:nowrap; overflow:hidden; }
+#desk-dock .dk { min-width:0; }
+#desk-dock .dk-l { font-size:9px; color:var(--dim); text-transform:uppercase; letter-spacing:.3px; white-space:nowrap; }
+#desk-dock .dk-v { font-size:15px; font-weight:700; line-height:1.25; white-space:nowrap;
+  font-variant-numeric:tabular-nums; }
+#desk-dock .dock-note { font-size:10px; color:var(--dim); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
 
 /* ── Mobile / narrow screens ── */
 @media (max-width: 640px) {
@@ -1405,6 +1431,18 @@ body.layout-edit #layout-bar { display:flex; flex-wrap:wrap; justify-content:cen
     </div>
     <div id="spend-body"></div>
   </div>
+</div>
+
+<!-- ══ PERMANENT DOCK — the two scoreboards John checks most, no click required ══ -->
+<div id="desk-dock">
+  <button class="dock-card" id="dock-accum" onclick="toggleAccum()" title="Open the full accumulator panel">
+    <div class="dock-head"><span>Accumulator</span><span class="dock-open">open ›</span></div>
+    <div class="dock-row"><span class="dk"><span class="dk-l">reading…</span></span></div>
+  </button>
+  <button class="dock-card" id="dock-bot" onclick="toggleBot()" title="Open the full Bot Trades panel">
+    <div class="dock-head"><span>Bot trades</span><span class="dock-open">open ›</span></div>
+    <div class="dock-row"><span class="dk"><span class="dk-l">reading…</span></span></div>
+  </button>
 </div>
 
 <div id="accum-panel-shell" onclick="if(event.target===this) toggleAccum()">
@@ -3013,7 +3051,7 @@ function closeQROutside(e) {
 // ═══════════════════════════ SETTINGS ═══════════════════════════
 // Model routing: 'smart' = deep-analysis model (chart reads/verdicts); 'light' = cheap model for mechanical jobs.
 // Build stamp — bump on every deploy so "which version am I running?" has a true answer.
-const APP_BUILD = 'v4.3 · 21 Aug 2026 · the resolver now has a price for every coin it resolves — five of seven trades were being written off as hand-closed simply because their coin was not in that run\'s 20-coin batch; "unseen" is now its own outcome and reads as the bot\'s gap, not the trade\'s';
+const APP_BUILD = 'v4.4 · 23 Aug 2026 · accumulator and bot trades are now a permanent bottom dock on desktop rather than panels you have to open — same numbers as the panels behind them, from the same tallyLog call, so the two cannot disagree; second accumulator books can be run measure-only on other coins from the accumulator panel; and a resolution now records WHICH market graded it, because the bot trades on Phemex and was being graded against Binance'
 // ── STALE PAGE GUARD (2026-08-21) ────────────────────────────────────────────────────────────
 // GitHub Pages sets a cache header on index.html, and a phone with this saved to its home screen
 // will hold that copy for days. On 2026-08-21 John reported two bugs — "sells 0 / buy-backs 0"
@@ -4177,6 +4215,30 @@ function serverBotContext() {
                  : 'The pump ladder holds the coins; no dot-flip timeframe is armed.')
         + (Array.isArray(a.open) && a.open.length ? ' ' + a.open.length + ' buy-back rungs still resting.' : '');
       o += '\nKNOWN DEFECT (found 2026-08-21, not yet fixed): a resting buy-back rung never expires, and the 4-ladder cap counts dead ladders, so three ladders laid in Oct 2023 at ~26k jammed the pump ladder completely from Sep 2024 onward. Backtested 2023-26 it ends with 0.77 BTC against 1.00 held. Do not describe the pump ladder as working.';
+    }
+
+    // ── SECOND BOOKS (2026-08-22) ─────────────────────────────────────────────────────────────
+    // The chat states whatever is in here as fact. If books exist and this does not mention them,
+    // "how is the accumulator doing" gets answered about BTC alone — the same class of mistake as
+    // 2026-08-21, when the context described a feed that had been dormant for six days. The
+    // research finding goes in WITH its caveat, because a model given only the +67.9% will quote
+    // it as an edge, and most of that column is a coin falling rather than a strategy working.
+    const bookKeys = Object.keys(st || {}).filter(k => /^cipher_accum_[A-Z]+$/.test(k));
+    if (bookKeys.length) {
+      const parts = [];
+      for (const k of bookKeys) {
+        const b = st[k] || {}, c = k.replace('cipher_accum_', '');
+        const u = Number(b.unitsNow), s0 = Number(b.startUnits);
+        const g = (u > 0 && s0 > 0) ? ((u / s0 - 1) * 100).toFixed(2) + '%' : 'no reading yet';
+        const strat = (b.liveFlip && b.liveFlip.tf) ? b.liveFlip.tf + ' dot flip' : 'pump ladder';
+        parts.push(c + ' (' + strat + '): ' + g + ' vs holding, ' + (b.sells || 0) + ' sells, ' + (b.fills || 0) + ' fills');
+      }
+      o += '\n\nSECOND ACCUMULATOR BOOKS (added 2026-08-22, MEASURE ONLY — these place no orders and touch no balance; each runs on a virtual 1000 USDT stack): '
+        + parts.join(' · ') + '. '
+        + 'They exist because the accumulator was measured across 12 symbols over 3 years and BTC was one of only three losers (BTC -2.0%, ETH -7.1%, DOGE -7.5%) against XRP +67.9%, ATOM +68.4%, DOT +60.7%, AVAX +55.1%, ADA +51.8%, LINK +38.0%. Unit gain correlates +0.44 with realised volatility and BTC has the lowest vol in the set. '
+        + 'CAVEAT THAT MUST BE STATED WHENEVER THOSE NUMBERS ARE: unit gain also correlates -0.48 with PRICE change, and all six coins whose price FELL accumulated units. Ending with 68% more ATOM while ATOM fell 83% is not a win. Only XRP and BNB both rose AND accumulated. Never quote the alt-coin unit gains as an edge without this.';
+    } else {
+      o += '\n\nSECOND ACCUMULATOR BOOKS: none configured — BTC only. The panel can add measure-only books on other coins; none are running.';
     }
 
     // The shadow book — and the reason not to believe its headline.
@@ -10344,6 +10406,92 @@ document.addEventListener('click', function(e){
     if(!a.flips || !Object.keys(a.flips).length){
       h += '<div class="bot-why" style="color:var(--dim);">Waiting for the bot\'s next run to populate 5m through 1D. It runs every 30–40 minutes.</div>';
     }
+
+    // ── SECOND BOOKS (2026-08-22) ────────────────────────────────────────────────────────────
+    // Measured across 12 symbols over 3 years, unit-denominated against buy-and-hold: BTC −2.0%,
+    // ETH −7.1%, against XRP +67.9%, ATOM +68.4%, DOT +60.7%, AVAX +55.1%, ADA +51.8%. Unit gain
+    // correlates +0.44 with realised volatility, and BTC has the lowest vol in the set. The
+    // strategy needs pumps to sell and dips to buy back, and it is deployed on the quietest coin.
+    //
+    // The honest half, which is why this panel says what it says: unit gain also correlates −0.48
+    // with PRICE change, and every coin that FELL accumulated. 68% more ATOM while ATOM fell 83%
+    // is not a win. Only XRP and BNB rose AND accumulated — they are marked, the others are not.
+    //
+    // Every book here is MEASURE ONLY and there is deliberately no arm button. Arming needs the
+    // global ACCUM_EXEC armed as well, and that coin funded in the spot wallet — two things that
+    // should take more than a tap. This panel exists to gather evidence, not to open positions.
+    const BOOK_COINS = ['XRP','BNB','ADA','LINK','AVAX','DOT','ATOM','SOL','ETH','LTC','DOGE'];
+    const ROSE_AND_ACCUM = { XRP:1, BNB:1 };   // price up AND units up — not a downtrend artefact
+    // Guarded rather than a bare `window.` — renderAccum is also executed headlessly by
+    // test-accum-panel.mjs, which supplies a stub document and no window at all. A panel function
+    // that only runs inside a browser cannot be tested, and this one is worth testing.
+    const booksCfg = (typeof window !== 'undefined' && window.ACCUM_BOOKS_CFG) || '';
+    const bk = booksCfg.split(',').map(x=>x.trim()).filter(Boolean);
+    let ladderCoin = '', flipCoin = '', flipTf = '30m';
+    for(const part of bk){
+      const [c, st2] = part.split(':');
+      if(!c) continue;
+      if(String(st2||'ladder').toLowerCase() === 'ladder') ladderCoin = c.toUpperCase();
+      else { flipCoin = c.toUpperCase(); flipTf = st2; }
+    }
+
+    h += '<div style="font-size:11px;font-weight:700;color:var(--muted);margin:14px 0 4px;">SECOND BOOKS — OTHER COINS, MEASURE ONLY</div>';
+    h += '<div class="bot-why" style="color:var(--dim);margin-bottom:6px;">Each runs as its own separate book on a virtual $1,000 stack, scored in coins against buy-and-hold. No orders are placed and no balance is touched. ★ marks the two coins whose price ROSE while the strategy still gained units — the rest of the winners only accumulated because the coin fell, which is not the same thing.</div>';
+
+    const bchip = (label, val, on, fn) =>
+      '<button class="accum-book" onclick="'+fn+'" '
+      + 'style="flex:0 0 auto;padding:8px 13px;font-size:12px;cursor:pointer;border-radius:6px;'
+      + 'border:1px solid '+(on?'#9c9':'#4a4a4a')+';'
+      + 'background:'+(on?'rgba(150,200,150,0.18)':'rgba(255,255,255,0.07)')+';'
+      + 'color:'+(on?'#9c9':'#cfcfcf')+';font-weight:'+(on?'700':'500')+';">'+esc(label)+'</button>';
+
+    h += '<div style="font-size:10px;color:var(--dim);margin:6px 0 3px;">PUMP LADDER ON</div>';
+    h += '<div style="display:flex;flex-wrap:wrap;gap:5px;margin-bottom:7px;">';
+    h += bchip('OFF', '', !ladderCoin, "setAccumBooks('','"+esc(flipCoin)+"','"+esc(flipTf)+"')");
+    for(const c of BOOK_COINS)
+      h += bchip(c + (ROSE_AND_ACCUM[c] ? ' ★' : ''), c, ladderCoin===c,
+                 "setAccumBooks('"+esc(c)+"','"+esc(flipCoin)+"','"+esc(flipTf)+"')");
+    h += '</div>';
+
+    h += '<div style="font-size:10px;color:var(--dim);margin:6px 0 3px;">DOT FLIP ON <select id="book-flip-tf" onchange="setAccumBooks(\''+esc(ladderCoin)+'\', document.getElementById(\'book-flip-coin-cur\').value, this.value)" style="background:rgba(255,255,255,0.07);color:#cfcfcf;border:1px solid #4a4a4a;border-radius:4px;font-size:10px;padding:1px 3px;">'
+       + ['5m','15m','30m','1H','2H','4H','1D'].map(t=>'<option value="'+t+'"'+(t===flipTf?' selected':'')+'>'+t+'</option>').join('')
+       + '</select></div>';
+    h += '<input type="hidden" id="book-flip-coin-cur" value="'+esc(flipCoin)+'">';
+    h += '<div style="display:flex;flex-wrap:wrap;gap:5px;margin-bottom:6px;">';
+    h += bchip('OFF', '', !flipCoin, "setAccumBooks('"+esc(ladderCoin)+"','','"+esc(flipTf)+"')");
+    for(const c of BOOK_COINS)
+      h += bchip(c + (ROSE_AND_ACCUM[c] ? ' ★' : ''), c, flipCoin===c,
+                 "setAccumBooks('"+esc(ladderCoin)+"','"+esc(c)+"','"+esc(flipTf)+"')");
+    h += '</div>';
+    h += '<div id="books-msg" style="font-size:11px;color:var(--dim);min-height:14px;margin-bottom:4px;"></div>';
+
+    // The scoreboard for whatever books have actually run. Read from each book's own state key,
+    // so a book that has not run yet says so rather than showing a zero that looks like a result.
+    const bookRows = [];
+    for(const c of BOOK_COINS){
+      const bs = st['cipher_accum_' + c];
+      if(!bs) continue;
+      const u = Number(bs.unitsNow), s0 = Number(bs.startUnits);
+      const g = (u > 0 && s0 > 0) ? (u/s0 - 1) * 100 : null;
+      bookRows.push({ coin:c, g, sells:bs.sells||0, fills:bs.fills||0,
+                      resting:(bs.open||[]).length, tf:(bs.liveFlip && bs.liveFlip.tf) || null, since: bs.startedAt || null });
+    }
+    if(bookRows.length){
+      h += '<div style="font-size:11px;font-weight:700;color:var(--muted);margin:12px 0 6px;">SECOND-BOOK RECORD (coins, vs buy-and-hold)</div>';
+      h += '<div style="display:flex;font-size:10px;color:var(--dim);padding:0 0 4px;"><span style="width:60px;">COIN</span><span style="width:64px;">STRATEGY</span><span style="width:74px;text-align:right;">vs hold</span><span style="width:56px;text-align:right;">sells</span><span style="flex:1;text-align:right;">resting</span></div>';
+      for(const r of bookRows){
+        const c2 = r.g===null?'var(--dim)':r.g>0?'#9c9':r.g<0?'#e88':'var(--muted)';
+        h += '<div style="display:flex;font-size:12px;border-bottom:1px solid var(--line);padding:5px 0;align-items:baseline;">'
+          + '<span style="width:60px;font-weight:700;">'+esc(r.coin)+'</span>'
+          + '<span style="width:64px;color:var(--dim);font-size:11px;">'+esc(r.tf||'ladder')+'</span>'
+          + '<span style="width:74px;text-align:right;color:'+c2+';font-weight:700;">'+(r.g===null?'—':(r.g>=0?'+':'')+r.g.toFixed(2)+'%')+'</span>'
+          + '<span style="width:56px;text-align:right;color:var(--dim);">'+esc(r.sells)+'</span>'
+          + '<span style="flex:1;text-align:right;color:var(--dim);font-size:11px;">'+esc(r.resting)+'</span>'
+          + '</div>';
+      }
+    } else if(ladderCoin || flipCoin){
+      h += '<div class="bot-why" style="color:var(--dim);">Selected — waiting for the bot\'s next run to open the book. It runs every 30–40 minutes.</div>';
+    }
     if(a.flips && Object.keys(a.flips).length){
       h += '<div style="font-size:11px;font-weight:700;color:var(--muted);margin:12px 0 6px;">THE PAPER RECORD (all eight, always running)</div>';
       h += '<div style="display:flex;font-size:10px;color:var(--dim);padding:0 0 4px;"><span style="width:52px;">TF</span><span style="width:78px;text-align:right;">vs hold</span><span style="width:72px;text-align:right;">round trips</span><span style="flex:1;text-align:right;">state</span></div>';
@@ -10626,6 +10774,9 @@ document.addEventListener('click', function(e){
       const res = await fetch(SRV_STATE_URL + '?t=' + Date.now(), { cache:'no-store' });
       if(!res.ok) return null;
       SRV_STATE = JSON.parse(await res.text()); SRV_STATE_AT = Date.now();
+      // The dock is fed by the SAME read every other panel uses — on load, then every 5 minutes.
+      // Wrapped because a dock that throws must never take the state refresh down with it.
+      try{ renderDock(SRV_STATE); }catch(e){ }
       return SRV_STATE;
     }catch(e){ return null; }
   }
@@ -10642,6 +10793,7 @@ document.addEventListener('click', function(e){
       SRV_STATE = st; SRV_STATE_AT = Date.now();
       const hb = st.cipher_heartbeat, log = Array.isArray(st.cipher_log) ? st.cipher_log : [];
       try{ renderAccum(st, log); }catch(err){ }
+      try{ renderDock(st); }catch(err){ }
       let h = '';
       // ── UNPROTECTED POSITIONS, AT THE TOP, EVERY TIME (2026-08-20) ────────────────────────
       // A SOL long this bot never opened sat for thirteen hours with no stop, no target and no
@@ -10696,10 +10848,92 @@ document.addEventListener('click', function(e){
       if(!res.ok){ el.innerHTML = '<div style="font-size:11px;color:var(--dim);">could not read the bot state (' + res.status + ')</div>'; return; }
       const st = JSON.parse(await res.text());
       SRV_STATE = st; SRV_STATE_AT = Date.now();
+      // The book list lives in the relay config, not in the agent state — the agent will not know
+      // about a change until its next run, and painting the chips from agent state would show a
+      // selection as unset for up to 40 minutes after it was made. Failure here is not fatal: the
+      // chips fall back to "none selected", which is honest rather than wrong.
+      try{
+        const rc = await srvFetch('/config', null);
+        if(rc && rc.status === 200 && rc.data && rc.data.config) window.ACCUM_BOOKS_CFG = rc.data.config.accumBooks || '';
+      }catch(e){ /* leave whatever was last known */ }
       renderAccum(st, Array.isArray(st.cipher_log) ? st.cipher_log : []);
     }catch(e){ el.innerHTML = '<div style="font-size:11px;color:var(--dim);">state unavailable: ' + esc(String(e && e.message || e)) + '</div>'; }
   }
   window.loadAccum = loadAccum;
+
+  // ── THE PERMANENT DOCK (2026-08-23) ──────────────────────────────────────────────────────
+  // Two cards that are always on screen on desktop. Deliberately a GLANCE, not a second panel:
+  // the numbers only, no controls. Controls that are always visible are controls that eventually
+  // get pressed by accident, and one of the buttons behind here is "Stop everything".
+  //
+  // Every figure comes from the same place the full panels use — tallyLog over the same ledger,
+  // and the same cipher_accum object. Nothing is recomputed a second way. A dock that says 50%
+  // while the panel behind it says 13% would be worse than no dock at all.
+  function renderDock(st){
+    const A = document.getElementById('dock-accum'), B = document.getElementById('dock-bot');
+    if(!A || !B) return;
+    const cell = (label, value, colour, cls) =>
+      '<span class="dk"><span class="dk-l">'+esc(label)+'</span>'
+      + '<div class="dk-v"'+(colour?' style="color:'+colour+';"':'')+'>'+value+'</div></span>';
+    const head = (title, extra) =>
+      '<div class="dock-head"><span>'+title+'</span><span class="dock-open">'+(extra||'open ›')+'</span></div>';
+
+    // ── ACCUMULATOR — counted in coins, never in pounds ──────────────────────────────────────
+    try{
+      const a = (st && st.cipher_accum) || null;
+      if(!a){
+        A.innerHTML = head('Accumulator') + '<div class="dock-note">not read yet</div>';
+      } else {
+        const u = Number(a.unitsNow), s0 = Number(a.startUnits);
+        const g = (u > 0 && s0 > 0) ? (u/s0 - 1) * 100 : null;
+        const col = g === null ? 'var(--dim)' : g > 0 ? '#9c9' : g < 0 ? '#e88' : 'var(--muted)';
+        const lf = a.liveFlip || {};
+        const holder = lf.blocked ? 'flip blocked' : lf.tf ? (lf.tf + ' dot flip') : 'pump ladder';
+        const resting = Array.isArray(a.open) ? a.open.length : 0;
+        A.innerHTML = head('Accumulator', (a.exec === 'armed' ? 'armed · ' : 'measure only · ') + 'open ›')
+          + '<div class="dock-row">'
+          + cell('vs hold', g === null ? '—' : (g >= 0 ? '+' : '') + g.toFixed(2) + '%', col)
+          + cell('coins', Number.isFinite(u) ? u.toFixed(6) : '—')
+          + cell('sells', a.sells || 0)
+          + cell('buy-backs', a.fills || 0)
+          + cell('resting', resting, resting ? '#e8c07a' : null)
+          + '</div>'
+          + '<div class="dock-note">' + esc(holder) + ' holds the coins</div>';
+      }
+    }catch(e){ A.innerHTML = head('Accumulator') + '<div class="dock-note">unavailable</div>'; }
+
+    // ── BOT TRADES — the graded record, and what is NOT in it ────────────────────────────────
+    try{
+      const ledger = st && Array.isArray(st.cipher_ledger) ? st.cipher_ledger : null;
+      const log = st && Array.isArray(st.cipher_log) ? st.cipher_log : [];
+      const source = ledger && ledger.length ? ledger : log;
+      const t = tallyLog(source);
+      const openN = st && st.cipher_open ? Object.keys(st.cipher_open).length : 0;
+      const rate = t.graded ? (t.wins / t.graded * 100) : null;
+      const rCol = t.R > 0 ? '#9c9' : t.R < 0 ? '#e88' : 'var(--muted)';
+      // The not-counted total is shown next to the record on purpose. It was 31 against 6 graded
+      // on 2026-08-22, and a win rate quoted without it is the most misleading number on the app.
+      //
+      // artifacts + rejected, and NOT + unseen: `unseen` is a SUBSET of artifacts, incremented
+      // inside the same branch, so adding it double-counts. The first version of this line did
+      // exactly that and would have shown a bigger total than the panel behind it — the precise
+      // disagreement this dock is supposed to be incapable of. Matches the panel's own formula.
+      const notCounted = (t.artifacts || 0) + (t.rejected || 0);
+      B.innerHTML = head('Bot trades', (openN ? openN + ' open · ' : '') + 'open ›')
+        + '<div class="dock-row">'
+        + cell('graded', t.graded, t.graded ? null : 'var(--dim)')
+        + cell('w / l', (t.wins||0) + ' / ' + (t.losses||0))
+        + cell('win rate', rate === null ? '—' : rate.toFixed(0) + '%',
+               rate === null ? 'var(--dim)' : rate >= 50 ? '#9c9' : '#e88')
+        + cell('total R', (t.R >= 0 ? '+' : '') + (Number(t.R)||0).toFixed(2), rCol)
+        + cell('not counted', notCounted, notCounted ? '#e8c07a' : null)
+        + '</div>'
+        + '<div class="dock-note">' + (notCounted
+            ? esc(notCounted + ' resolutions the bot could not grade — not in the win rate')
+            : 'every resolution graded') + '</div>';
+    }catch(e){ B.innerHTML = head('Bot trades') + '<div class="dock-note">unavailable</div>'; }
+  }
+  window.renderDock = renderDock;
 
   // ── THE TIMEFRAME TOGGLES (2026-08-19) ───────────────────────────────────────────────────
   // These do not change anything in this browser. They write one field to the relay, which the
@@ -10743,6 +10977,38 @@ document.addEventListener('click', function(e){
     }catch(e){ say(String(e && e.message || e), true); }
   }
   window.setFlipTf = setFlipTf;
+
+  // ── SECOND BOOKS ─────────────────────────────────────────────────────────────────────────
+  // Same channel and the same discipline as setFlipTf: write one field to the relay, then paint
+  // from the RELAY's answer, never from the button that was tapped. It never asks for
+  // confirmation because there is nothing to confirm — every book it can create is measure-only,
+  // and it cannot arm one. The moment that stops being true this needs a dialogue.
+  async function setAccumBooks(ladderCoin, flipCoin, flipTf){
+    const msg = document.getElementById('books-msg');
+    const say = (t,bad)=>{ if(msg){ msg.textContent=t||''; msg.style.color = bad?'#e88':'var(--dim)'; } };
+    const parts = [];
+    if(ladderCoin) parts.push(ladderCoin + ':ladder');
+    if(flipCoin && flipCoin !== ladderCoin) parts.push(flipCoin + ':' + (flipTf||'30m'));
+    if(flipCoin && flipCoin === ladderCoin){
+      say('One coin, one book — pick a different coin for the flip, or turn the ladder off first.', true);
+      return;
+    }
+    const spec = parts.join(',');
+    say('saving…');
+    try{
+      const r = await srvFetch('/config', { accumBooks: spec });
+      if(r.status !== 200 || !r.data || !r.data.config){
+        say((r.data && r.data.error) || ('save failed (' + r.status + ')'), true);
+        return;
+      }
+      window.ACCUM_BOOKS_CFG = r.data.config.accumBooks || '';
+      say(window.ACCUM_BOOKS_CFG
+        ? 'Running ' + window.ACCUM_BOOKS_CFG.split(',').join(' and ') + ' — measure only, no orders. The first numbers land after the bot\'s next run.'
+        : 'No second books. BTC only, exactly as before.');
+      if(SRV_STATE) renderAccum(SRV_STATE, Array.isArray(SRV_STATE.cipher_log) ? SRV_STATE.cipher_log : []);
+    }catch(e){ say(String(e && e.message || e), true); }
+  }
+  window.setAccumBooks = setAccumBooks;
 
   window.toggleAccum = function(){
     const p = document.getElementById('accum-panel-shell'); if(!p) return;
