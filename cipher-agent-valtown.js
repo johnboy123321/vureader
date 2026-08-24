@@ -3099,23 +3099,54 @@ function brainBudget(slot, now, usage) {
   return (slot.spendUsd || 0) < num("BRAIN_DAILY_USD", 0.25);
 }
 
-async function brainCall(prompt) {
-  const key = env("ANTHROPIC_API_KEY", "");
+// Which provider, and therefore which wire format. Set BRAIN_BASE_URL to anything OpenAI-shaped
+// (DeepSeek, OpenRouter, Groq, Together, a local server) and the brain speaks that instead. Leave
+// it unset and this behaves exactly as it did before — same host, same headers, same body.
+function brainProvider() {
+  const base = String(env("BRAIN_BASE_URL", "")).replace(/\/+$/, "");
+  const key = env("BRAIN_API_KEY", "") || env("ANTHROPIC_API_KEY", "");
   if (!key) return null;
+  if (!base) return { kind: "anthropic", url: "https://api.anthropic.com/v1/messages", key,
+                      model: env("BRAIN_MODEL", "claude-haiku-4-5") };
+  return { kind: "openai", url: base + "/chat/completions", key,
+           model: env("BRAIN_MODEL", "deepseek-chat") };
+}
+
+async function brainCall(prompt) {
+  const p = brainProvider();
+  if (!p) return null;
   const ctrl = new AbortController();
   const to = setTimeout(() => ctrl.abort(), 30000);
   try {
-    const r = await fetch("https://api.anthropic.com/v1/messages", {
+    const anth = p.kind === "anthropic";
+    const r = await fetch(p.url, {
       method: "POST", signal: ctrl.signal,
-      headers: { "x-api-key": key, "anthropic-version": "2023-06-01", "content-type": "application/json" },
+      headers: anth
+        ? { "x-api-key": p.key, "anthropic-version": "2023-06-01", "content-type": "application/json" }
+        : { "authorization": "Bearer " + p.key, "content-type": "application/json" },
       body: JSON.stringify({
-        model: env("BRAIN_MODEL", "claude-haiku-4-5"), max_tokens: 700,
+        model: p.model, max_tokens: 700,
         messages: [{ role: "user", content: prompt }],
       }),
     });
     const j = await r.json();
-    if (!r.ok) { console.error("brain call refused:", (j && j.error && j.error.message) || r.status); return null; }
-    return { text: (j.content && j.content[0] && j.content[0].text) || "", usage: j.usage || {} };
+    // The error field sits in a different place in each shape; report whichever is there rather
+    // than a bare status code, because "refused" without a reason costs an hour to diagnose.
+    if (!r.ok) {
+      const msg = (j && j.error && (j.error.message || j.error)) || (j && j.message) || r.status;
+      console.error(`brain call refused (${p.kind}): ${msg}`);
+      return null;
+    }
+    const text = anth
+      ? (j.content && j.content[0] && j.content[0].text) || ""
+      : (j.choices && j.choices[0] && j.choices[0].message && j.choices[0].message.content) || "";
+    // Normalise usage HERE, at the boundary. The spend cap counts input_tokens/output_tokens; an
+    // OpenAI-shaped reply calls them prompt_tokens/completion_tokens, and left untranslated the
+    // meter would read zero forever and the daily cap would never engage. A budget that has
+    // quietly stopped counting still looks like protection, which is what makes it dangerous.
+    const u = j.usage || {};
+    const usage = anth ? u : { input_tokens: u.prompt_tokens || 0, output_tokens: u.completion_tokens || 0 };
+    return { text, usage };
   } catch (e) { console.error("brain call failed (harmless, labels only):", e && e.message); return null; }
   finally { clearTimeout(to); }
 }
@@ -3963,6 +3994,26 @@ async function runAccumulator(book = primaryAccumBook()) {
                                gainPct: lf.gainPct, holding: lf.holding, trips: lf.trips, sells: lf.sells };
             console.log(`live flip ${lf.tf} (REAL): ${lf.unitsNow} units vs ${lf.startUnits} at arming — ${lf.gainPct >= 0 ? "+" : ""}${lf.gainPct}% · ${lf.sells} sells, ${lf.trips} round trips · ${lf.holding ? "holding coins" : "in cash, waiting for green"}`);
             }
+          } else if (flipTf) {
+            // ── ASKED FOR A TIMEFRAME, BUT ITS CANDLES DID NOT ARRIVE ───────────────────────
+            // This used to fall through to the "off" branch below, which hands the coins back to
+            // the ladder and clears lf.tf. So a single failed fetch — a rate-limit, a slow venue,
+            // a daily series shorter than the 60-bar floor — silently un-armed a live strategy
+            // and logged it as FLIP OFF, indistinguishable from the user flicking the switch.
+            // Next run it re-armed. That is why 1D "kept swapping back": nothing was rejecting
+            // the setting, the agent was standing it down and picking it up again.
+            //
+            // A missing fetch is a gap in the data, not an instruction. The arm is left exactly
+            // as it was and the gap is reported.
+            const held = lf && lf.tf === flipTf;
+            state.liveFlip = held
+              ? { tf: lf.tf, blocked: false, stale: true, armedAt: lf.armedAt, units: lf.units,
+                  cash: lf.cash, unitsNow: lf.unitsNow, startUnits: lf.startUnits, gainPct: lf.gainPct,
+                  holding: lf.holding, trips: lf.trips, sells: lf.sells,
+                  why: `no ${flipTf} candles this run — the arm is untouched and it will act on the next one` }
+              : { tf: null, want: flipTf, blocked: true,
+                  why: `no ${flipTf} candles came back this run (at least 60 bars are needed). The setting is unchanged and it will try again on the next run.` };
+            console.log(`live flip ${flipTf}: no candles this run — arm left as it was, NOT stood down`);
           } else {
             // Toggled back to off — HAND THE COINS BACK. The flip may well be sitting in cash
             // mid-cycle, so the ladder must resume from what is actually held rather than from
@@ -4007,7 +4058,7 @@ async function runAccumulator(book = primaryAccumBook()) {
             const bSlot = shadowSlot(await loadShadow(), "brain_autopsy");
             const days = num("ACCUM_REVIEW_DAYS", 7);
             const due = !state.lastReview || (Date.now() - state.lastReview) > days * 864e5;
-            if (env("ANTHROPIC_API_KEY", "") && due && (state.sells || 0) + (state.fills || 0) > 0
+            if (brainProvider() && due && (state.sells || 0) + (state.fills || 0) > 0
                 && brainBudget(bSlot, Date.now(), null)) {
               const res = await brainCall(buildAccumReviewPrompt(state, px,
                 "gains units in ranging/falling markets, loses them in sustained rallies; full history -27.8%, since Jan 2024 +14.9%"));
@@ -4089,7 +4140,10 @@ export default async function cipherAgent() {
     const sym = uni[(cursor + i) % uni.length];
     if (!seenThisRun.has(sym)) { seenThisRun.add(sym); slice.push(sym); }
   }
-  await setJSON(KEY.cursor, (cursor + batch) % uni.length);
+  // NOT advanced here. The scan below can stop early on its time budget, and moving the cursor
+  // by the full batch before knowing that skipped the tail of every batch permanently — same
+  // positions every run, because the stride is fixed. It is advanced after the loop, by the
+  // number of coins actually looked at.
 
   // Day-scoped dedupe: one trade per coin+direction per day, same as the app.
   const day = new Date().toISOString().slice(0, 10);
@@ -4218,6 +4272,10 @@ export default async function cipherAgent() {
   }
 
   let scanned = 0, candidates = 0, placed = 0;
+  // Where the rotation got to. Distinct from `scanned`, which counts coins the loop accepted —
+  // this counts positions consumed from the slice, so a coin skipped for not being crypto still
+  // advances the queue and cannot jam it.
+  let consumed = 0;
   const rankPool = [];                       // every coin's best signal this run, threshold or not
   const SHADOW = await loadShadow();
   _regimeCache = null; _rsCache = null;      // one BTC daily read, one field ranking, per run
@@ -4227,7 +4285,11 @@ export default async function cipherAgent() {
   if (REGIME.label) console.log(`regime: ${REGIME.label} (BTC ${REGIME.distPct >= 0 ? "+" : ""}${REGIME.distPct}% vs its ${REGIME_MA}D average) — measured only, it filters nothing`);
 
   for (const coin of slice) {
-    if (Date.now() - started > 45000) { console.log("time budget reached — stopping early"); break; }
+    if (Date.now() - started > 45000) {
+      console.log(`time budget reached — stopping early after ${consumed} of ${slice.length}; the cursor resumes here rather than skipping the rest`);
+      break;
+    }
+    consumed++;
     if (!coin || NOT_CRYPTO.test(coin)) continue;
     scanned++;
 
@@ -4309,7 +4371,17 @@ export default async function cipherAgent() {
 
     const planBars = bars[sig.planTf] || await fetchCandles(coin, sig.planTf || "1D", 260);
     const plan = planBars ? buildTradePlan(planBars, sig.bias, sig.price) : null;
-    if (!plan) { await pushLog({ coin, dir: sig.bias, score: sig.score, skipped: "could not build a trade plan" }); continue; }
+    if (!plan) {
+      // One sentence for three different failures is how this stayed the biggest line in the log
+      // for weeks without anyone being able to act on it. Missing candles and a refused-because-
+      // too-volatile setup are not the same event and must never read the same again.
+      const nb = Array.isArray(planBars) ? planBars.length : 0;
+      const why = !nb ? `no ${sig.planTf || "1D"} candles came back — the venue did not answer, so there was nothing to build a plan from`
+                : nb < 60 ? `only ${nb} ${sig.planTf || "1D"} candles came back, too few to measure a stop from`
+                : `refused — the stop the structure asks for is more than 3× ATR away on ${sig.planTf || "1D"}. A move that size has no edge over this signal.`;
+      await pushLog({ coin, dir: sig.bias, score: sig.score, planTf: sig.planTf || "1D", bars: nb, skipped: why });
+      continue;
+    }
 
     const t = { coin, dir: sig.bias, entry: plan.entry, sl: plan.stop, tp1: plan.targets[0], tp2: plan.targets[1], score: sig.score,
                 stopKind: plan.stopKind, trend: plan.trend, zone: plan.zone };
@@ -4601,7 +4673,7 @@ export default async function cipherAgent() {
       const bSlot = shadowSlot(SHADOW, "brain_autopsy");
       const fresh = src.filter(r => r.arm === "baseline" && r.R !== null && r.R <= AUTOPSY_MAX_R() && !r.autopsy)
                        .sort((a, b) => a.at - b.at).slice(0, AUTOPSY_BATCH());
-      if (!env("ANTHROPIC_API_KEY", "")) {
+      if (!brainProvider()) {
         // ── OFF IS A STATE, NOT AN ABSENCE (2026-08-21) ──────────────────────────────────────
         // John: "why has brain_autopsy never recorded anything?" Because it has never run: there
         // is no ANTHROPIC_API_KEY, so it returns here every time. That was reported only to the
@@ -4611,11 +4683,11 @@ export default async function cipherAgent() {
         // It is a config gap, not a bug: add ANTHROPIC_API_KEY to the repo secrets and it starts.
         // Until then it says so on the record, once, where it can actually be seen.
         if (fresh.length) {
-          console.log(`brain autopsy: ${fresh.length} unread loss(es) waiting — no ANTHROPIC_API_KEY secret set, brain is off`);
+          console.log(`brain autopsy: ${fresh.length} unread loss(es) waiting — no brain configured. Set ANTHROPIC_API_KEY, or BRAIN_BASE_URL + BRAIN_API_KEY for any OpenAI-compatible provider.`);
           if (!bSlot.offNoted || Date.now() - bSlot.offNoted > 6 * 3600e3) {
             bSlot.offNoted = Date.now();
             await pushLog({ shadow: "brain_autopsy", result: "OFF", countsForStats: false,
-              skipped: `${fresh.length} losing trade(s) are waiting to be read, but the loser-autopsy brain has never run: no ANTHROPIC_API_KEY secret is set on the repo, so it returns before doing anything. `
+              skipped: `${fresh.length} losing trade(s) are waiting to be read, but the loser-autopsy brain has never run: no brain is configured on the repo, so it returns before doing anything. Either ANTHROPIC_API_KEY, or BRAIN_BASE_URL plus BRAIN_API_KEY for a cheaper OpenAI-compatible provider. `
                 + `This is a setting, not a fault — add the secret in Settings → Secrets and variables → Actions and it starts on the next run. `
                 + `It costs at most $${num("BRAIN_DAILY_USD", 0.25)} a day and never places, sizes or blocks an order.` });
           }
@@ -4808,6 +4880,10 @@ export default async function cipherAgent() {
   await setJSON(BOOKMAP_KEY, bookMap);
   await setJSON(KEY.fired, fired);
   await setJSON("cipher_attempts", attempts);
+  // Advance by what was REACHED. A run that got through 13 of 20 resumes at 13 next time instead
+  // of starting at 20 and orphaning seven coins for good.
+  await setJSON(KEY.cursor, (cursor + Math.max(1, consumed)) % uni.length);
+  if (consumed < slice.length) console.log(`rotation: covered ${consumed}/${slice.length} this run — next run starts at the one after`);
   await setJSON("cipher_heartbeat", { at: new Date().toISOString(), scanned, candidates, placed, mode, via: EXEC(), ms: Date.now() - started });
   console.log(`cipher-agent: scanned ${scanned}, ${candidates} candidates, ${placed} placed (${mode}, via ${EXEC()}) in ${Date.now() - started}ms`);
 }
