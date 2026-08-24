@@ -1,6 +1,71 @@
 {
-  "cipher_cursor": 15,
+  "cipher_cursor": 11,
   "cipher_log": [
+    {
+      "at": "2026-08-24T08:05:59.375Z",
+      "coin": "TON",
+      "dir": "long",
+      "entry": 1.6,
+      "sl": 1.4825387262204892,
+      "tp1": 1.717461273779511,
+      "tp2": 1.8642878660038995,
+      "score": 6,
+      "stopKind": "swing10",
+      "trend": "down",
+      "zone": null,
+      "qty": 85.134,
+      "risk": 10,
+      "mode": "armed",
+      "orderID": "",
+      "entryKind": "immediate",
+      "book": "swing",
+      "via": "direct",
+      "attempt": 1,
+      "diag": {
+        "ms": 454,
+        "status": 200,
+        "via": "1.1 6df78351a02545f9ebfbb05759426ee0.cloudfront.net (CloudFront)",
+        "venue": "phemex"
+      },
+      "result": "REJECTED (not a signal) — the venue has this symbol switched off",
+      "rejection": {
+        "label": "the venue has this symbol switched off",
+        "detail": "TE_SEQ_TURN_OFF — Phemex testnet disables symbols periodically. Nothing to do with the setup.",
+        "klass": "execution_artifact",
+        "cause": "venue",
+        "code": "20005",
+        "raw": "phemex 20005: TE_SEQ_TURN_OFF"
+      },
+      "countsForStats": false,
+      "thesis": "Momentum Rollover Long; Bullish WaveTrend cross at -56 (oversold); VWAP wave above zero and rising (7.4) — the early-warning wave agrees; Money flow turning up · plan from 1D · rollover detector"
+    },
+    {
+      "at": "2026-08-24T08:05:53.806Z",
+      "coin": "INJ",
+      "dir": "long",
+      "entry": 5.355,
+      "sl": 5.183608643913637,
+      "tp1": 5.526391356086364,
+      "tp2": 5.740630551194319,
+      "score": 6,
+      "stopKind": "OB",
+      "trend": "none",
+      "zone": {
+        "src": "OB",
+        "top": 5.272,
+        "bottom": 5.2,
+        "awayPct": 1.55
+      },
+      "result": "SKIPPED (venue)",
+      "skipped": "INJUSDT is benched — the venue has this symbol switched off (TE_SEQ_TURN_OFF). Refused 4×; trying again in 30h.",
+      "rejection": {
+        "label": "the venue has this symbol switched off (TE_SEQ_TURN_OFF)",
+        "klass": "execution_artifact",
+        "cause": "venue",
+        "code": "20005"
+      },
+      "countsForStats": false
+    },
     {
       "at": "2026-08-24T07:08:07.851Z",
       "coin": "TRX",
@@ -3525,80 +3590,32 @@
         "awayPct": 0.2
       },
       "skipped": "REFUSED — stop only 1.35% from entry — below the 2.2% floor, costs would eat 16% of the risk"
-    },
-    {
-      "at": "2026-08-23T04:53:36.920Z",
-      "coin": "UNI",
-      "dir": "long",
-      "score": 6,
-      "skipped": "could not build a trade plan"
-    },
-    {
-      "at": "2026-08-23T04:53:36.290Z",
-      "coin": "SUI",
-      "dir": "short",
-      "score": 6,
-      "skipped": "could not build a trade plan"
     }
   ],
   "cipher_fired": {
     "SUI|short|2026-08-24": 1787544475441,
     "UNI|short|2026-08-24": 1787544477047,
-    "NEAR|short|2026-08-24": 1787544481086
+    "NEAR|short|2026-08-24": 1787544481086,
+    "TON|long|2026-08-24": 1787558758919
   },
   "cipher_heartbeat": {
-    "at": "2026-08-24T07:08:24.797Z",
-    "scanned": 20,
-    "candidates": 4,
+    "at": "2026-08-24T08:06:38.913Z",
+    "scanned": 7,
+    "candidates": 2,
     "placed": 0,
     "mode": "armed",
     "via": "direct",
-    "ms": 55160
+    "ms": 83413
   },
   "cipher_attempts": {
     "SUI|short|2026-08-24": 1,
     "UNI|short|2026-08-24": 1,
-    "NEAR|short|2026-08-24": 1
+    "NEAR|short|2026-08-24": 1,
+    "TON|long|2026-08-24": 1
   },
   "cipher_shadow": {
     "rank_vs_threshold": {
       "records": [
-        {
-          "at": 1787328341837,
-          "arm": "variant",
-          "coin": "BCH",
-          "dir": "long",
-          "tf": "1D",
-          "entry": 223.1,
-          "stop": 204.43313744056567,
-          "target": 265.10044075872725,
-          "quality": 6,
-          "note": "rollover",
-          "reg": "bull",
-          "rs": 0.318,
-          "regDist": 5.8,
-          "breadth": 0.35,
-          "R": 2.25,
-          "gtf": "4H"
-        },
-        {
-          "at": 1787328342038,
-          "arm": "variant",
-          "coin": "AAVE",
-          "dir": "long",
-          "tf": "1D",
-          "entry": 99.21,
-          "stop": 89.38128398679675,
-          "target": 121.3246110297073,
-          "quality": 6,
-          "note": "rollover",
-          "reg": "bull",
-          "rs": 0.636,
-          "regDist": 5.8,
-          "breadth": 0.35,
-          "R": 2.25,
-          "gtf": "4H"
-        },
         {
           "at": 1787331213731,
           "arm": "baseline",
@@ -13957,6 +13974,40 @@
           "regDist": 12.6,
           "breadth": 0.8,
           "R": null
+        },
+        {
+          "at": 1787558761480,
+          "arm": "baseline",
+          "coin": "TON",
+          "dir": "long",
+          "tf": "1D",
+          "entry": 1.6,
+          "stop": 1.4825387262204892,
+          "target": 1.8642878660038995,
+          "quality": 6,
+          "note": "rollover",
+          "reg": "bull",
+          "rs": 0,
+          "regDist": 12.6,
+          "breadth": 0.57,
+          "R": null
+        },
+        {
+          "at": 1787558761793,
+          "arm": "variant",
+          "coin": "TON",
+          "dir": "long",
+          "tf": "1D",
+          "entry": 1.6,
+          "stop": 1.4825387262204892,
+          "target": 1.8642878660038995,
+          "quality": 6,
+          "note": "rollover",
+          "reg": "bull",
+          "rs": 0,
+          "regDist": 12.6,
+          "breadth": 0.57,
+          "R": null
         }
       ],
       "promoted": false,
@@ -14036,11 +14087,9 @@
       "history": [],
       "arms": {
         "bars20": {
-          "sum": 964.5914840376851,
-          "n": 856,
+          "sum": 965.0524654463187,
+          "n": 858,
           "seen": [
-            "XRP1787184069338",
-            "INJ1787180873085",
             "SOL1787184069137",
             "SOL1787190802140",
             "SOL1787194899502",
@@ -14638,7 +14687,9 @@
             "FIL1787478310987",
             "AVAX1787475926649",
             "AVAX1787478311108",
-            "SUI1787478310485"
+            "SUI1787478310485",
+            "AVAX1787479446375",
+            "AVAX1787481825846"
           ]
         },
         "bars40": {
@@ -17687,7 +17738,7 @@
       },
       "since": 1787349769745,
       "avgEntry": 78240.2,
-      "lastSeen": 1787555302882
+      "lastSeen": 1787558795432
     },
     "DOT|long": {
       "coin": "DOT",
@@ -17701,7 +17752,7 @@
       },
       "since": 1787280627798,
       "avgEntry": 0.855,
-      "lastSeen": 1787555302882
+      "lastSeen": 1787558795432
     }
   },
   "cipher_books": {
@@ -18091,7 +18142,7 @@
     "highWater": 0.00767931,
     "startPx": 64730.8,
     "unitsNow": 0.007036,
-    "pxNow": 77742.9,
+    "pxNow": 77734,
     "trigger": "pump1",
     "spot": {
       "ready": true,
@@ -18109,40 +18160,40 @@
       "baseBalance": 0.00715235,
       "quoteBalance": 4.90210195,
       "exec": "armed",
-      "checkedAt": 1787555303679
+      "checkedAt": 1787558796698
     },
     "seededReal": true,
     "seededAt": "2026-08-19T13:59:51.035Z",
     "exec": "armed",
     "flips": {
       "5m": {
-        "units": 0.8964453530518388,
-        "cash": 0,
+        "units": 0,
+        "cash": 69602.02972986591,
         "trips": 155,
-        "sells": 155,
-        "lastT": 1787555100000,
+        "sells": 156,
+        "lastT": 1787558700000,
         "startUnits": 1,
-        "unitsNow": 0.89644535,
-        "gainPct": -10.36,
-        "holding": true
+        "unitsNow": 0.89990212,
+        "gainPct": -10.01,
+        "holding": false
       },
       "15m": {
-        "units": 0.8866298061150084,
-        "cash": 0,
+        "units": 0,
+        "cash": 68568.69136705538,
         "trips": 75,
-        "sells": 75,
-        "lastT": 1787553900000,
+        "sells": 76,
+        "lastT": 1787557500000,
         "startUnits": 1,
-        "unitsNow": 0.88662981,
-        "gainPct": -11.34,
-        "holding": true
+        "unitsNow": 0.88696442,
+        "gainPct": -11.3,
+        "holding": false
       },
       "30m": {
         "units": 0.9408472932735198,
         "cash": 0,
         "trips": 46,
         "sells": 46,
-        "lastT": 1787553000000,
+        "lastT": 1787556600000,
         "startUnits": 1,
         "unitsNow": 0.94084729,
         "gainPct": -5.92,
@@ -18153,7 +18204,7 @@
         "cash": 0,
         "trips": 39,
         "sells": 39,
-        "lastT": 1787551200000,
+        "lastT": 1787554800000,
         "startUnits": 1,
         "unitsNow": 0.93729766,
         "gainPct": -6.27,
@@ -18164,7 +18215,7 @@
         "cash": 0,
         "trips": 35,
         "sells": 35,
-        "lastT": 1787551200000,
+        "lastT": 1787558400000,
         "startUnits": 1,
         "unitsNow": 0.89919364,
         "gainPct": -10.08,
@@ -18175,10 +18226,10 @@
         "cash": 67934.78704664213,
         "trips": 14,
         "sells": 15,
-        "lastT": 1787536800000,
+        "lastT": 1787544000000,
         "startUnits": 1,
-        "unitsNow": 0.88333915,
-        "gainPct": -11.67,
+        "unitsNow": 0.87698154,
+        "gainPct": -12.3,
         "holding": false
       },
       "4H": {
@@ -18186,10 +18237,10 @@
         "cash": 58313.762511791814,
         "trips": 34,
         "sells": 35,
-        "lastT": 1787529600000,
+        "lastT": 1787544000000,
         "startUnits": 1,
-        "unitsNow": 0.75790528,
-        "gainPct": -24.21,
+        "unitsNow": 0.75431267,
+        "gainPct": -24.57,
         "holding": false
       },
       "1D": {
@@ -18235,6 +18286,29 @@
   },
   "cipher_unprotected": [],
   "cipher_ledger": [
+    {
+      "at": "2026-08-24T08:05:59.379Z",
+      "kind": "rejected",
+      "coin": "TON",
+      "dir": "long",
+      "book": "swing",
+      "entry": 1.6,
+      "stop": 1.4825387262204892,
+      "target": 1.717461273779511,
+      "qty": 85.134,
+      "risk": 10,
+      "mode": "armed",
+      "via": "direct",
+      "rejection": {
+        "label": "the venue has this symbol switched off",
+        "detail": "TE_SEQ_TURN_OFF — Phemex testnet disables symbols periodically. Nothing to do with the setup.",
+        "klass": "execution_artifact",
+        "cause": "venue",
+        "code": "20005",
+        "raw": "phemex 20005: TE_SEQ_TURN_OFF"
+      },
+      "countsForStats": false
+    },
     {
       "at": "2026-08-24T05:03:49.065Z",
       "kind": "resolved",
@@ -20245,6 +20319,13 @@
       "strikes": 2,
       "lastAt": 1787450120892,
       "until": 1787493320892
+    },
+    "TONUSDT": {
+      "code": "20005",
+      "why": "the venue has this symbol switched off (TE_SEQ_TURN_OFF)",
+      "strikes": 1,
+      "lastAt": 1787558759383,
+      "until": 1787580359383
     }
   }
 }
