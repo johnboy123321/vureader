@@ -1,0 +1,68 @@
+# ═══════════════════════════════════════════════════════════════════════════════
+#  SETUP LAB — the brain proposing trading setups, and the backtest answering
+#
+#  Upload to your repo at:  .github/workflows/setup-lab.yml
+#  Also upload the whole  setup-lab/  folder and  bt-cipherb/data/  (the candles).
+#
+#  Runs once a day. Asks the brain for ten setups, validates them, backtests each
+#  over 12 coins and 3 years, and commits the survivors to setup-lab/survivors.json.
+#  The trading agent then evaluates those survivors live — in SHADOW. They place
+#  nothing until they have won a shadow arm.
+#
+#  SECRETS (Settings → Secrets and variables → Actions)
+#    BRAIN_API_KEY    your key
+#    BRAIN_BASE_URL   e.g. https://api.deepseek.com/v1  (omit for Anthropic)
+#    BRAIN_MODEL      e.g. deepseek-chat
+#
+#  Cost: one call a day. On a cheap provider this is fractions of a penny.
+#  The expensive part of strategy research is the testing, and the testing is free.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+name: Setup Lab
+
+on:
+  schedule:
+    - cron: "20 5 * * *"      # 05:20 UTC daily, well clear of the agent's slots
+  workflow_dispatch:           # and a button, for when you want a round on demand
+
+permissions:
+  contents: write
+
+concurrency:
+  group: setup-lab
+  cancel-in-progress: false
+
+jobs:
+  propose:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Propose, validate and backtest
+        env:
+          BRAIN_API_KEY:  ${{ secrets.BRAIN_API_KEY }}
+          BRAIN_BASE_URL: ${{ secrets.BRAIN_BASE_URL }}
+          BRAIN_MODEL:    ${{ secrets.BRAIN_MODEL }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          SETUPS_PER_RUN: "10"
+        run: node setup-lab/propose.mjs
+
+      - name: Commit anything that survived
+        run: |
+          git config user.name  "Setup-lab"
+          git config user.email "setup-lab@users.noreply.github.com"
+          git add setup-lab/survivors.json setup-lab/journal.json || true
+          # Nothing surviving is the NORMAL outcome, not an error. A run that finds
+          # nothing must exit clean, or a green filter doing its job looks like a
+          # broken workflow and someone eventually "fixes" it by loosening the bar.
+          if git diff --cached --quiet; then
+            echo "nothing new survived — that is the filter working"
+          else
+            git commit -m "setup lab $(date -u '+%Y-%m-%d %H:%M UTC')"
+            git push
+          fi

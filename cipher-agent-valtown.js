@@ -3335,6 +3335,61 @@ function entryArmResolve(intent, forward) {
   return out;
 }
 
+// ── DISCOVERED SETUPS (2026-08-24) ────────────────────────────────────────────────────────────
+// Rules found by the setup lab and stored in the repo. Loaded once per run, evaluated against bars
+// the scan has already fetched, and recorded as shadow decisions. Nothing here can place an order:
+// the only function it calls is shadowRecord, which writes to the experiment ledger.
+let _setupLab = undefined;          // undefined = not tried yet, null = unavailable
+async function setupLab() {
+  if (_setupLab !== undefined) return _setupLab;
+  _setupLab = null;
+  try {
+    // Dynamic, so the agent stays a single file that runs with or without the lab beside it.
+    const eng = await import("./setup-lab/engine.mjs");
+    const raw = JSON.parse(fs.readFileSync("setup-lab/survivors.json", "utf8"));
+    if (!Array.isArray(raw) || !raw.length) { console.log("setup lab: no survivors stored yet"); return _setupLab; }
+    // A rule using a condition this engine cannot compute would evaluate to false everywhere,
+    // which reads as "never fired" and is indistinguishable from a setup that simply does not
+    // trigger. Bench it by name instead — an unusable rule must never look like a quiet one.
+    const known = new Set(Object.keys(eng.CONDITION_NAMES || {}));
+    const usable = [], benched = [];
+    for (const r of raw.slice(0, num("SETUPS_MAX", 20))) {
+      const bad = (r.when || []).map(w => w.fn).filter(f => known.size && !known.has(f));
+      if (bad.length) benched.push(`${r.name} (${bad.join(", ")})`); else usable.push(r);
+    }
+    if (benched.length) console.log(`setup lab: benched ${benched.length} — ${benched.join(" · ")}`);
+    _setupLab = { eng, rules: usable };
+    console.log(`setup lab: ${usable.length} discovered setup(s) running in SHADOW — they place nothing`);
+  } catch (e) {
+    // Missing folder is the normal case, not an error worth shouting about.
+    if (!/Cannot find module|ENOENT/.test(String(e && e.message))) console.error("setup lab: unavailable —", e && e.message);
+  }
+  return _setupLab;
+}
+
+// Evaluate every stored setup on one coin's bars and record whatever fires. Pure bookkeeping.
+function shadowDiscovered(lab, SHADOW, coin, bars, meta) {
+  if (!lab) return 0;
+  let fired = 0;
+  for (const rule of lab.rules) {
+    const c = bars[rule.timeframe];
+    if (!c || c.length < 120) continue;
+    try {
+      const trades = lab.eng.runRule(c, rule);
+      if (!trades.length) continue;
+      const last = trades[trades.length - 1];
+      // Only a signal on the NEWEST closed bar is a live decision. An older one already happened
+      // and grading it now would be recording a trade we did not make at a price that has gone.
+      if (last.i < c.length - 2) continue;
+      shadowRecord(SHADOW, "discovered_setups", "variant",
+        { coin, dir: rule.dir, entry: last.entry, sl: last.stop, tp2: last.target, planTf: rule.timeframe },
+        { note: rule.name, ...meta });
+      fired++;
+    } catch { /* one bad rule must never stop the others, or the whole arm goes dark */ }
+  }
+  return fired;
+}
+
 const SHADOW_KEY = "cipher_shadow";
 const SHADOW_MIN_RESOLVED = 30;    // per arm, before a comparison means anything
 const SHADOW_MARGIN_R     = 0.05;  // variant must beat baseline by this much in mean R
@@ -4272,6 +4327,7 @@ export default async function cipherAgent() {
   }
 
   let scanned = 0, candidates = 0, placed = 0;
+  let _setupsFired = 0, _setupsSkipped = false;
   // Where the rotation got to. Distinct from `scanned`, which counts coins the loop accepted —
   // this counts positions consumed from the slice, so a coin skipped for not being crypto still
   // advances the queue and cannot jam it.
@@ -4299,6 +4355,18 @@ export default async function cipherAgent() {
     try { regimeBreadthTally(REGIME, bars["1D"]); } catch {}   // free: the candles are already here
     // Detector-only timeframes — the BTC 30m top the app missed lived here.
     for (const tf of ["30m", "15m"]) bars[tf] = await fetchCandles(coin, tf, 260);
+
+    // ── THE DISCOVERED SETUPS, IN SHADOW ─────────────────────────────────────────────────────
+    // Deliberately after the fetches, so it costs no extra network, and gated on the clock so it
+    // can never eat the coverage the rotation fix just bought back.
+    if (Date.now() - started < 30000) {
+      const lab = await setupLab();
+      if (lab) _setupsFired += shadowDiscovered(lab, SHADOW, coin, bars,
+        { reg: REGIME.label, regDist: REGIME.distPct, breadth: REGIME.breadth });
+    } else if (_setupsFired === 0 && !_setupsSkipped) {
+      _setupsSkipped = true;
+      console.log("setup lab: skipped this run — the scan used its time budget on coverage, which comes first");
+    }
 
     // Two independent sources of a trade: the confluence score, and the pattern detectors.
     // Detectors carry no score, so they use the configured minimum — the guards below still bind.
@@ -4880,6 +4948,7 @@ export default async function cipherAgent() {
   await setJSON(BOOKMAP_KEY, bookMap);
   await setJSON(KEY.fired, fired);
   await setJSON("cipher_attempts", attempts);
+  if (_setupsFired) console.log(`setup lab: ${_setupsFired} shadow decision(s) recorded from discovered setups — none of them placed anything`);
   // Advance by what was REACHED. A run that got through 13 of 20 resumes at 13 next time instead
   // of starting at 20 and orphaning seven coins for good.
   await setJSON(KEY.cursor, (cursor + Math.max(1, consumed)) % uni.length);
