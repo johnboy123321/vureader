@@ -1,0 +1,84 @@
+[
+  {
+    "name": "inverse HS with a VuManChu green dot",
+    "dir": "long",
+    "timeframe": "4H",
+    "when": [
+      { "fn": "pattern", "name": "invHeadShoulders", "within": 6 },
+      { "fn": "wtCrossUp" },
+      { "fn": "wt2Below", "value": 0 }
+    ],
+    "stop": { "kind": "pattern", "padAtr": 0.25 },
+    "target": { "kind": "rMultiple", "value": 2 },
+    "maxBars": 60,
+    "falsifier": "If the neckline break is real, price should not return through the right shoulder; a win rate under 25% would say the pattern adds nothing to the dot."
+  },
+  {
+    "name": "head and shoulders with a red dot",
+    "dir": "short",
+    "timeframe": "4H",
+    "when": [
+      { "fn": "pattern", "name": "headShoulders", "within": 6 },
+      { "fn": "wtCrossDown" },
+      { "fn": "wt2Above", "value": 0 }
+    ],
+    "stop": { "kind": "pattern", "padAtr": 0.25 },
+    "target": { "kind": "rMultiple", "value": 2 },
+    "maxBars": 60,
+    "falsifier": "Shorts in a three-year sample where most coins rose should struggle; if this only works in the second half it is a bear-market artefact, not a setup."
+  },
+  {
+    "name": "double bottom into a daily uptrend",
+    "dir": "long",
+    "timeframe": "4H",
+    "when": [
+      { "fn": "pattern", "name": "doubleBottom", "within": 6 },
+      { "fn": "htf", "mult": 6, "cond": { "fn": "aboveSma", "period": 50 } }
+    ],
+    "stop": { "kind": "pattern", "padAtr": 0.3 },
+    "target": { "kind": "rMultiple", "value": 2 },
+    "maxBars": 60,
+    "falsifier": "If the higher-timeframe filter matters, removing it should make the numbers worse; if it does not, the filter is decoration."
+  },
+  {
+    "name": "oversold dot with money flow already green",
+    "dir": "long",
+    "timeframe": "4H",
+    "when": [
+      { "fn": "wtCrossUp" },
+      { "fn": "wt2Below", "value": -53 },
+      { "fn": "mfPositive" }
+    ],
+    "stop": { "kind": "swing", "lookback": 10, "padAtr": 0.25 },
+    "target": { "kind": "rMultiple", "value": 2 },
+    "maxBars": 60,
+    "falsifier": "Money flow tested alone has no predictive power at all; if this beats the same rule without the money-flow term, the value is in the combination, and if it does not, drop it."
+  },
+  {
+    "name": "oversold dot alone - the control",
+    "dir": "long",
+    "timeframe": "4H",
+    "when": [
+      { "fn": "wtCrossUp" },
+      { "fn": "wt2Below", "value": -53 }
+    ],
+    "stop": { "kind": "swing", "lookback": 10, "padAtr": 0.25 },
+    "target": { "kind": "rMultiple", "value": 2 },
+    "maxBars": 60,
+    "falsifier": "This is the plain signal the bot already trades. Every other setup in this library has to beat it or it is adding complexity for nothing."
+  },
+  {
+    "name": "daily dot in a volatile market",
+    "dir": "long",
+    "timeframe": "1D",
+    "when": [
+      { "fn": "wtCrossUp" },
+      { "fn": "wt2Below", "value": -40 },
+      { "fn": "atrPctAbove", "value": 3 }
+    ],
+    "stop": { "kind": "atr", "mult": 2 },
+    "target": { "kind": "rMultiple", "value": 2.25 },
+    "maxBars": 40,
+    "falsifier": "If the volatility gate does nothing, this will score the same as the ungated daily dot; a lower trade count with no better expectancy means the filter is only shrinking the sample."
+  }
+]
