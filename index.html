@@ -788,6 +788,10 @@ header { background:rgba(38,38,36,0.92); border-bottom:1px solid rgba(255,255,25
 .setup-box, .settings-box, .kb-box, .qr-box { background:#2f2e2b; border:1px solid rgba(255,255,255,0.09); backdrop-filter:none; }
 #setup, #settings-panel, #qr-modal, #kb-panel, #log-panel, #scan-panel, #trades-panel, #macro-panel, #paper-panel, #lab-panel, #help-panel, #krown-panel { background:rgba(20,19,17,0.72); }
 
+/* Hidden by default so narrow screens never pay for it. Declared BEFORE the ≥1150px query below
+   so that query wins — the reverse order silently cancelled it. */
+#desk-dock { display:none; }
+
 /* ═══ Side rails (desktop ≥1150px) — tools left, live market right ═══ */
 #app.on { display:flex; }
 #left-rail, #right-rail { display:none; }
@@ -820,7 +824,13 @@ header { background:rgba(38,38,36,0.92); border-bottom:1px solid rgba(255,255,25
 .rail-note { font-size:10px; color:var(--dim); margin-top:10px; text-align:center; }
 .rail-empty { font-size:11px; color:var(--dim); padding:6px 10px; }
 /* Mobile/tablet tool menu: collapse the header tool buttons into one dropdown */
-header { position:relative; }
+/* z-index:45 is deliberate, not a magic number. Page content tops out at 40; every overlay and
+   modal starts at 50. 45 is the gap between them, so the tool dropdown clears the right-hand
+   cards (whose .fng-bar is positioned and sits later in the document, which is what was painting
+   over the menu) while still passing underneath every panel that is meant to cover the header.
+   Note this has to live on the HEADER, not on #h-actions: header has backdrop-filter, which makes
+   it a stacking context, so the menu's own z-index only ever applied inside it. */
+header { position:relative; z-index:45; }
 .menu-toggle { display:flex; align-items:center; justify-content:center; }
 #h-actions {
   position:absolute; top:calc(100% + 6px); right:12px; z-index:120;
@@ -832,48 +842,70 @@ header { position:relative; }
 #h-actions .icon-btn {
   width:100%; justify-content:flex-start; gap:10px; height:auto; min-height:42px;
   min-width:0; padding:10px 12px; font-size:14px; border-radius:10px;
+  /* var(--muted) is 64% opacity — fine for a 34px icon tucked in a header, too faint for a menu
+     row you are meant to read down. */
+  color:var(--text);
 }
 #h-actions .icon-btn[aria-label]::after { content:attr(aria-label); }
 
 @media (min-width:1150px) {
-  .menu-toggle { display:none; }
-  #app.on { display:grid; grid-template-columns:218px minmax(0,1fr) 274px; grid-template-rows:auto minmax(0,1fr) auto; }
+  /* ── 2026-08-23: the left rail is gone, the tools live in the header dropdown at every width ──
+     John: "this can just be a drop down menu, switch the chat at the bottom, put the accumulator
+     and the bot trades above the chat." The dropdown already existed for mobile and was simply
+     switched off up here — so this reuses it rather than building a second menu that would drift
+     out of step with the first. That frees the 218px column and widens the conversation.
+     Note .h-actions{display:none} is NOT restored: #h-actions carries its own display:none and
+     #h-actions.open (id+class) outranks it, which is what makes the dropdown work. */
+  #app.on { display:grid; grid-template-columns:minmax(0,1fr) 274px;
+            grid-template-rows:auto auto minmax(0,1fr); }
   header { grid-column:1/-1; grid-row:1; }
-  #left-rail { grid-column:1; grid-row:2; display:flex; flex-direction:column; gap:2px; padding:16px 10px;
-    border-right:1px solid rgba(255,255,255,0.06); overflow-y:auto; }
-  #chat-col { grid-column:2; grid-row:2; min-height:0; }
-  #right-rail { grid-column:3; grid-row:2; display:flex; flex-direction:column; padding:16px 14px;
+  #left-rail { display:none; }
+  /* The two scoreboards sit directly above the conversation; the market column runs full height
+     beside both, so the dock does not cut across it. */
+  #chat-col { grid-column:1; grid-row:3; min-height:0; }
+  #right-rail { grid-column:2; grid-row:2 / -1; display:flex; flex-direction:column; padding:16px 14px;
     border-left:1px solid rgba(255,255,255,0.06); overflow-y:auto; }
-  .h-actions { display:none; } /* tools live in the left rail on desktop */
   /* The dock takes its OWN row rather than floating over the chat — the composer is the one
      control that must never be covered, and a fixed bar would sit right on it. */
-  #desk-dock { grid-column:1/-1; grid-row:3; display:flex; gap:8px; padding:8px 12px 10px;
-    border-top:1px solid rgba(255,255,255,0.07); }
+  #desk-dock { grid-column:1; grid-row:2; display:flex; gap:9px; padding:10px 12px 4px; }
   .kb-box { width:min(660px, calc(100% - 28px)); max-height:calc(100vh - var(--hdrh,58px) - 64px); }
   .scan-box { width:min(820px, calc(100% - 28px)) !important; max-height:calc(100vh - var(--hdrh,58px) - 64px) !important; }
 }
 
-/* ═══ The permanent dock (desktop ≥1150px) — accumulator + bot trades, always visible ═══ */
-/* Hidden by default so narrow screens never pay for it, and so a browser that never matches the
-   media query below simply behaves exactly as it did before this existed. */
-#desk-dock { display:none; }
+/* ═══ The permanent dock — accumulator + bot trades, always visible ═══ */
+/* NOTE the display:none for this lives ABOVE the ≥1150px media query, not here. Two rules for one
+   property in the wrong order is what made this invisible at every width the first time. */
 #desk-dock .dock-card {
-  flex:1 1 0; min-width:0; display:flex; flex-direction:column; gap:5px; cursor:pointer;
-  background:rgba(20,19,17,0.55); border:1px solid rgba(255,255,255,0.07); border-radius:9px;
-  padding:8px 11px; text-align:left; font-family:inherit; transition:border-color .15s, background .15s;
+  flex:1 1 0; min-width:0; display:flex; flex-direction:column; gap:6px; cursor:pointer;
+  /* A visible edge. The first version used a 7% white border on a near-black ground, which is
+     no edge at all — the cards dissolved into the page and read as loose text. */
+  background:rgba(255,255,255,0.028); border:1px solid rgba(255,255,255,0.11); border-radius:10px;
+  padding:9px 13px 10px; text-align:left; font-family:inherit;
+  /* A <button> does NOT inherit colour — it takes the browser's own near-black button text unless
+     told otherwise. .dk-v sets no colour of its own, so every headline number in the dock was
+     black on a near-black card. This one line is the whole "black writing" bug. */
+  color:var(--text);
+  transition:border-color .15s, background .15s;
 }
-#desk-dock .dock-card:hover { border-color:rgba(255,255,255,0.18); background:rgba(20,19,17,0.75); }
+#desk-dock .dock-card:hover { border-color:rgba(255,255,255,0.24); background:rgba(255,255,255,0.05); }
 #desk-dock .dock-head {
-  display:flex; align-items:baseline; justify-content:space-between; gap:8px;
-  font-size:10px; font-weight:700; letter-spacing:.5px; text-transform:uppercase; color:var(--muted);
+  display:flex; align-items:baseline; gap:9px; min-width:0;
+  font-size:10px; font-weight:700; letter-spacing:.6px; text-transform:uppercase; color:var(--muted);
 }
-#desk-dock .dock-open { font-size:9px; font-weight:500; letter-spacing:.3px; color:var(--dim); text-transform:none; }
-#desk-dock .dock-row { display:flex; gap:14px; flex-wrap:nowrap; overflow:hidden; }
-#desk-dock .dk { min-width:0; }
-#desk-dock .dk-l { font-size:9px; color:var(--dim); text-transform:uppercase; letter-spacing:.3px; white-space:nowrap; }
-#desk-dock .dk-v { font-size:15px; font-weight:700; line-height:1.25; white-space:nowrap;
-  font-variant-numeric:tabular-nums; }
-#desk-dock .dock-note { font-size:10px; color:var(--dim); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+/* The context line rides ALONGSIDE the title instead of taking a third row of its own — that row
+   was most of why the dock felt so tall for so little information. */
+#desk-dock .dock-sub { font-weight:400; letter-spacing:.1px; text-transform:none; font-size:10.5px;
+  color:var(--dim); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; min-width:0; }
+#desk-dock .dock-open { margin-left:auto; flex:0 0 auto; font-size:10px; font-weight:500;
+  letter-spacing:.2px; color:var(--dim); text-transform:none; }
+/* Fixed-basis columns so the numbers line up and stop drifting apart across the card. */
+#desk-dock .dock-row { display:flex; gap:6px; }
+#desk-dock .dk { flex:0 1 auto; min-width:0; padding-right:10px; }
+#desk-dock .dk + .dk { border-left:1px solid rgba(255,255,255,0.07); padding-left:10px; }
+#desk-dock .dk-v { font-size:16px; font-weight:700; line-height:1.15; white-space:nowrap;
+  font-variant-numeric:tabular-nums; letter-spacing:-.2px; }
+#desk-dock .dk-l { font-size:9px; color:var(--dim); text-transform:uppercase; letter-spacing:.35px;
+  white-space:nowrap; margin-top:2px; }
 
 /* ── Mobile / narrow screens ── */
 @media (max-width: 640px) {
@@ -1036,6 +1068,7 @@ body.layout-edit #layout-bar { display:flex; flex-wrap:wrap; justify-content:cen
         <button class="icon-btn txt-btn" onclick="toggleMacro()" title="US economic calendar & data">MACRO</button>
         <button class="icon-btn txt-btn" onclick="toggleLab()" title="Pattern discovery lab">LAB</button>
         <button class="icon-btn txt-btn" onclick="toggleHelp()" title="How everything works">HELP</button>
+        <button class="icon-btn txt-btn" onclick="toggleSpend()" title="What the API is costing">API SPEND</button>
         <button class="icon-btn txt-btn layout-toggle-btn" id="layout-edit-btn" onclick="toggleLayoutEdit()" title="Drag & resize any box to design your own layout">LAYOUT</button>
         <button class="icon-btn" onclick="toggleSettings()" title="Settings" aria-label="Settings"><svg class="lic" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg></button>
       </div>
@@ -1134,6 +1167,18 @@ body.layout-edit #layout-bar { display:flex; flex-wrap:wrap; justify-content:cen
     </div>
   </div>
   </div>
+
+<!-- ══ PERMANENT DOCK — the two scoreboards John checks most, no click required ══ -->
+<div id="desk-dock">
+  <button class="dock-card" id="dock-accum" onclick="toggleAccum()" title="Open the full accumulator panel">
+    <div class="dock-head"><span>Accumulator</span><span class="dock-open">open ›</span></div>
+    <div class="dock-row"><span class="dk"><span class="dk-l">reading…</span></span></div>
+  </button>
+  <button class="dock-card" id="dock-bot" onclick="toggleBot()" title="Open the full Bot Trades panel">
+    <div class="dock-head"><span>Bot trades</span><span class="dock-open">open ›</span></div>
+    <div class="dock-row"><span class="dk"><span class="dk-l">reading…</span></span></div>
+  </button>
+</div>
 
 </div>
 
@@ -1431,18 +1476,6 @@ body.layout-edit #layout-bar { display:flex; flex-wrap:wrap; justify-content:cen
     </div>
     <div id="spend-body"></div>
   </div>
-</div>
-
-<!-- ══ PERMANENT DOCK — the two scoreboards John checks most, no click required ══ -->
-<div id="desk-dock">
-  <button class="dock-card" id="dock-accum" onclick="toggleAccum()" title="Open the full accumulator panel">
-    <div class="dock-head"><span>Accumulator</span><span class="dock-open">open ›</span></div>
-    <div class="dock-row"><span class="dk"><span class="dk-l">reading…</span></span></div>
-  </button>
-  <button class="dock-card" id="dock-bot" onclick="toggleBot()" title="Open the full Bot Trades panel">
-    <div class="dock-head"><span>Bot trades</span><span class="dock-open">open ›</span></div>
-    <div class="dock-row"><span class="dk"><span class="dk-l">reading…</span></span></div>
-  </button>
 </div>
 
 <div id="accum-panel-shell" onclick="if(event.target===this) toggleAccum()">
@@ -3051,7 +3084,13 @@ function closeQROutside(e) {
 // ═══════════════════════════ SETTINGS ═══════════════════════════
 // Model routing: 'smart' = deep-analysis model (chart reads/verdicts); 'light' = cheap model for mechanical jobs.
 // Build stamp — bump on every deploy so "which version am I running?" has a true answer.
-const APP_BUILD = 'v4.4 · 23 Aug 2026 · accumulator and bot trades are now a permanent bottom dock on desktop rather than panels you have to open — same numbers as the panels behind them, from the same tallyLog call, so the two cannot disagree; second accumulator books can be run measure-only on other coins from the accumulator panel; and a resolution now records WHICH market graded it, because the bot trades on Phemex and was being graded against Binance'
+// ── THE PILL USED TO CARRY ITS OWN HARDCODED VERSION (2026-08-23) ────────────────────────────
+// The corner pill said "v3.4" — a literal string frozen months ago while APP_BUILD moved on. On
+// 23 Aug it cost an hour: John read v3.4 off the pill and reasonably concluded he had an old file,
+// so we chased caches, GitHub, Netlify and his filesystem while the copy in front of him was
+// already current. A version number that is written down twice will eventually disagree with
+// itself, and the wrong one is always the one someone reads. Derived from APP_BUILD now, once.
+const APP_BUILD = 'v4.6 · 24 Aug 2026 · a dot-flip timeframe no longer un-arms itself when its candles fail to arrive (a failed fetch was being handled as though you had switched it off), and the timeframe chips now stay lit on what you ASKED for — amber until the bot confirms it, blue once it is really trading; the tool menu now paints over the right-hand cards instead of under them (the header has a backdrop-filter, which quietly trapped the menu inside its own stacking context), and the dock numbers are no longer the browser default black-on-black — a <button> does not inherit colour; accumulator and bot trades are now a permanent bottom dock on desktop rather than panels you have to open — same numbers as the panels behind them, from the same tallyLog call, so the two cannot disagree; second accumulator books can be run measure-only on other coins from the accumulator panel; and a resolution now records WHICH market graded it, because the bot trades on Phemex and was being graded against Binance'
 // ── STALE PAGE GUARD (2026-08-21) ────────────────────────────────────────────────────────────
 // GitHub Pages sets a cache header on index.html, and a phone with this saved to its home screen
 // will hold that copy for days. On 2026-08-21 John reported two bugs — "sells 0 / buy-backs 0"
@@ -3947,6 +3986,7 @@ document.addEventListener('visibilitychange', () => { if (!document.hidden) clou
 // Keep paper-trade results fresh while the app is open (every 30 min) + once on load.
 
 // ═══════════════════════════ KNOWLEDGE BASE ═══════════════════════════
+const APP_VER = (APP_BUILD.match(/^v[\d.]+/) || ['v?'])[0];   // just "v4.4", for the pill
 const KB_VERSION = '8';   // 8 = research brief added 2026-08-16
 function mergeKB() {
   const storedVer = localStorage.getItem('mc_kb_ver');
@@ -5328,7 +5368,7 @@ async function send() {
     input.value = ''; grow(input);
     addUserMsg('/feed', []);
     let dbg = '';
-    try { dbg = 'BUILD: v3.4-bot · thread length: ' + history.length + ' msgs\n\nPROMPT HEAD (what the model reads FIRST):\n' + buildSystemPrompt('feed check').slice(0, 400) + '…\n\nSELF-KNOWLEDGE BLOCK: ' + (appSelfContext().length + ' chars, attached ✓') + '\n\n' + botContext(); } catch (e) { dbg = 'FEED BROKEN: ' + (e && e.message || e); }
+    try { dbg = 'BUILD: ' + APP_BUILD.split(' ·')[0] + ' · thread length: ' + history.length + ' msgs\n\nPROMPT HEAD (what the model reads FIRST):\n' + buildSystemPrompt('feed check').slice(0, 400) + '…\n\nSELF-KNOWLEDGE BLOCK: ' + (appSelfContext().length + ' chars, attached ✓') + '\n\n' + botContext(); } catch (e) { dbg = 'FEED BROKEN: ' + (e && e.message || e); }
     addAIMsg('**Feed check (local, no API call)** — this is what gets attached to every chat message:\n\n' + (dbg || '(empty — feed broken)'));
     return;
   }
@@ -9864,7 +9904,7 @@ document.addEventListener('click', function(e){
     let el=document.getElementById('cipherExecPill');
     if(!el){ el=document.createElement('div'); el.id='cipherExecPill'; el.style.cssText='position:fixed;bottom:14px;right:14px;z-index:99999;font:11px/1.4 ui-monospace,monospace;background:#111;color:#ddd;border:1px solid #333;border-radius:8px;padding:6px 8px;display:flex;gap:8px;align-items:center;opacity:.9'; document.body.appendChild(el); }
     const mode=get(LS.mode,'off'); const dot=mode==='armed'?'●':mode==='dry'?'◐':'○';
-    el.innerHTML='<span id="cipherExecOpen" style="letter-spacing:.05em;cursor:pointer" title="Open Bot Trades">EXEC '+dot+' '+mode.toUpperCase()+' <span style="color:#666">v3.4</span></span>'+
+    el.innerHTML='<span id="cipherExecOpen" style="letter-spacing:.05em;cursor:pointer" title="Open Bot Trades">EXEC '+dot+' '+mode.toUpperCase()+' <span style="color:#666" title="app build">'+APP_VER+'</span></span>'+
       '<button id="cipherExecTest" style="background:none;border:1px solid #444;color:#8bd;border-radius:5px;padding:1px 6px;cursor:pointer">test</button>'+
       '<button id="cipherExecCycle" style="background:none;border:1px solid #444;color:#bbb;border-radius:5px;padding:1px 6px;cursor:pointer">mode</button>'+
       '';   // the pill's old KILL is gone (2026-08-15) — it stopped only the app's own exec and
@@ -10369,7 +10409,14 @@ document.addEventListener('click', function(e){
     // to the pump ladder, which is the default and how this worked before the toggles existed.
     const ORDER=['5m','15m','30m','1H','2H','3H','4H','1D'];
     const lfv = a.liveFlip || {};
-    const liveTf = lfv.tf || null;
+    // ── WHAT IS RUNNING vs WHAT WAS ASKED FOR ────────────────────────────────────────────────
+    // liveFlip.tf is null whenever the flip is blocked — including the ordinary, possibly
+    // days-long case of "waiting for the resting ladder rungs to fill". Painting the chips from
+    // tf alone meant the highlight snapped back to OFF on the next refresh and the setting looked
+    // like it had been rejected. It never was. So the REQUESTED timeframe stays lit, and the two
+    // states are told apart by colour rather than by one of them being invisible.
+    const liveTf = lfv.tf || lfv.want || null;
+    const tfPending = !lfv.tf && !!lfv.want;
 
     h += '<div style="font-size:11px;font-weight:700;color:var(--muted);margin:12px 0 6px;">DOT FLIP — WHICH TIMEFRAME TRADES THE REAL COINS</div>';
     // These have to LOOK pressable. The first version drew them as bare text on a dark panel and
@@ -10378,9 +10425,12 @@ document.addEventListener('click', function(e){
     const chip = (label, tf, on) =>
       '<button class="flip-tf" data-tf="'+esc(tf)+'" onclick="setFlipTf(\''+esc(tf)+'\')" '
       + 'style="flex:0 0 auto;padding:9px 15px;font-size:13px;cursor:pointer;border-radius:6px;'
-      + 'border:1px solid '+(on?'#8bd':'#4a4a4a')+';'
-      + 'background:'+(on?'rgba(136,187,221,0.20)':'rgba(255,255,255,0.07)')+';'
-      + 'color:'+(on?'#8bd':'#cfcfcf')+';font-weight:'+(on?'700':'500')+';">'+esc(label)+'</button>';
+      // Blue = this timeframe is trading the real coins. Amber = this is what you asked for and
+      // it has not started yet. Both are "selected"; only one of them is live, and a panel that
+      // showed them the same way would be claiming something untrue.
+      + 'border:1px solid '+(on?(tfPending?'#e8c07a':'#8bd'):'#4a4a4a')+';'
+      + 'background:'+(on?(tfPending?'rgba(232,192,122,0.18)':'rgba(136,187,221,0.20)'):'rgba(255,255,255,0.07)')+';'
+      + 'color:'+(on?(tfPending?'#e8c07a':'#8bd'):'#cfcfcf')+';font-weight:'+(on?'700':'500')+';">'+esc(label)+'</button>';
 
     h += '<div style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:8px;">';
     h += chip('OFF', 'off', !liveTf);
@@ -10872,35 +10922,48 @@ document.addEventListener('click', function(e){
   function renderDock(st){
     const A = document.getElementById('dock-accum'), B = document.getElementById('dock-bot');
     if(!A || !B) return;
-    const cell = (label, value, colour, cls) =>
-      '<span class="dk"><span class="dk-l">'+esc(label)+'</span>'
-      + '<div class="dk-v"'+(colour?' style="color:'+colour+';"':'')+'>'+value+'</div></span>';
-    const head = (title, extra) =>
-      '<div class="dock-head"><span>'+title+'</span><span class="dock-open">'+(extra||'open ›')+'</span></div>';
+    const cell = (label, value, colour) =>
+      '<span class="dk"><div class="dk-v"'+(colour?' style="color:'+colour+';"':'')+'>'+value+'</div>'
+      + '<div class="dk-l">'+esc(label)+'</div></span>';
+    const head = (title, sub, right) =>
+      '<div class="dock-head"><span>'+title+'</span>'
+      + (sub ? '<span class="dock-sub">'+esc(sub)+'</span>' : '')
+      + '<span class="dock-open">'+esc(right||'open')+' ›</span></div>';
 
     // ── ACCUMULATOR — counted in coins, never in pounds ──────────────────────────────────────
     try{
       const a = (st && st.cipher_accum) || null;
       if(!a){
-        A.innerHTML = head('Accumulator') + '<div class="dock-note">not read yet</div>';
+        A.innerHTML = head('Accumulator', 'not read yet');
       } else {
         const u = Number(a.unitsNow), s0 = Number(a.startUnits);
         const g = (u > 0 && s0 > 0) ? (u/s0 - 1) * 100 : null;
         const col = g === null ? 'var(--dim)' : g > 0 ? '#9c9' : g < 0 ? '#e88' : 'var(--muted)';
         const lf = a.liveFlip || {};
-        const holder = lf.blocked ? 'flip blocked' : lf.tf ? (lf.tf + ' dot flip') : 'pump ladder';
-        const resting = Array.isArray(a.open) ? a.open.length : 0;
-        A.innerHTML = head('Accumulator', (a.exec === 'armed' ? 'armed · ' : 'measure only · ') + 'open ›')
-          + '<div class="dock-row">'
-          + cell('vs hold', g === null ? '—' : (g >= 0 ? '+' : '') + g.toFixed(2) + '%', col)
-          + cell('coins', Number.isFinite(u) ? u.toFixed(6) : '—')
-          + cell('sells', a.sells || 0)
-          + cell('buy-backs', a.fills || 0)
-          + cell('resting', resting, resting ? '#e8c07a' : null)
-          + '</div>'
-          + '<div class="dock-note">' + esc(holder) + ' holds the coins</div>';
+        // ── WHICHEVER BOOK IS DRIVING IS THE ONE TO COUNT (2026-08-23) ───────────────────────
+        // The first version always read a.sells / a.fills — the LADDER's counters. With the 1H dot
+        // flip holding the coins the ladder is stood down, so the dock showed 0 sells / 0 buy-backs
+        // while the panel two inches away said 2 and 2, reading the flip's own book. Two views of
+        // one number disagreeing on screen is exactly what this dock was not supposed to do.
+        const flipDriving = !!lf.tf && !lf.blocked;
+        const sells = flipDriving ? (lf.sells || 0) : (a.sells || 0);
+        const backs = flipDriving ? (lf.trips || 0) : (a.fills || 0);
+        const sub = lf.blocked ? 'flip blocked — ladder holds the coins'
+                  : flipDriving ? lf.tf + ' dot flip holds the coins'
+                                : 'pump ladder holds the coins';
+        let row = cell('vs hold', g === null ? '—' : (g >= 0 ? '+' : '') + g.toFixed(2) + '%', col)
+                + cell('coins', Number.isFinite(u) ? u.toFixed(6) : '—')
+                + cell('sells', sells)
+                + cell(flipDriving ? 'round trips' : 'buy-backs', backs);
+        // Resting rungs only mean something while the ladder is the one trading.
+        if(!flipDriving){
+          const resting = Array.isArray(a.open) ? a.open.length : 0;
+          row += cell('resting', resting, resting ? '#e8c07a' : null);
+        }
+        A.innerHTML = head('Accumulator', sub, a.exec === 'armed' ? 'armed' : 'measure only')
+                    + '<div class="dock-row">' + row + '</div>';
       }
-    }catch(e){ A.innerHTML = head('Accumulator') + '<div class="dock-note">unavailable</div>'; }
+    }catch(e){ A.innerHTML = head('Accumulator', 'unavailable'); }
 
     // ── BOT TRADES — the graded record, and what is NOT in it ────────────────────────────────
     try{
@@ -10911,15 +10974,12 @@ document.addEventListener('click', function(e){
       const openN = st && st.cipher_open ? Object.keys(st.cipher_open).length : 0;
       const rate = t.graded ? (t.wins / t.graded * 100) : null;
       const rCol = t.R > 0 ? '#9c9' : t.R < 0 ? '#e88' : 'var(--muted)';
-      // The not-counted total is shown next to the record on purpose. It was 31 against 6 graded
-      // on 2026-08-22, and a win rate quoted without it is the most misleading number on the app.
-      //
-      // artifacts + rejected, and NOT + unseen: `unseen` is a SUBSET of artifacts, incremented
-      // inside the same branch, so adding it double-counts. The first version of this line did
-      // exactly that and would have shown a bigger total than the panel behind it — the precise
-      // disagreement this dock is supposed to be incapable of. Matches the panel's own formula.
+      // artifacts + rejected — the panel's own formula. NOT + unseen: unseen is a subset of
+      // artifacts and adding it double-counts.
       const notCounted = (t.artifacts || 0) + (t.rejected || 0);
-      B.innerHTML = head('Bot trades', (openN ? openN + ' open · ' : '') + 'open ›')
+      B.innerHTML = head('Bot trades',
+                         notCounted ? notCounted + ' resolutions it could not grade' : 'every resolution graded',
+                         openN ? openN + ' open' : 'open')
         + '<div class="dock-row">'
         + cell('graded', t.graded, t.graded ? null : 'var(--dim)')
         + cell('w / l', (t.wins||0) + ' / ' + (t.losses||0))
@@ -10927,11 +10987,8 @@ document.addEventListener('click', function(e){
                rate === null ? 'var(--dim)' : rate >= 50 ? '#9c9' : '#e88')
         + cell('total R', (t.R >= 0 ? '+' : '') + (Number(t.R)||0).toFixed(2), rCol)
         + cell('not counted', notCounted, notCounted ? '#e8c07a' : null)
-        + '</div>'
-        + '<div class="dock-note">' + (notCounted
-            ? esc(notCounted + ' resolutions the bot could not grade — not in the win rate')
-            : 'every resolution graded') + '</div>';
-    }catch(e){ B.innerHTML = head('Bot trades') + '<div class="dock-note">unavailable</div>'; }
+        + '</div>';
+    }catch(e){ B.innerHTML = head('Bot trades', 'unavailable'); }
   }
   window.renderDock = renderDock;
 
@@ -10967,11 +11024,14 @@ document.addEventListener('click', function(e){
       // Repaint the buttons from what the relay actually holds, not from what was tapped. The
       // agent-state read is deliberately NOT refreshed here: it will not know about this until
       // the bot has run, and showing it as live before then would be a lie.
+      // Amber, not blue: the relay has accepted this, but nothing is live until the bot's next
+      // run confirms it. Painting it blue here would promise something that has not happened yet.
+      const pend = got !== 'off';
       document.querySelectorAll('.flip-tf').forEach(b=>{
         const on = b.getAttribute('data-tf') === got;
-        b.style.borderColor = on ? '#8bd' : '#4a4a4a';
-        b.style.background  = on ? 'rgba(136,187,221,0.20)' : 'rgba(255,255,255,0.07)';
-        b.style.color       = on ? '#8bd' : '#cfcfcf';
+        b.style.borderColor = on ? (pend?'#e8c07a':'#8bd') : '#4a4a4a';
+        b.style.background  = on ? (pend?'rgba(232,192,122,0.18)':'rgba(136,187,221,0.20)') : 'rgba(255,255,255,0.07)';
+        b.style.color       = on ? (pend?'#e8c07a':'#8bd') : '#cfcfcf';
         b.style.fontWeight  = on ? '700' : '500';
       });
     }catch(e){ say(String(e && e.message || e), true); }
