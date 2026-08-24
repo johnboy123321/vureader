@@ -64,14 +64,24 @@ console.log('\n4. Veto candidates: persistence, not the circular "losses lose"')
 }
 console.log('\n5. The brain can never reach an order, a size, or a stop');
 {
+  // Slice to the section that actually FOLLOWS the brain module. The previous end marker moved
+  // above this block in a 2026-08-19 reorder, which made indexOf return -1 and silently widened
+  // the slice to the whole rest of the file. The length guard catches that class of mistake.
   const brainStart=src.indexOf('THE SERVER-SIDE BRAIN');
-  const brainEnd=src.indexOf('// Bull or bear, from BTC', brainStart);
-  const block=src.slice(brainStart, brainEnd);
+  const brainEnd=src.indexOf('Cause \u2192 veto candidate', brainStart);
+  const block=src.slice(brainStart, brainEnd > brainStart ? brainEnd : undefined);
+  ok('the brain slice is sane (guards against a reorder)', block.length > 500 && block.length < 12000, block.length);
   ok('the brain module exists', block.length>500);
   ok('no order function anywhere in it', !/execOrder|directOrder|buildOrder|cancelOrder|closeOrderFor|rememberResting/.test(block));
   const runBlock=src.slice(src.indexOf("THE BRAIN'S EYES"), src.indexOf('brain autopsy failed'));
   ok('the run-loop pass only stamps labels', !/execOrder|directOrder|buildOrder\(|planValid/.test(runBlock));
-  ok('no key = silently off, with the backlog stated', /no ANTHROPIC_API_KEY secret set, brain is off/.test(runBlock));
+  // Wording changed 2026-08-24 when the brain stopped being welded to Anthropic — the PROPERTY is
+  // the same and is what this asserts: no brain configured means silently off, with the backlog
+  // stated and both ways of switching it on named.
+  ok('no brain = silently off, with the backlog stated',
+     /no brain configured/.test(runBlock) && /unread loss\(es\) waiting/.test(runBlock));
+  ok('and the message says how to turn it on, either provider',
+     /Set ANTHROPIC_API_KEY, or BRAIN_BASE_URL \+ BRAIN_API_KEY/.test(runBlock));
   ok('budget is checked BEFORE the call', runBlock.indexOf('brainBudget(bSlot, Date.now(), null)') < runBlock.indexOf('brainCall('));
   ok('one batched call per run, not one per loss', (runBlock.match(/brainCall\(/g)||[]).length===1);
   ok('candidates are logged as advisory', /must be written as a mechanical rule and win a shadow arm/.test(runBlock));
