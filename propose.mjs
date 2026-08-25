@@ -29,8 +29,13 @@ import fs from 'node:fs';
 import { scoreSetup, report, BASELINE_R } from './score.mjs';
 import { validateSetup, vocabularyForPrompt } from './schema.mjs';
 
-const STORE = 'setup-lab/survivors.json';
-const JOURNAL = 'setup-lab/journal.json';       // everything tried, and why it failed
+// Written next to THIS file, whichever layout it ended up in — a folder, or loose in the repo
+// root. Deriving the path from import.meta.url rather than the working directory means the store
+// cannot end up somewhere the reader is not looking, which is the failure that leaves a working
+// generator and a permanently empty arm.
+const HERE = new URL('.', import.meta.url).pathname;
+const STORE = HERE + 'survivors.json';
+const JOURNAL = HERE + 'journal.json';          // everything tried, and why it failed
 const N_PER_RUN = Number(process.env.SETUPS_PER_RUN || 10);
 
 const env = (k, d = '') => (process.env[k] ?? d);

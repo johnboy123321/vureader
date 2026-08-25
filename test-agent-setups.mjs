@@ -17,7 +17,16 @@ const ok=(n,c,x)=>{c?(pass++,console.log('  ok   '+n)):(fail++,console.log('  FA
 console.log('\n1. It loads, and copes with not being there');
 ok('there is a loader', /async function setupLab\(\)/.test(src));
 ok('the lab is imported dynamically, so the agent stays a single file',
-   /await import\("\.\/setup-lab\/engine\.mjs"\)/.test(src));
+   /await import\(dir \+ "engine\.mjs"\)/.test(src));
+// A web upload of a folder does not reliably produce a folder — John's landed loose in the repo
+// root. A hardcoded path fails INSIDE the catch, so the arm would have stayed dark with nothing
+// in the log to explain it. Both layouts, and it says which one it found.
+ok('both layouts are tried', /for \(const dir of \["\.\/setup-lab\/", "\.\/"\]\)/.test(src));
+ok('survivors.json is looked for in both places too',
+   /for \(const f of \["setup-lab\/survivors\.json", "survivors\.json"\]\)/.test(src));
+ok('and finding neither is reported, not swallowed',
+   /engine\.mjs not found in setup-lab\/ or the repo root/.test(src));
+ok('it says where it loaded from', /setup lab: loaded from \$\{from\}/.test(src));
 ok('a missing lab is the quiet normal case, not an error',
    /Cannot find module\|ENOENT/.test(src));
 ok('it is loaded once per run, not once per coin', /if \(_setupLab !== undefined\) return _setupLab;/.test(src));

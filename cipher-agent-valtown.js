@@ -1277,6 +1277,16 @@ const OPEN_KEY = "cipher_open", PRIORITY_KEY = "cipher_priority";
 
 // Snapshot what we are holding, with the plan that opened it, so the next run can tell what
 // happened to it. Keyed the same way as the book map.
+// 0 is Phemex's "unset", and an absent field must stay undefined so the caller can tell "no stop"
+// from "could not read one". Any other falsy or negative value is treated as unreadable too — a
+// stop of -1 is not a stop, and guessing at it is how this bug happened in the first place.
+function venuePx(v) {
+  if (v === undefined || v === null || v === "") return undefined;
+  const n = Number(v);
+  if (!Number.isFinite(n)) return undefined;
+  return n > 0 ? n : null;                      // null = definitely none, undefined = cannot tell
+}
+
 function snapshotOpen(positions, bookMap, prev) {
   const out = {};
   for (const p of positions) {
@@ -1289,6 +1299,14 @@ function snapshotOpen(positions, bookMap, prev) {
                // the exchange's own average entry, so an adopted position can be graded against
                // the price it was really opened at rather than wherever price happens to be today
                avgEntry: +(p.avgEntryPriceRp ?? p.avgEntryPrice) || (prev && prev[k] && prev[k].avgEntry) || undefined,
+               // ── WHAT THE VENUE ITSELF IS HOLDING (2026-08-25) ──────────────────────────────
+               // Dropped on the floor until now, which is why the unprotected warning was able to
+               // announce "no stop at the venue" about a position Phemex was showing with a stop
+               // and a target on it. Phemex uses 0 for "unset", and different API generations name
+               // these Rp / Ep / plain, so read them all and treat only a real positive number as
+               // a stop. undefined means COULD NOT READ, which is not the same as none.
+               venueStop: venuePx(p.stopLossRp ?? p.stopLoss ?? p.stopLossEp),
+               venueTarget: venuePx(p.takeProfitRp ?? p.takeProfit ?? p.takeProfitEp),
                adopted: (prev && prev[k] && prev[k].adopted) || undefined };
   }
   return out;
@@ -1328,10 +1346,29 @@ async function adoptOrphans(nowOpen, bookMap) {
     // honest "I cannot size this". Refusing QUIETLY is what was wrong.
     if (!plan) {
       const notional = (Number(pos.size) || 0) * (Number(pos.avgEntry) || cur);
-      await pushLog({ coin: pos.coin, dir: pos.dir, result: "UNPROTECTED",
-        skipped: `held with no plan and none could be built from today's structure — the stop it needs is more than 3 ATR away. It has NO stop and NO target at the venue, it is not in any book, and it is blocking new ${pos.coin} trades in both books. Size ${pos.size} (~${notional.toFixed(0)} USDT). This bot did not open it — close it by hand, or give it a stop yourself.` });
-      console.error(`UNPROTECTED: ${pos.coin} ${pos.dir} size ${pos.size} (~${notional.toFixed(0)} USDT) — no plan could be built, no stop at the venue`);
-      pos.unprotected = true;
+      const size = `Size ${pos.size} (~${notional.toFixed(0)} USDT).`;
+      const blocks = `It is not in any book, so it is blocking new ${pos.coin} trades in both books.`;
+      const why = "held with no plan and none could be built from today's structure — the stop it needs is more than 3 ATR away.";
+      // Three different situations, three different sentences. The old message asserted the worst
+      // of them regardless, about a position the venue was holding a stop on.
+      const s = pos.venueStop, t = pos.venueTarget;
+      if (s === undefined) {
+        await pushLog({ coin: pos.coin, dir: pos.dir, result: "NO PLAN",
+          skipped: `${why} ${blocks} I could not read a stop from the venue for it either way, so I am not going to tell you it has none — check the position on Phemex. ${size}` });
+        console.log(`no plan: ${pos.coin} ${pos.dir} — venue stop unreadable, not claiming either way`);
+        pos.unprotected = true;      // still unmanaged BY THE BOT, which is what this flag means
+      } else if (s === null) {
+        await pushLog({ coin: pos.coin, dir: pos.dir, result: "UNPROTECTED",
+          skipped: `${why} It has NO stop at the venue${t === null ? " and no target" : ""}, and ${blocks.charAt(0).toLowerCase() + blocks.slice(1)} ${size} This bot did not open it — close it by hand, or give it a stop yourself.` });
+        console.error(`UNPROTECTED: ${pos.coin} ${pos.dir} size ${pos.size} (~${notional.toFixed(0)} USDT) — no plan, and NO stop at the venue`);
+        pos.unprotected = true;
+      } else {
+        // The common case, and the one that was being reported as an emergency.
+        await pushLog({ coin: pos.coin, dir: pos.dir, result: "NO PLAN",
+          skipped: `${why} The venue IS holding a stop at ${formatPrice(s)}${t ? ` and a target at ${formatPrice(t)}` : ""}, so it is not naked — but the bot is not managing it and ${blocks.charAt(0).toLowerCase() + blocks.slice(1)} ${size} Nothing needs doing urgently; close it or leave it.` });
+        console.log(`no plan: ${pos.coin} ${pos.dir} — venue holds a stop at ${formatPrice(s)}, not flagged as unprotected`);
+        pos.unprotected = false;     // it has a stop; do not put it in the red box
+      }
       continue;
     }
     const ref = Number.isFinite(pos.avgEntry) && pos.avgEntry > 0 ? pos.avgEntry : cur;
@@ -3345,8 +3382,20 @@ async function setupLab() {
   _setupLab = null;
   try {
     // Dynamic, so the agent stays a single file that runs with or without the lab beside it.
-    const eng = await import("./setup-lab/engine.mjs");
-    const raw = JSON.parse(fs.readFileSync("setup-lab/survivors.json", "utf8"));
+    // TWO LAYOUTS, because uploading a folder through a web UI does not always produce a folder:
+    // the lab may sit in setup-lab/, or its files may have landed loose in the repo root. A hard-
+    // coded path would have failed silently here — the import throws, the catch swallows it, and
+    // the whole arm stays dark with nothing in the log to say why. So try both and say which won.
+    let eng = null, from = null;
+    for (const dir of ["./setup-lab/", "./"]) {
+      try { eng = await import(dir + "engine.mjs"); from = dir; break; } catch {}
+    }
+    if (!eng) { console.log("setup lab: engine.mjs not found in setup-lab/ or the repo root — arm is off"); return _setupLab; }
+    let raw = null;
+    for (const f of ["setup-lab/survivors.json", "survivors.json"]) {
+      try { raw = JSON.parse(fs.readFileSync(f, "utf8")); break; } catch {}
+    }
+    console.log(`setup lab: loaded from ${from}`);
     if (!Array.isArray(raw) || !raw.length) { console.log("setup lab: no survivors stored yet"); return _setupLab; }
     // A rule using a condition this engine cannot compute would evaluate to false everywhere,
     // which reads as "never fired" and is indistinguishable from a setup that simply does not

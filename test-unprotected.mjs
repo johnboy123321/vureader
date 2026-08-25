@@ -12,7 +12,23 @@ ok('a failed adoption is no longer a bare continue',
    !/const plan = buildTradePlan\(bars, pos\.dir, cur\);\s*\n\s*if \(!plan\) continue;/.test(src));
 ok('it logs an UNPROTECTED decision', /result: "UNPROTECTED"/.test(src));
 ok('the log names the size and notional', /Size \$\{pos\.size\} \(~\$\{notional\.toFixed\(0\)\} USDT\)/.test(src));
-ok('it says there is no stop at the venue', /NO stop and NO target at the venue/.test(src));
+// ── CHANGED 2026-08-25: IT MAY ONLY SAY THAT WHEN IT IS TRUE ─────────────────────────────────
+// The old assertion demanded the message always claim "NO stop and NO target at the venue". That
+// sentence was never checked against the venue — snapshotOpen dropped the stopLoss field — and on
+// 2026-08-25 the panel said it about an ETH long that Phemex was showing with TP/SL 2551.76 /
+// 2376.1. A warning that cries wolf spends the attention the real ones need, and this one told
+// John to go and set a stop on a position that already had one.
+ok('it says there is no stop only when the venue says there is no stop',
+   /if \(s === null\) \{[\s\S]{0,400}It has NO stop at the venue/.test(src));
+ok('a venue stop it CAN see is reported as such, not as an emergency',
+   /The venue IS holding a stop at \$\{formatPrice\(s\)\}/.test(src));
+ok('and that case is not flagged unprotected', /pos\.unprotected = false;\s+\/\/ it has a stop/.test(src));
+ok('an unreadable stop is stated as unreadable, never as absent',
+   /I could not read a stop from the venue for it either way/.test(src));
+ok('the venue fields are actually carried through the snapshot',
+   /venueStop: venuePx\(p\.stopLossRp \?\? p\.stopLoss \?\? p\.stopLossEp\)/.test(src));
+ok('0 means none and a missing field means unknown — they are different',
+   /return n > 0 \? n : null;\s+\/\/ null = definitely none, undefined = cannot tell/.test(src));
 ok('it says the position blocks other trades in that coin', /blocking new \$\{pos\.coin\} trades in both books/.test(src));
 ok('it says the bot did not open it', /This bot did not open it/.test(src));
 ok('it still refuses to invent a plan', /continue;/.test(src) && !/plan = \{ *entry: cur, *stop: cur/.test(src));
