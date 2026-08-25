@@ -150,7 +150,13 @@ console.log('\n11. THE DE-HEDGE no longer reports a failure as a success');
 {
   const i = src.indexOf('A FAILED CLOSE MUST NOT REPORT ITSELF AS A CLOSE');
   ok('the fix is present', i > 0);
-  const blk = src.slice(i, i + 2200);
+  // Anchored on the function's REAL end, not on a character count. The first version sliced a
+  // fixed 2,200 characters, so when the give-up logic was added in the middle, four assertions
+  // silently fell off the end of the window and went red on code that was perfectly correct.
+  // A test whose scope is a magic number is a test that breaks when the file breathes.
+  const end = src.indexOf('═══════════════ CIRCUIT BREAKER', i);
+  const blk = src.slice(i, end > i ? end : i + 2200);
+  ok('the de-hedge block was located by its own boundary, not a byte count', end > i, end);
   ok('failure has its own result label', /result: ok \? "DE-HEDGED" : "DE-HEDGE FAILED"/.test(blk));
   ok('it is no longer labelled ERR, which parsed as a venue rejection', !/ERR de-hedge/.test(src));
   ok('a failure says the position is STILL hedged', /is STILL holding both sides/.test(blk));
@@ -159,6 +165,67 @@ console.log('\n11. THE DE-HEDGE no longer reports a failure as a success');
   ok('and from a thrown error too', /catch \(e\) \{ ok = false; why = String\(e && e\.message \|\| e\)/.test(blk));
   ok('it never counts toward the strategy record either way', /countsForStats: false/.test(blk));
   ok('and it tells you it will retry rather than implying it is done', /retried next run/.test(blk));
+}
+
+console.log('\n11b. A de-hedge that CANNOT work stops asking (2026-08-25)');
+{
+  // Found on John's exchange screen: ADA, ETH and XRP each holding both sides, the short leg a
+  // tenth to a thirtieth the size of the long. Those are stubs left by an IOC market close that
+  // partially filled — below the venue's minimum order size, so no number of retries can clear
+  // them, and the bot was asking again every fifteen minutes for ever.
+  ok('there is a persisted memory of what the venue refused', /const DEHEDGE_KEY = "cipher_dehedge_failed"/.test(src));
+  ok('it gives up after a fixed count rather than a timeout', /const DEHEDGE_GIVE_UP = 3;/.test(src));
+  ok('a leg already refused that many times is skipped without another order',
+     /\(prevFail\.n \|\| 0\) >= DEHEDGE_GIVE_UP\) \{\s*\n\s*out\.givenUp\+\+;\s*\n\s*continue;/.test(src));
+  // The key includes the SIZE, so a leg that changed — meaning something did work — gets another
+  // go. Giving up permanently on a leg that is still moving would be the opposite failure.
+  ok('the memory is keyed on the size, so a change earns another attempt',
+     /failed\[legKey\] = \{ n, size: legSize, why, at: Date\.now\(\) \}/.test(src) &&
+     /prevFail\.size !== legSize\) \{ delete failed\[legKey\]/.test(src));
+  ok('a successful close clears the record', /if \(ok\) \{ if \(failed\[legKey\]\) \{ delete failed\[legKey\]/.test(src));
+  ok('giving up is said ONCE, loudly, with the venue\'s own reason',
+     /DE-HEDGE GIVEN UP: \$\{sym\}/.test(src) && /Venue says: \$\{why/.test(src));
+  ok('and the ledger line tells John exactly what to do about it',
+     /Close it by hand on the exchange; it takes one click/.test(src));
+  ok('it still never counts toward the strategy record',
+     /result: "DE-HEDGE GIVEN UP", countsForStats: false/.test(src));
+  ok('the run summary reports how many are waiting on a human',
+     /given up on \(waiting for you to close by hand\)/.test(src));
+  ok('the memory is only written when it changed — the state file is committed every run',
+     /if \(failedDirty\) \{ try \{ await setJSON\(DEHEDGE_KEY, failed\)/.test(src));
+}
+
+console.log('\n11c. The ladder arm measures, and only measures (2026-08-25)');
+{
+  // The one strategy with evidence behind it: +53.2% median vs holding across 12 coins at real
+  // fees, against −7.7% for the flip it varies. It runs as PAPER, because a three-year backtest
+  // is a filter and not proof.
+  ok('the ladder step exists', /function accumLadderStep\(state, bars, cfg = \{\}\)/.test(src));
+  ok('three spacings run at once, so a plateau can be told from a lucky setting',
+     /\{ id: "L3x4", rungs: 3, stepPct: 4 \}/.test(src) && /\{ id: "L2x5"/.test(src) && /\{ id: "L5x2"/.test(src));
+  ok('rungs are checked BEFORE the dots on the same bar',
+     /Rungs are checked BEFORE the dots on the same bar/.test(src));
+  ok('the green dot stays as a backstop, or it can strand in cash',
+     /else if \(green && st\.cash > 0\) \{[\s\S]{0,200}st\.cash = 0; st\.open = \[\]; st\.trips\+\+;/.test(src));
+  ok('a red dot replaces stale rungs rather than bidding an old level',
+     /Replace any stale bids/.test(src));
+  ok('it is marked back to COINS including cash still out in rungs',
+     /r\.st\.unitsNow = \+\(r\.st\.units \+ r\.st\.cash \/ lpx\)/.test(src));
+  ok('it reuses bars already fetched — no extra network', /const lbars = flipBars\["1D"\];/.test(src));
+  {
+    // The whole safety property: this arm can compute and print and nothing else.
+    // Anchored end again — see 11a. A byte count would have been wrong here too, and the block
+    // it needs to cover is exactly "from the banner to the catch that guards it".
+    const i = src.indexOf('THE LADDER ARMS (2026-08-25)');
+    const e = src.indexOf('ladder arms skipped (paper only, harmless)', i);
+    const blk = src.slice(i, e > i ? e + 60 : i + 2000);
+    ok('the ladder block was located by its own boundary', i > 0 && e > i, `${i}..${e}`);
+    ok('it places no orders', !/sendSpotOrder|execOrder|phemexCall|placeOrder/.test(blk));
+    ok('and one failure in it cannot take the accumulator down',
+     /catch \(e\) \{ console\.error\("ladder arms skipped \(paper only, harmless\)/.test(blk));
+  }
+  ok('it is printed against the 1D flip, the thing it would replace',
+     /vs flip 1D/.test(src));
 }
 
 console.log('\n12. The classifier still agrees with the bench rules');
