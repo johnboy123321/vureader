@@ -4533,7 +4533,7 @@ export default async function cipherAgent() {
   if (REGIME.label) console.log(`regime: ${REGIME.label} (BTC ${REGIME.distPct >= 0 ? "+" : ""}${REGIME.distPct}% vs its ${REGIME_MA}D average) — measured only, it filters nothing`);
 
   for (const coin of slice) {
-    if (Date.now() - started > 45000) {
+    if (Date.now() - started > num("SCAN_BUDGET_MS", 90000)) {
       console.log(`time budget reached — stopping early after ${consumed} of ${slice.length}; the cursor resumes here rather than skipping the rest`);
       break;
     }
@@ -4541,17 +4541,29 @@ export default async function cipherAgent() {
     if (!coin || NOT_CRYPTO.test(coin)) continue;
     scanned++;
 
-    // Confluence timeframes, keeping the candles so the detectors can reuse them.
+    // ── ALL FIVE TIMEFRAMES AT ONCE (2026-08-25) ─────────────────────────────────────────────
+    // These were five sequential awaits — about three seconds a coin, which is the whole reason
+    // the 45-second budget only ever reached 13 coins. They do not depend on each other, so
+    // there was never a reason to queue them.
+    //
+    // Promise.all is safe here specifically because fetchCandles NEVER throws: every failure path
+    // in it returns null. If that ever stops being true this needs allSettled, or one bad symbol
+    // takes the whole coin down.
+    const SCAN_TFS = ["1D", "4H", "1H", "30m", "15m"];
     const bars = {}, tfData = {};
-    for (const tf of ["1D", "4H", "1H"]) { bars[tf] = await fetchCandles(coin, tf, 260); tfData[tf] = analyzeTF(bars[tf]); }
+    const fetched = await Promise.all(SCAN_TFS.map(tf => fetchCandles(coin, tf, 260)));
+    SCAN_TFS.forEach((tf, k) => { bars[tf] = fetched[k]; });
+    // analyzeTF is pure CPU work on candles already in hand — it stays sequential because making
+    // it concurrent would buy nothing and only obscure the order.
+    for (const tf of ["1D", "4H", "1H"]) tfData[tf] = analyzeTF(bars[tf]);
     try { regimeBreadthTally(REGIME, bars["1D"]); } catch {}   // free: the candles are already here
-    // Detector-only timeframes — the BTC 30m top the app missed lived here.
-    for (const tf of ["30m", "15m"]) bars[tf] = await fetchCandles(coin, tf, 260);
 
     // ── THE DISCOVERED SETUPS, IN SHADOW ─────────────────────────────────────────────────────
     // Deliberately after the fetches, so it costs no extra network, and gated on the clock so it
-    // can never eat the coverage the rotation fix just bought back.
-    if (Date.now() - started < 30000) {
+    // can never eat the coverage the rotation fix just bought back. Two thirds of the budget,
+    // tracking it rather than a fixed number — a hardcoded 30s next to a configurable budget is
+    // the kind of pair that drifts apart and nobody notices.
+    if (Date.now() - started < num("SCAN_BUDGET_MS", 90000) * 0.67) {
       const lab = await setupLab();
       if (lab) _setupsFired += shadowDiscovered(lab, SHADOW, coin, bars,
         { reg: REGIME.label, regDist: REGIME.distPct, breadth: REGIME.breadth });

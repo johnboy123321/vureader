@@ -62,11 +62,23 @@ console.log('\n3. It records, and that is ALL it does');
 }
 
 console.log('\n4. It must not cost the scan its coverage');
-ok('the pass is skipped once the run is past 30s', /if \(Date\.now\(\) - started < 30000\) \{/.test(src));
+// Was a hardcoded 30s against a hardcoded 45s budget. Both are configurable now, and the gate
+// tracks the budget rather than restating a number — two magic numbers that have to agree are two
+// numbers that eventually will not.
+ok('the pass is gated on a fraction of the scan budget, not a magic number',
+   /if \(Date\.now\(\) - started < num\("SCAN_BUDGET_MS", 90000\) \* 0\.67\) \{/.test(src));
+ok('and the budget itself is configurable', /num\("SCAN_BUDGET_MS", 90000\)/.test(src));
 ok('and it says so rather than going quiet', /the scan used its time budget on coverage, which comes first/.test(src));
-ok('it reuses bars already fetched — no extra network',
-   src.indexOf('for (const tf of ["30m", "15m"]) bars[tf] = await fetchCandles') <
-   src.indexOf('_setupsFired += shadowDiscovered'));
+{
+  // This anchored on the old sequential 30m/15m fetch line, which the parallel-fetch change
+  // deleted — so indexOf returned -1, and `-1 < anything` is true. It went green while checking
+  // nothing at all. Third time tonight a test has been caught doing that; both indexes are now
+  // asserted to EXIST before they are compared, which is the part that was missing.
+  const iFetch = src.indexOf('const fetched = await Promise.all(SCAN_TFS.map');
+  const iLab = src.indexOf('_setupsFired += shadowDiscovered');
+  ok('both anchors exist — a -1 here would make the comparison meaningless', iFetch > 0 && iLab > 0, `${iFetch}/${iLab}`);
+  ok('it reuses bars already fetched — no extra network', iFetch > 0 && iLab > 0 && iFetch < iLab);
+}
 ok('what fired is reported', /shadow decision\(s\) recorded from discovered setups — none of them placed anything/.test(src));
 
 console.log('\n5. The generator writes only to the store, never to the bot');
