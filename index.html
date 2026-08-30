@@ -10409,48 +10409,74 @@ document.addEventListener('click', function(e){
     // to the pump ladder, which is the default and how this worked before the toggles existed.
     const ORDER=['5m','15m','30m','1H','2H','3H','4H','1D'];
     const lfv = a.liveFlip || {};
+    const llv = a.liveLadder || {};
     // ── WHAT IS RUNNING vs WHAT WAS ASKED FOR ────────────────────────────────────────────────
     // liveFlip.tf is null whenever the flip is blocked — including the ordinary, possibly
     // days-long case of "waiting for the resting ladder rungs to fill". Painting the chips from
     // tf alone meant the highlight snapped back to OFF on the next refresh and the setting looked
     // like it had been rejected. It never was. So the REQUESTED timeframe stays lit, and the two
     // states are told apart by colour rather than by one of them being invisible.
-    const liveTf = lfv.tf || lfv.want || null;
-    const tfPending = !lfv.tf && !!lfv.want;
+    //
+    // Three owners can hold the real balance now, not two: pump ladder (nothing selected below),
+    // dot flip (a timeframe), or dot-ladder (2026-08-30, backtested best of the three ladder
+    // spacings). Only one is ever actually live, so "selected" below is a single value across
+    // both controls — a timeframe chip and the LADDER chip can never both light up.
+    const ladderTf = llv.tf || (llv.want === 'dotladder' ? 'dotladder' : null);
+    const ladderPending = !llv.tf && llv.want === 'dotladder';
+    const flipTfLive = lfv.tf || lfv.want || null;
+    const flipPending = !lfv.tf && !!lfv.want;
+    const selected = ladderTf ? 'dotladder' : flipTfLive;
+    const selPending = ladderTf ? ladderPending : flipPending;
 
-    h += '<div style="font-size:11px;font-weight:700;color:var(--muted);margin:12px 0 6px;">DOT FLIP — WHICH TIMEFRAME TRADES THE REAL COINS</div>';
+    h += '<div style="font-size:11px;font-weight:700;color:var(--muted);margin:12px 0 6px;">WHICH STRATEGY TRADES THE REAL COINS</div>';
     // These have to LOOK pressable. The first version drew them as bare text on a dark panel and
     // John read the whole row as a label — a control nobody can see is a control that does not
     // exist. Hence a filled chip, a real border and a proper tap target.
     const chip = (label, tf, on) =>
       '<button class="flip-tf" data-tf="'+esc(tf)+'" onclick="setFlipTf(\''+esc(tf)+'\')" '
       + 'style="flex:0 0 auto;padding:9px 15px;font-size:13px;cursor:pointer;border-radius:6px;'
-      // Blue = this timeframe is trading the real coins. Amber = this is what you asked for and
+      // Blue = this is trading the real coins right now. Amber = this is what you asked for and
       // it has not started yet. Both are "selected"; only one of them is live, and a panel that
       // showed them the same way would be claiming something untrue.
-      + 'border:1px solid '+(on?(tfPending?'#e8c07a':'#8bd'):'#4a4a4a')+';'
-      + 'background:'+(on?(tfPending?'rgba(232,192,122,0.18)':'rgba(136,187,221,0.20)'):'rgba(255,255,255,0.07)')+';'
-      + 'color:'+(on?(tfPending?'#e8c07a':'#8bd'):'#cfcfcf')+';font-weight:'+(on?'700':'500')+';">'+esc(label)+'</button>';
+      + 'border:1px solid '+(on?(selPending?'#e8c07a':'#8bd'):'#4a4a4a')+';'
+      + 'background:'+(on?(selPending?'rgba(232,192,122,0.18)':'rgba(136,187,221,0.20)'):'rgba(255,255,255,0.07)')+';'
+      + 'color:'+(on?(selPending?'#e8c07a':'#8bd'):'#cfcfcf')+';font-weight:'+(on?'700':'500')+';">'+esc(label)+'</button>';
 
-    h += '<div style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:8px;">';
-    h += chip('OFF', 'off', !liveTf);
-    for(const t of ORDER) h += chip(t, t, liveTf===t);
+    h += '<div style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:2px;">';
+    h += chip('OFF', 'off', !selected);
+    for(const t of ORDER) h += chip(t, t, selected===t);
     h += '</div>';
+    h += '<div style="font-size:10px;color:var(--dim);margin:2px 0 6px;">DOT FLIP (above) — binary, sells the whole stack, buys it all back on green</div>';
+    h += '<div style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:8px;">';
+    h += chip('LADDER 2×5%', 'dotladder', selected==='dotladder');
+    h += '</div>';
+    h += '<div style="font-size:10px;color:var(--dim);margin:-4px 0 6px;">DOT-LADDER — same red-dot exit, buys back in two 5%-apart steps instead of one green-dot jump. Backtested best of the ladder spacings across fee levels (2026-08-30).</div>';
     h += '<div id="flip-msg" style="font-size:11px;color:var(--dim);min-height:14px;margin-bottom:4px;"></div>';
 
     // What the toggle is actually doing right now, in the bot's own words. A control that shows
     // only what you asked for, rather than what took effect, is the most misleading kind.
-    if(lfv.blocked){
+    if(selected==='dotladder'){
+      if(llv.blocked){
+        h += '<div class="bot-why" style="color:#e8c07a;">Dot-ladder requested but NOT armed — '+esc(llv.why||'')+'</div>';
+      } else {
+        const lg = Number(llv.gainPct)||0;
+        h += '<div class="bot-why" style="color:var(--muted);"><b style="color:#8bd;">Dot-ladder (2×5%) is live on the real balance.</b> '
+          + (llv.holding?'Holding coins, waiting for a red dot to sell.':(esc(llv.resting||0)+' buy-back rung(s) resting.'))
+          + ' '+esc(llv.sells||0)+' sells, '+esc(llv.fills||0)+' fills, '+esc(llv.trips||0)+' full sweeps since arming, '
+          + '<span style="color:'+(lg>0?'#9c9':lg<0?'#e88':'var(--muted)')+';font-weight:700;">'+(lg>=0?'+':'')+lg.toFixed(2)+'%</span> against holding.'
+          + ' The pump ladder and dot flip are stood down.</div>';
+      }
+    } else if(lfv.blocked){
       h += '<div class="bot-why" style="color:#e8c07a;">'+esc(lfv.want||'')+' requested but NOT armed — '+esc(lfv.why||'')+'</div>';
-    } else if(liveTf){
+    } else if(flipTfLive){
       const lg = Number(lfv.gainPct)||0;
-      h += '<div class="bot-why" style="color:var(--muted);"><b style="color:#8bd;">'+esc(liveTf)+' is live on the real balance.</b> '
+      h += '<div class="bot-why" style="color:var(--muted);"><b style="color:#8bd;">'+esc(flipTfLive)+' is live on the real balance.</b> '
         + (lfv.holding?'Holding coins, waiting for a red dot to sell.':'Sold — sitting in cash, waiting for a green dot to buy back.')
         + ' '+esc(lfv.sells||0)+' sells, '+esc(lfv.trips||0)+' round trips since arming, '
         + '<span style="color:'+(lg>0?'#9c9':lg<0?'#e88':'var(--muted)')+';font-weight:700;">'+(lg>=0?'+':'')+lg.toFixed(2)+'%</span> against holding.'
         + ' The pump ladder is stood down.</div>';
     } else {
-      h += '<div class="bot-why" style="color:var(--dim);">Off — the pump ladder holds the coins. Tap a timeframe to hand them to the dot flip on that chart instead.</div>';
+      h += '<div class="bot-why" style="color:var(--dim);">Off — the pump ladder holds the coins. Tap a timeframe or LADDER to hand them to that strategy instead.</div>';
     }
 
     if(!a.flips || !Object.keys(a.flips).length){
@@ -11004,7 +11030,12 @@ document.addEventListener('click', function(e){
   async function setFlipTf(tf){
     const msg = document.getElementById('flip-msg');
     const say = (t,bad)=>{ if(msg){ msg.textContent=t||''; msg.style.color = bad?'#e88':'var(--dim)'; } };
-    if(tf !== 'off'){
+    if(tf === 'dotladder'){
+      const warn = 'Hand the real spot balance to the dot-ladder (2 rungs, 5% apart)?\n\n'
+        + 'It will sell the WHOLE stack on every red dot, then ladder the buy-back in two steps 5% apart instead of waiting for one green dot, on its own, until you switch it off.\n\n'
+        + 'The pump ladder and the dot flip both stand down while it runs. Nothing is placed at the moment you arm it — it waits for the first red dot after now.';
+      if(!confirm(warn)) return;
+    } else if(tf !== 'off'){
       const warn = 'Hand the real spot balance to the ' + tf + ' dot flip?\n\n'
         + 'It will sell the WHOLE stack on every red dot and buy it all back on the green, on its own, until you switch it off.\n\n'
         + 'The pump ladder stands down while it runs. Nothing is placed at the moment you arm it — it waits for the first dot after now.';
@@ -11020,7 +11051,7 @@ document.addEventListener('click', function(e){
       const got = r.data.config.accumFlipTf || 'off';
       say(got === 'off'
         ? 'Off — the pump ladder keeps the coins. Takes effect on the bot\'s next run.'
-        : got + ' armed. It takes effect on the bot\'s next run (every 30–40 min), and the panel below will show it as live once that run lands.');
+        : (got === 'dotladder' ? 'Dot-ladder (2×5%) armed.' : got + ' armed.') + ' It takes effect on the bot\'s next run (every 30–40 min), and the panel below will show it as live once that run lands.');
       // Repaint the buttons from what the relay actually holds, not from what was tapped. The
       // agent-state read is deliberately NOT refreshed here: it will not know about this until
       // the bot has run, and showing it as live before then would be a lie.
