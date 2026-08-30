@@ -1916,9 +1916,17 @@ function hedgeCloseOrder(pos) {
   return o;
 }
 
+// What the venue has already refused to close, and how many times. Persisted, because the whole
+// point is to remember across runs — an in-memory counter would reset every fifteen minutes and
+// the loop would carry on exactly as before.
+const DEHEDGE_KEY = "cipher_dehedge_failed";
+const DEHEDGE_GIVE_UP = 3;
+
 async function resolveHedges(positions) {
-  const out = { found: 0, closed: 0, failed: 0 };
+  const out = { found: 0, closed: 0, failed: 0, givenUp: 0 };
   if (String(env("HEDGE_FIX", "1")) !== "1") return out;
+  const failed = (await getJSON(DEHEDGE_KEY, {})) || {};
+  let failedDirty = false;
   const bySym = new Map();
   for (const p of positions) {
     if (!(Math.abs(Number(p.size) || 0) > 0)) continue;
@@ -1935,6 +1943,18 @@ async function resolveHedges(positions) {
     const biggestLong = longs.sort((a, b) => notional(b) - notional(a))[0];
     const biggestShort = shorts.sort((a, b) => notional(b) - notional(a))[0];
     const smaller = notional(biggestLong) <= notional(biggestShort) ? biggestLong : biggestShort;
+    // ── HAVE WE ALREADY BEEN TOLD NO? ────────────────────────────────────────────────────────
+    // Keyed on the leg AND its size: if the size has changed, something worked, and it deserves
+    // another go. If it has not, the venue has already answered this exact question.
+    const legKey = `${sym}|${String(smaller.posSide || "").toLowerCase()}`;
+    const legSize = String(Math.abs(Number(smaller.size) || 0));
+    const prevFail = failed[legKey];
+    if (prevFail && prevFail.size === legSize && (prevFail.n || 0) >= DEHEDGE_GIVE_UP) {
+      out.givenUp++;
+      continue;                                  // silent by design — it was said loudly once
+    }
+    if (prevFail && prevFail.size !== legSize) { delete failed[legKey]; failedDirty = true; }
+
     const order = hedgeCloseOrder(smaller);
     if (!order) { out.failed++; continue; }
     // ── A FAILED CLOSE MUST NOT REPORT ITSELF AS A CLOSE (2026-08-21) ───────────────────────
@@ -1955,6 +1975,26 @@ async function resolveHedges(positions) {
     if (ok) out.closed++; else out.failed++;
     const coin = sym.replace(/USDT$/, "");
     const leg = `${smaller.posSide}, ${Math.abs(Number(smaller.size))}`;
+
+    // ── KEEP SCORE, AND SAY SOMETHING USEFUL ON THE WAY OUT ──────────────────────────────────
+    if (ok) { if (failed[legKey]) { delete failed[legKey]; failedDirty = true; } }
+    else {
+      const n = ((prevFail && prevFail.size === legSize ? prevFail.n : 0) || 0) + 1;
+      failed[legKey] = { n, size: legSize, why, at: Date.now() };
+      failedDirty = true;
+      if (n >= DEHEDGE_GIVE_UP) {
+        out.givenUp++;
+        // ONE line, said once, naming the venue's own reason. The whole cost of this bug was that
+        // the same failure was reported every fifteen minutes and therefore read as background
+        // noise rather than as a thing needing a hand.
+        console.error(`DE-HEDGE GIVEN UP: ${sym} ${leg} — refused ${n} times. Venue says: ${why || "no reason given"}`);
+        await pushLog({ coin, dir: String(smaller.posSide || "").toLowerCase(),
+          result: "DE-HEDGE GIVEN UP", countsForStats: false,
+          skipped: `${sym} has both sides open and the venue has refused to close the smaller leg (${leg}) ${n} times. Its reason: ${why || "none given"}. `
+            + `This is almost certainly a stub left by a partial fill — too small for the venue to accept as an order, so the bot cannot clear it however many times it asks. `
+            + `It will NOT be retried again unless the size changes. Close it by hand on the exchange; it takes one click and stops both legs paying funding.` });
+      }
+    }
     await pushLog({ coin, dir: String(smaller.posSide || "").toLowerCase(),
       result: ok ? "DE-HEDGED" : "DE-HEDGE FAILED",
       countsForStats: false,
@@ -1963,6 +2003,9 @@ async function resolveHedges(positions) {
         : `${sym} is STILL holding both sides. Tried to close the smaller leg (${leg}) and the venue refused: ${why || "no reason given"}. `
           + `It is paying funding and fees on both legs until this succeeds or you close one by hand. This will be retried next run.` });
   }
+  // Written once per run, and only if something moved. A record that grows every fifteen minutes
+  // would bloat the state file the agent commits to the repo.
+  if (failedDirty) { try { await setJSON(DEHEDGE_KEY, failed); } catch { } }
   return out;
 }
 
@@ -2698,6 +2741,73 @@ function accumFlipStep(state, bars, cfg = {}) {
       const got = (spent / px) * (1 - feeBps / 1e4);
       st.units += got; st.cash = 0; st.trips++;
       events.push({ kind: "flip-buy", at: bars[i].t, px, units: got, cash: spent });
+    }
+    st.lastT = bars[i].t;
+  }
+  return { st, events };
+}
+
+// ═══════════ SELL THE RED DOT, LADDER BACK IN (2026-08-25) ═══════════
+// The flip's exit with a different re-entry. Pure, same shape as accumFlipStep, same units-based
+// bookkeeping, so the two are directly comparable and neither can flatter the other.
+//
+// A rung fills when the bar's LOW trades through it, at the rung price — the normal assumption for
+// a resting limit order, and mildly generous. It is applied identically to every arm that uses
+// rungs, so the comparison between spacings is sound even if the level is optimistic.
+//
+// The green dot sweeps leftover cash. Without that backstop the arm can sit in cash indefinitely
+// on a coin that never comes back down: measured across 12 coins, dropping it took the median from
+// +53% to +5% and blew the spread out to −63%…+660%. The ladder is the engine; the backstop is
+// what stops the engine running away.
+const LADDER_ARMS = [
+  { id: "L3x4", rungs: 3, stepPct: 4 },
+  { id: "L2x5", rungs: 2, stepPct: 5 },
+  { id: "L5x2", rungs: 5, stepPct: 2 },
+];
+
+function accumLadderStep(state, bars, cfg = {}) {
+  const { feeBps = num("FLIP_FEE_BPS", 1), rungs = 3, stepPct = 4 } = cfg;
+  const st = { units: 1, cash: 0, trips: 0, sells: 0, fills: 0, lastT: 0, startUnits: 1,
+               open: [], ...(state || {}) };
+  const events = [];
+  if (!bars || bars.length < 60) return { st, events };
+  const { wt1, wt2 } = waveTrend(bars);
+  const f = 1 - feeBps / 1e4;
+  const fresh = [];
+  for (let i = 1; i < bars.length; i++) if (bars[i].t > (st.lastT || 0)) fresh.push(i);
+  for (const i of fresh) {
+    if (!Number.isFinite(wt2[i]) || !Number.isFinite(wt2[i - 1])) continue;
+    const d0 = wt1[i] - wt2[i], dPrev = wt1[i - 1] - wt2[i - 1];
+    const red = dPrev >= 0 && d0 < 0, green = dPrev <= 0 && d0 > 0;
+    const px = bars[i].c;
+
+    // Rungs are checked BEFORE the dots on the same bar. A bar that dips into a rung and also
+    // prints a green dot filled the cheaper rung first in reality; the other order would hand the
+    // ladder's whole advantage to the backstop and hide the effect being measured.
+    if (Array.isArray(st.open) && st.open.length) {
+      const still = [];
+      for (const r of st.open) {
+        if (bars[i].l <= r.px && st.cash >= r.usdt - 1e-9) {
+          st.units += (r.usdt / r.px) * f; st.cash -= r.usdt; st.fills++;
+          events.push({ kind: "ladder-fill", at: bars[i].t, px: r.px, usdt: r.usdt });
+        } else still.push(r);
+      }
+      st.open = still;
+    }
+
+    if (red && st.units > 0) {
+      const proceeds = st.units * px * f;
+      st.cash += proceeds; st.units = 0; st.sells++;
+      // Replace any stale bids: this is a fresh exit at a fresh price, and leaving the last
+      // cycle's rungs out would have it bidding against a level it no longer believes in.
+      const slice = st.cash / rungs;
+      st.open = [];
+      for (let k = 1; k <= rungs; k++) st.open.push({ px: px * (1 - stepPct * k / 100), usdt: slice });
+      events.push({ kind: "ladder-sell", at: bars[i].t, px, cash: proceeds, rungs: st.open.length });
+    } else if (green && st.cash > 0) {
+      const spent = st.cash;
+      st.units += (spent / px) * f; st.cash = 0; st.open = []; st.trips++;
+      events.push({ kind: "ladder-sweep", at: bars[i].t, px, cash: spent });
     }
     st.lastT = bars[i].t;
   }
@@ -3982,6 +4092,37 @@ async function runAccumulator(book = primaryAccumBook()) {
           const line = FLIP_TFS.map(t => { const x = state.flips[t]; return x ? `${t} ${x.gainPct >= 0 ? "+" : ""}${x.gainPct}% (${x.trips})` : `${t} —`; }).join(" · ");
           console.log(`dot flip @${num("FLIP_FEE_BPS", 1)}bps maker, paper: ${line}`);
 
+          // ── THE LADDER ARMS (2026-08-25) ─────────────────────────────────────────────────────
+          // Same exit as the flip, laddered re-entry. Reuses flipBars, so this costs no extra
+          // network. Daily only: at real fees the 4H version was catastrophic for every strategy
+          // tested (−48% flip, −27% ladder), and running an arm we already know loses would just
+          // be noise in the record.
+          try {
+            state.ladders = state.ladders || {};
+            const lbars = flipBars["1D"];
+            if (lbars && lbars.length >= 60) {
+              for (const arm of LADDER_ARMS) {
+                const r = accumLadderStep(state.ladders[arm.id] || null, lbars,
+                  { rungs: arm.rungs, stepPct: arm.stepPct });
+                state.ladders[arm.id] = r.st;
+                const lpx = lbars[lbars.length - 1].c;
+                // Marked back to COINS, including cash still out in unfilled rungs. Cash sitting
+                // in the book is not a result, it is an unfinished trade, and counting it as
+                // anything else is how a stranded strategy looks healthy.
+                r.st.unitsNow = +(r.st.units + r.st.cash / lpx).toFixed(8);
+                r.st.gainPct = +(((r.st.unitsNow / (r.st.startUnits || 1)) - 1) * 100).toFixed(2);
+                r.st.resting = Array.isArray(r.st.open) ? r.st.open.length : 0;
+                r.st.holding = (r.st.units || 0) * lpx > (r.st.cash || 0);
+              }
+              const ll = LADDER_ARMS.map(a => { const x = state.ladders[a.id];
+                return x ? `${a.rungs}x${a.stepPct}% ${x.gainPct >= 0 ? "+" : ""}${x.gainPct}% (${x.sells}s/${x.fills}f, ${x.resting} resting)` : `${a.id} —`; }).join(" · ");
+              // Printed next to the 1D flip on purpose: that is the arm it is a variant of, and
+              // the only comparison that means anything is against the thing it would replace.
+              const flip1D = state.flips && state.flips["1D"];
+              console.log(`ladder back-in, paper (1D, vs flip 1D ${flip1D ? (flip1D.gainPct >= 0 ? "+" : "") + flip1D.gainPct + "%" : "—"}): ${ll}`);
+            }
+          } catch (e) { console.error("ladder arms skipped (paper only, harmless):", e && e.message); }
+
           // ── AND THE ONE THAT IS REAL ───────────────────────────────────────────────────────
           let lf = await getJSON(book.flipKey, null);
           if (flipBlocked) {
@@ -4346,7 +4487,9 @@ export default async function cipherAgent() {
   if (mode === "armed" && canSeeBook) {
     try {
       const hf = await resolveHedges(positions);
-      if (hf.found) console.log(`hedges found on ${hf.found} coin(s) — ${hf.closed} smaller leg(s) closed${hf.failed ? `, ${hf.failed} failed` : ""}`);
+      if (hf.found) console.log(`hedges found on ${hf.found} coin(s) — ${hf.closed} smaller leg(s) closed`
+        + (hf.failed ? `, ${hf.failed} failed` : "")
+        + (hf.givenUp ? `, ${hf.givenUp} given up on (waiting for you to close by hand)` : ""));
     } catch (e) { console.error("de-hedge pass failed (harmless, reduce-only):", e && e.message); }
   }
 
@@ -4423,7 +4566,7 @@ export default async function cipherAgent() {
   if (REGIME.label) console.log(`regime: ${REGIME.label} (BTC ${REGIME.distPct >= 0 ? "+" : ""}${REGIME.distPct}% vs its ${REGIME_MA}D average) — measured only, it filters nothing`);
 
   for (const coin of slice) {
-    if (Date.now() - started > 45000) {
+    if (Date.now() - started > num("SCAN_BUDGET_MS", 90000)) {
       console.log(`time budget reached — stopping early after ${consumed} of ${slice.length}; the cursor resumes here rather than skipping the rest`);
       break;
     }
@@ -4431,17 +4574,29 @@ export default async function cipherAgent() {
     if (!coin || NOT_CRYPTO.test(coin)) continue;
     scanned++;
 
-    // Confluence timeframes, keeping the candles so the detectors can reuse them.
+    // ── ALL FIVE TIMEFRAMES AT ONCE (2026-08-25) ─────────────────────────────────────────────
+    // These were five sequential awaits — about three seconds a coin, which is the whole reason
+    // the 45-second budget only ever reached 13 coins. They do not depend on each other, so
+    // there was never a reason to queue them.
+    //
+    // Promise.all is safe here specifically because fetchCandles NEVER throws: every failure path
+    // in it returns null. If that ever stops being true this needs allSettled, or one bad symbol
+    // takes the whole coin down.
+    const SCAN_TFS = ["1D", "4H", "1H", "30m", "15m"];
     const bars = {}, tfData = {};
-    for (const tf of ["1D", "4H", "1H"]) { bars[tf] = await fetchCandles(coin, tf, 260); tfData[tf] = analyzeTF(bars[tf]); }
+    const fetched = await Promise.all(SCAN_TFS.map(tf => fetchCandles(coin, tf, 260)));
+    SCAN_TFS.forEach((tf, k) => { bars[tf] = fetched[k]; });
+    // analyzeTF is pure CPU work on candles already in hand — it stays sequential because making
+    // it concurrent would buy nothing and only obscure the order.
+    for (const tf of ["1D", "4H", "1H"]) tfData[tf] = analyzeTF(bars[tf]);
     try { regimeBreadthTally(REGIME, bars["1D"]); } catch {}   // free: the candles are already here
-    // Detector-only timeframes — the BTC 30m top the app missed lived here.
-    for (const tf of ["30m", "15m"]) bars[tf] = await fetchCandles(coin, tf, 260);
 
     // ── THE DISCOVERED SETUPS, IN SHADOW ─────────────────────────────────────────────────────
     // Deliberately after the fetches, so it costs no extra network, and gated on the clock so it
-    // can never eat the coverage the rotation fix just bought back.
-    if (Date.now() - started < 30000) {
+    // can never eat the coverage the rotation fix just bought back. Two thirds of the budget,
+    // tracking it rather than a fixed number — a hardcoded 30s next to a configurable budget is
+    // the kind of pair that drifts apart and nobody notices.
+    if (Date.now() - started < num("SCAN_BUDGET_MS", 90000) * 0.67) {
       const lab = await setupLab();
       if (lab) _setupsFired += shadowDiscovered(lab, SHADOW, coin, bars,
         { reg: REGIME.label, regDist: REGIME.distPct, breadth: REGIME.breadth });
