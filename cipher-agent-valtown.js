@@ -3899,11 +3899,38 @@ function shadowSlot(sh, id) {
 }
 
 // A decision, with everything needed to grade it later. `arm` is "baseline" or "variant".
+// Duplicate offers refused this run — reported on the rank_vs_threshold summary line.
+let SHADOW_DUPS_THIS_RUN = 0;
+
 function shadowRecord(sh, id, arm, t, meta) {
   const slot = shadowSlot(sh, id);
+  const rtf = t.planTf || t.tf || "1D";
+  const rentry = +t.entry, rstop = +t.sl;
+  // ── ONE RECORD PER DECISION, NOT ONE PER RUN (2026-09-12) ────────────────────────────────────
+  // The scanner re-offers the same candidate every run for as long as the structure holds, and
+  // every offer used to become its own record. Measured on 2026-09-12: a single ADA 1D short was
+  // on file FOURTEEN times across 23 hours, every copy scored −1, and the 322 graded records in
+  // the state file were only **183 distinct setups** — the 91 records on 1D were just 19.
+  //
+  // Duplicates are not extra evidence. An identical entry and stop resolve identically, so they
+  // inflate every n, and because the copies are perfectly correlated they also shrink every
+  // confidence interval towards a precision the data does not contain. The promotion gate reads
+  // exactly those counts (n ≥ SHADOW_MIN_RESOLVED, both halves the same sign), so thirty
+  // "records" could be six setups seen five times each — which is how a lever gets promoted on
+  // evidence that was never there. It is also the likeliest reason the relative-strength ladder
+  // looked monotonic on record counts and then inverted.
+  //
+  // An exact repeat of arm+coin+dir+tf+entry+stop is the same idea being re-offered, never a
+  // second independent one: these levels come off live structure as floats and do not recur by
+  // coincidence. So it is counted ONCE for as long as it stays on file. The arm is part of the
+  // identity on purpose — baseline and variant are meant to score the same decision, and
+  // dropping the variant's copy would break the comparison the experiment exists to make.
+  const dup = slot.records.find(r => r.arm === arm && r.coin === t.coin && r.dir === t.dir
+                                  && (r.tf || "1D") === rtf && r.entry === rentry && r.stop === rstop);
+  if (dup) { SHADOW_DUPS_THIS_RUN++; return; }
   slot.records.push({
-    at: Date.now(), arm, coin: t.coin, dir: t.dir, tf: t.planTf || t.tf || "1D",
-    entry: +t.entry, stop: +t.sl, target: +(t.tp2 ?? t.tp1),
+    at: Date.now(), arm, coin: t.coin, dir: t.dir, tf: rtf,
+    entry: rentry, stop: rstop, target: +(t.tp2 ?? t.tp1),
     quality: meta && meta.quality, note: meta && meta.note,
     reg: (meta && meta.reg) || null,            // "bull" | "bear" at the moment of the decision
     rs: (meta && meta.rs) != null ? meta.rs : null,  // 1 = trading the field's leader in your direction
@@ -3917,26 +3944,40 @@ function shadowRecord(sh, id, arm, t, meta) {
 // Walk real candles forward from the decision and score it in R. Stop is checked BEFORE target
 // within a candle — the pessimistic reading, same as the app's backtester. Anything still open
 // after the time cap is marked to market.
-function gradeOne(rec, candles) {
+// The single candle walk every grader in this file uses. Returns { R, how, ambiguous } — `how` is
+// "stop" | "target" | "timeout" — or null while the decision is still open. One implementation on
+// purpose: two arms compared by two different walks are not compared at all.
+// `capBars` overrides the time cap, in bars OF THE CANDLES PASSED IN, so the same decision can be
+// re-walked at a finer resolution over the same wall-clock horizon.
+function walkDecision(rec, candles, capBars) {
   const risk = Math.abs(rec.entry - rec.stop);
   if (!(risk > 0) || !candles || !candles.length) return null;
   const isLong = rec.dir !== "short";
   const start = decisionBar(rec, candles);   // −1 if the window cannot reach the decision
   if (start < 0) return null;
+  const cap = capBars || SHADOW_TIMEOUT_BARS * (rec.tfMult || 4);
   for (let i = start; i < candles.length; i++) {
     const c = candles[i];
     const hitStop = isLong ? c.l <= rec.stop : c.h >= rec.stop;
     const hitTgt  = isLong ? c.h >= rec.target : c.l <= rec.target;
     if (hitStop && hitTgt) rec.ambiguous = (rec.ambiguous || 0) + 1;   // counted, never hidden
-    if (hitStop) return -1;
-    if (hitTgt) return +Math.abs(rec.target - rec.entry) / risk;
+    // Stop before target inside one bar — the pessimistic reading. Correct at a resolution where
+    // a single bar cannot hold both; a lie at one where it can. That is what SECOND_OPINION_TF
+    // exists to measure rather than assume.
+    if (hitStop) return { R: -1, how: "stop", ambiguous: hitTgt };
+    if (hitTgt) return { R: +Math.abs(rec.target - rec.entry) / risk, how: "target", ambiguous: false };
     // The cap is 40 bars OF THE SIGNAL'S timeframe. Graded on a finer one, that is 4x as many
     // bars — otherwise a 4H idea would be marked to market after less than a day.
-    if (i - start >= SHADOW_TIMEOUT_BARS * (rec.tfMult || 4)) {
-      return (isLong ? c.c - rec.entry : rec.entry - c.c) / risk;   // marked to market
+    if (i - start >= cap) {
+      return { R: (isLong ? c.c - rec.entry : rec.entry - c.c) / risk, how: "timeout", ambiguous: false };
     }
   }
   return null;                                  // not enough candles yet — leave it open
+}
+
+function gradeOne(rec, candles) {
+  const g = walkDecision(rec, candles);
+  return g ? g.R : null;
 }
 
 // ── GRADE ON A FINER TIMEFRAME THAN THE SIGNAL (2026-08-18) ──────────────────────────────────
@@ -3950,6 +3991,25 @@ function gradeOne(rec, candles) {
 // Walking the timeframe BELOW the signal cuts the candles that can contain both levels by 4x.
 // The same reasoning the confirmation watcher already uses.
 const GRADE_TF_BELOW = { "1D": "4H", "4H": "1H", "1H": "30m", "30m": "15m", "15m": "15m" };
+
+// ── SECOND OPINION ON THE WIDEST SIGNALS (2026-09-12) ────────────────────────────────────────
+// The 2026-08-18 fix above moved grading one timeframe DOWN because a bar wide enough to contain
+// both the stop and the target always scores as a loss (the stop is checked first). It was
+// verified on 4H signals — and never checked on 1D ones, whose stops are roughly twice as wide:
+// median 6.6% against 3.6%, with the target out at 14.8%. A 4H crypto bar spans that often.
+//
+// The live evidence on 2026-09-12: every one of the 19 distinct 1D setups on file had scored
+// EXACTLY −1. Nineteen for nineteen, zero variance. Strip them out and the whole graded book
+// moves from −0.130R to −0.030R and the "shorts are the problem" reading loses most of its
+// weight — so whether that block is the market or the measurement decides what gets changed next.
+//
+// This re-walks each already-graded 1D decision on 1H bars under identical rules and an equal
+// wall-clock cap, then logs how often the finer resolution disagrees. It is advisory: `R` is
+// never touched, nothing is filtered, no gate reads `R2`. If 1H keeps saying "stop", 1D shorts
+// are a real finding and can be acted on. If it says "target" where 4H said "stop", the 4H grade
+// is an artefact and every conclusion drawn from those records has to go.
+const SECOND_OPINION_TF   = { "1D": "1H" };   // signal timeframe → finer timeframe to re-check on
+const SECOND_OPINION_MULT = { "1D": 24 };     // finer bars per signal bar, to keep the cap equal
 
 async function gradeShadow(sh) {
   const cutoff = Date.now() - SHADOW_GRADE_AFTER_H * 3600e3;
@@ -3978,7 +4038,47 @@ async function gradeShadow(sh) {
       if (R !== null) { rec.R = +R.toFixed(3); rec.gtf = gtf; graded++; }
     }
   }
+  await secondOpinion(sh);
   return graded;
+}
+
+// Re-walk graded decisions whose timeframe has a SECOND_OPINION_TF, at that finer resolution.
+// Measures the grader against itself; changes nothing it reads.
+async function secondOpinion(sh) {
+  const need = new Map();
+  for (const id of Object.keys(sh)) {
+    const slot = sh[id];
+    if (!slot || !Array.isArray(slot.records)) continue;
+    for (const rec of slot.records) {
+      const ftf = SECOND_OPINION_TF[rec.tf || ""];
+      if (!ftf || rec.R === null || rec.R === undefined || rec.R2 !== undefined) continue;
+      const k = rec.coin + "|" + ftf;
+      if (!need.has(k)) need.set(k, []);
+      need.get(k).push(rec);
+    }
+  }
+  if (!need.size) return;
+  const cmp = { n: 0, agree: 0, flip: 0, sum: 0, sum2: 0, stop2: 0, tgt2: 0, to2: 0 };
+  for (const [k, recs] of need) {
+    const [coin, ftf] = k.split("|");
+    let candles = null;
+    try { candles = await fetchCandles(coin, ftf, 600); } catch { }
+    if (!candles) continue;
+    for (const rec of recs) {
+      const cap = SHADOW_TIMEOUT_BARS * (SECOND_OPINION_MULT[rec.tf] || 24);
+      const g = walkDecision(rec, candles, cap);
+      if (!g) continue;                          // finer window can't reach it — try a later run
+      rec.R2 = +g.R.toFixed(3); rec.how2 = g.how; rec.gtf2 = ftf;
+      cmp.n++; cmp.sum += rec.R; cmp.sum2 += rec.R2;
+      if ((rec.R > 0) === (rec.R2 > 0)) cmp.agree++;
+      else if (rec.R <= 0 && rec.R2 > 0) cmp.flip++;      // graded a loss, finer says a win
+      if (g.how === "stop") cmp.stop2++; else if (g.how === "target") cmp.tgt2++; else cmp.to2++;
+    }
+  }
+  if (cmp.n) console.log(`shadow second opinion: ${cmp.n} re-walked finer · graded mean `
+    + `${(cmp.sum / cmp.n).toFixed(3)}R · finer mean ${(cmp.sum2 / cmp.n).toFixed(3)}R · agree `
+    + `${cmp.agree}/${cmp.n} · graded-loss-but-finer-win ${cmp.flip} · finer outcomes: `
+    + `${cmp.stop2} stop / ${cmp.tgt2} target / ${cmp.to2} timeout`);
 }
 
 function armStats(records, arm) {
@@ -5367,7 +5467,7 @@ export default async function cipherAgent() {
 
     const v = shadowJudge(SHADOW, "rank_vs_threshold");
     await saveShadow(SHADOW);
-    console.log(`shadow rank_vs_threshold: baseline ${v.base.n} trades @ ${v.base.meanR}R · variant ${v.varr.n} @ ${v.varr.meanR}R · edge ${v.edge >= 0 ? "+" : ""}${v.edge}R${v.ready ? "" : " (still gathering)"}${v.changed ? " — " + v.changed.toUpperCase() : ""}${gradedN ? ` · graded ${gradedN} this run` : ""}`);
+    console.log(`shadow rank_vs_threshold: baseline ${v.base.n} trades @ ${v.base.meanR}R · variant ${v.varr.n} @ ${v.varr.meanR}R · edge ${v.edge >= 0 ? "+" : ""}${v.edge}R${v.ready ? "" : " (still gathering)"}${v.changed ? " — " + v.changed.toUpperCase() : ""}${gradedN ? ` · graded ${gradedN} this run` : ""}${SHADOW_DUPS_THIS_RUN ? ` · ${SHADOW_DUPS_THIS_RUN} duplicate offer(s) not re-recorded` : ""}`);
     if (v.changed) await pushLog({ shadow: "rank_vs_threshold", result: v.changed.toUpperCase(),
       skipped: `ranking ${v.changed}: variant ${v.varr.meanR}R vs baseline ${v.base.meanR}R over ${v.varr.n}/${v.base.n} resolved trades` });
 

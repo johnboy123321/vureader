@@ -16,11 +16,11 @@ const HERE = dirname(fileURLToPath(import.meta.url));
 const PATCHED = resolve(process.argv[2] || `${HERE}/cipher-agent-valtown.js`);
 const DEPLOYED = process.argv[3] ? resolve(process.argv[3]) : resolve(`${HERE}/raw-agent.js`);
 
-const NEED_FNS = ["decisionBar", "gradeOne", "gradeWithTimeStop", "walkFromBar", "gradeMakerEntry"];
+const NEED_FNS = ["decisionBar", "walkDecision", "gradeOne", "gradeWithTimeStop", "walkFromBar", "gradeMakerEntry"];
 
 // Pull `function NAME(...) { ... }` out of a source string by balancing braces.
 function lift(src, name) {
-  const sig = new RegExp(`^function ${name}\\(`, "m");
+  const sig = new RegExp(`^(?:async )?function ${name}\\(`, "m");
   const m = sig.exec(src);
   if (!m) return null;
   let i = src.indexOf("{", m.index), depth = 0;
