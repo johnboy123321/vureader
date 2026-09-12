@@ -1246,7 +1246,7 @@ function applyLiveConfig(c) {
   // which means the ladder — the conservative direction to fail in.
   if (c.accumFlipTf !== undefined && c.accumFlipTf !== null && c.accumFlipTf !== "") {
     const want = String(c.accumFlipTf).toLowerCase();
-    const hit = want === "off" ? "off" : FLIP_TFS.find(t => t.toLowerCase() === want);
+    const hit = want === "off" ? "off" : want === "dotladder" ? "dotladder" : FLIP_TFS.find(t => t.toLowerCase() === want);
     if (hit) { CFG.accumFlipTf = () => hit; applied.push("accumFlipTf=" + hit); }
     else console.log(`live config: ignoring accumFlipTf=${c.accumFlipTf}`);
   }
@@ -2131,17 +2131,136 @@ async function rememberResting(meta, order, coin, dir, orderID) {
 // a successful one were indistinguishable from `ok` alone, and expireStaleOrders() had nothing to
 // log — ten orders sat unfilled for 40–100+ hours with zero visibility into why. `why` is what
 // makes the next failure diagnosable from the state file alone, without console access.
-async function cancelOrder(symbol, orderID, clOrdID) {
+async function cancelOrder(symbol, orderID, clOrdID, posSide) {
   if (!CFG.direct()) return { ok: false, why: "no cancel route (relay mode)" };
   try {
+    // ── posSide IS REQUIRED BY PHEMEX HEDGE-MODE CANCEL (2026-09-02) ───────────────────────────
+    // Every stale-order expiry for SOL/FIL/LTC/APT was failing with "phemex http 400 code 10500
+    // Missing required parameter, Required query parameter 'posSide' is not present" because this
+    // call never sent it. The caller already has it on the live order object read from
+    // activeList — it just wasn't being passed through.
     const q = `symbol=${encodeURIComponent(symbol)}&` +
-              (orderID ? `orderID=${encodeURIComponent(orderID)}` : `clOrdID=${encodeURIComponent(clOrdID)}`);
+              (orderID ? `orderID=${encodeURIComponent(orderID)}` : `clOrdID=${encodeURIComponent(clOrdID)}`) +
+              (posSide ? `&posSide=${encodeURIComponent(posSide)}` : "");
     const r = await phemexCall("DELETE", "/g-orders/cancel", q, null);
     const code = r.data && r.data.code;
     const ok = r.status === 200 && (code === 0 || code === undefined);
     const why = ok ? "" : `phemex http ${r.status}${code !== undefined ? ` code ${code}` : ""} ${(r.data && r.data.msg) || ""}`.trim();
     return { ok, why };
   } catch (e) { return { ok: false, why: "cancel call threw: " + String((e && e.message) || e).slice(0, 160) }; }
+}
+
+// ═══════════ CLOSE THE PROTECTION GAP — "PLACED" DOES NOT MEAN PROTECTED (2026-09-02) ═══════════
+// John: "why isn't there any TPs on it" about a SOL short and a FIL short sitting open with no
+// stop/target resting on the exchange. Two different causes, traced from the log and the state
+// file, not guessed from the symptom:
+//   SOL — adopted as a plan-less orphan. adoptOrphans() is deliberately bookkeeping only ("no
+//         order placed") — it was never even GIVEN a chance to be protected.
+//   FIL — a normal signal that WAS sent with stopLossRp/takeProfitRp bundled on the entry order
+//         and logged "PLACED" — but nothing is resting on the exchange for it. The bot only ever
+//         checked that the HTTP call succeeded, never that the resulting position actually carries
+//         what it asked for. A bracket field silently dropped by the venue was invisible.
+// The relay already had a belt-and-braces "/stop" endpoint for exactly this ("if the exchange
+// ever drops it the position is naked") — built for the APP's relay-mode execution path. The
+// agent moved its OWN orders to direct-mode execution (EXEC_DIRECT) and never got the same net.
+// This ports it: every armed run, for every open position with a plan, check the resting order
+// book (the same activeList+untriggered read expireStaleOrders already trusts) for a reduce-only
+// stop tied to that side; if it is missing, place one. Runs EVERY cycle, not once — self-healing
+// if a stop is ever cancelled, expires, or (like SOL and FIL) never existed.
+//
+// Take-profit is REPORTED but not auto-placed. A standalone conditional take-profit (ordType
+// MarketIfTouched here — Phemex's documented order-type set, not yet proven against a live fill
+// on THIS account) carries more unknowns than a Stop, whose exact shape the relay's own working
+// code already proves. Shipping the safety-critical half (a missing stop is unbounded downside)
+// and watching it before trusting the rest matches this project's own rule for every newly-armed
+// feature — see [[cipher-open-items]] "first live run of any newly-armed feature should be
+// watched" — 2026-08-30 note.
+
+// A reduce-only order tagged Stop/StopLimit for this side of the position.
+function findRestingStop(orders, posSide) {
+  return (orders || []).find(o => o && o.reduceOnly && String(o.posSide) === posSide &&
+    (String(o.ordType) === "Stop" || String(o.ordType) === "StopLimit"));
+}
+// Any OTHER reduce-only order for this side counts as "some target-side protection exists" —
+// deliberately not matching a specific ordType name, so a guess about Phemex's take-profit
+// ordType cannot cause a false "no target" alarm about a target that is really there.
+function findRestingTarget(orders, posSide) {
+  return (orders || []).find(o => o && o.reduceOnly && String(o.posSide) === posSide &&
+    !(String(o.ordType) === "Stop" || String(o.ordType) === "StopLimit"));
+}
+
+// Places a reduce-only conditional order that closes an EXISTING position — the direct-mode
+// mirror of the relay's POST /stop. kind is "Stop" (proven shape) or "Target" (best-effort,
+// MarketIfTouched, not yet confirmed live).
+async function directProtect({ symbol, posSide, kind, triggerPx, qty, refPx }) {
+  if (CFG.kill()) return { ok: false, why: "KILL switch is ON — no orders placed." };
+  if (!(qty > 0)) return { ok: false, why: "qty must be > 0" };
+  if (!(triggerPx > 0)) return { ok: false, why: "triggerPx must be > 0" };
+  const isLong = posSide === "Long";
+  // Same hard rule the relay's /stop enforces: protection on the wrong side of the market is not
+  // protection. Skipped (not refused) when we have no reliable current price to check against —
+  // the coin may not have been in this run's scan batch.
+  if (Number(refPx) > 0) {
+    if (kind === "Stop") {
+      if (isLong && triggerPx >= refPx) return { ok: false, why: `stop ${triggerPx} must be below market ${refPx} for a long` };
+      if (!isLong && triggerPx <= refPx) return { ok: false, why: `stop ${triggerPx} must be above market ${refPx} for a short` };
+    } else {
+      if (isLong && triggerPx <= refPx) return { ok: false, why: `target ${triggerPx} must be above market ${refPx} for a long` };
+      if (!isLong && triggerPx >= refPx) return { ok: false, why: `target ${triggerPx} must be below market ${refPx} for a short` };
+    }
+  }
+  const dp = (String(refPx || triggerPx).split(".")[1] || "").length || 2;
+  const px = v => String(Number(Number(v).toFixed(dp)));
+  const order = {
+    clOrdID: (`cipher${kind}${Date.now()}`).replace(/[^a-zA-Z0-9]/g, "").slice(0, 40),
+    symbol, side: isLong ? "Sell" : "Buy", posSide,
+    ordType: kind === "Stop" ? "Stop" : "MarketIfTouched",
+    stopPxRp: px(triggerPx), triggerType: "ByMarkPrice",
+    orderQtyRq: String(qty), timeInForce: "ImmediateOrCancel",
+    closeOnTrigger: true, reduceOnly: true, text: "cipher-protective-" + kind.toLowerCase(),
+  };
+  if (CFG.mode() !== "armed" || String(env("DRY_RUN", "0")) === "1")
+    return { ok: true, dry: true, wouldSend: order };
+  const r = await phemexCall("POST", "/g-orders", "", order);
+  const code = r.data && r.data.code;
+  if (r.status !== 200) return { ok: false, why: `phemex http ${r.status}`, sent: order, phemex: r.data };
+  if (code !== 0 && code !== undefined) return { ok: false, why: `phemex ${code}: ${(r.data && r.data.msg) || "rejected"}`, sent: order, phemex: r.data };
+  return { ok: true, sent: order, phemex: r.data };
+}
+
+// For every open, PLANNED position, make sure a real reduce-only stop is resting at the venue.
+// Silent (skip, not guess) about a symbol whose order book cannot be read this run — the same
+// no-hedge reasoning already used elsewhere: treating "could not see" as "must be fine" is how
+// positions go naked in the first place.
+async function protectOpenPositions(nowOpen, priceOf) {
+  const out = { checked: 0, placed: 0, alreadyOk: 0, failed: 0, blind: 0, noTarget: [] };
+  if (!CFG.direct()) return out;               // the relay's own /stop endpoint covers relay mode
+  for (const pos of Object.values(nowOpen || {})) {
+    if (!pos || !pos.plan || !(pos.size > 0)) continue;
+    const symbol = `${pos.coin}USDT`;
+    const posSide = pos.dir === "short" ? "Short" : "Long";
+    let orders;
+    try { orders = await execOrdersFor(symbol); } catch (e) { out.blind++; continue; }
+    out.checked++;
+    const ref = Number(priceOf && priceOf(pos.coin)) || Number(pos.avgEntry) || undefined;
+    if (!findRestingStop(orders, posSide)) {
+      const r = await directProtect({ symbol, posSide, kind: "Stop", triggerPx: pos.plan.stop, qty: pos.size, refPx: ref });
+      if (r.ok && !r.dry) {
+        out.placed++;
+        await pushLog({ coin: pos.coin, dir: pos.dir, result: "STOP ATTACHED",
+          skipped: `no reduce-only stop was resting at the venue for an open, planned position — attached one at ${formatPrice(pos.plan.stop)}. Closes a gap where a bracket stop can be silently dropped by the exchange, or never existed at all (e.g. an adopted position), without the bot noticing.` });
+      } else if (!r.ok) {
+        out.failed++;
+        await pushLog({ coin: pos.coin, dir: pos.dir, result: "STOP ATTACH FAILED",
+          skipped: `tried to attach a missing stop at ${formatPrice(pos.plan.stop)} and the venue refused: ${r.why}. Left unprotected; will retry next run.` });
+      }
+    } else out.alreadyOk++;
+    if (!findRestingTarget(orders, posSide)) out.noTarget.push(`${pos.coin} ${pos.dir}`);
+  }
+  if (out.noTarget.length)
+    await pushLog({ result: "NO TARGET RESTING",
+      skipped: `${out.noTarget.length} open position(s) have (or now have) a stop but no take-profit resting at the venue: ${out.noTarget.join(", ")}. Not auto-placed yet — flagged for a look, see the 2026-09-02 note above this function.` });
+  return out;
 }
 
 async function expireStaleOrders() {
@@ -2168,7 +2287,7 @@ async function expireStaleOrders() {
     for (const r of recs) {
       const still = live.find(o => o && (o.clOrdID === r.clOrdID || (r.orderID && o.orderID === r.orderID)));
       if (!still) { delete book[r.id]; out.cleared++; continue; }          // filled, or already gone
-      const res = await cancelOrder(symbol, still.orderID, r.clOrdID);
+      const res = await cancelOrder(symbol, still.orderID, r.clOrdID, still.posSide);
       if (res.ok) {
         delete book[r.id]; out.cancelled++;
         await pushLog({ coin: r.coin, dir: r.dir, result: "EXPIRED",
@@ -2906,6 +3025,96 @@ function liveFlipStep(state, bars, tf, cfg = {}) {
     const got = (spent / px) * (1 - feeBps / 1e4);
     st.units += got; st.cash = 0; st.trips++;
     events.push({ kind: "flip-buy", at: last.t, px, units: got, cash: spent });
+  }
+  return { st, events };
+}
+
+// ═══════════ THE LIVE DOT-LADDER (2026-08-30) ═══════════
+// Backtested against 3 years of real BTC history at four fee levels: 2 rungs, 5% apart (L2x5)
+// beat the currently-live flip robustly at every fee tested. This is that arm promoted to the
+// real spot balance, same promotion liveFlipStep got on 2026-08-19 and the same three rules:
+//  1. NO REPLAY — arming plants the cursor on the newest closed daily bar and places nothing.
+//  2. ONE BOOK OWNS THE COINS — the caller stands the pump ladder and the dot flip down before
+//     this runs, the same way switching between those two already does.
+//  3. RUNGS FILL ON THE WAKE-TO-WAKE LOW — Phemex is not asked to rest true limit orders here
+//     (untracked ones would drift out of the book's view); a rung is treated as filled the
+//     moment a 15m bar closed since the last run traded through it, same rule the backtest used.
+// The fee is the REAL one (ACCUM_FEE_BPS, taker) — this arm's record is the only one allowed to
+// claim anything about live performance.
+const LIVE_LADDER_KEY = "cipher_accum_liveladder";
+
+function liveLadderStep(state, dailyBars, fineBars, cfg = {}) {
+  const { feeBps = num("ACCUM_FEE_BPS", 10), rungs = 2, stepPct = 5,
+          seedUnits = null, seedCash = 0, minOrderUsdt = num("ACCUM_MIN_ORDER_USDT", 10) } = cfg;
+  const st = {
+    tf: null, units: 0, cash: 0, trips: 0, sells: 0, fills: 0, lastT: 0, lastFineT: 0,
+    startUnits: 0, startedAt: null, armedAt: null, open: [],
+    ...(state || {}),
+  };
+  const events = [];
+  if (!dailyBars || dailyBars.length < 60) return { st, events, why: "not enough daily bars to arm" };
+  const lastDaily = dailyBars[dailyBars.length - 1];
+  const { wt1, wt2 } = waveTrend(dailyBars);
+  const n = dailyBars.length - 1;
+  if (!Number.isFinite(wt1[n]) || !Number.isFinite(wt2[n])) return { st, events, why: "indicator not ready" };
+  const d0 = wt1[n] - wt2[n], dPrev = wt1[n - 1] - wt2[n - 1];
+
+  if (st.tf !== "1D") {
+    const prev = st.tf;
+    st.tf = "1D";
+    st.lastT = lastDaily.t;                 // ← the no-replay guarantee, same line as liveFlipStep
+    st.lastFineT = (fineBars && fineBars.length) ? fineBars[fineBars.length - 1].t : 0;
+    st.trips = 0; st.sells = 0; st.fills = 0; st.open = [];
+    st.armedAt = new Date().toISOString();
+    st.startedAt = st.armedAt;
+    if (seedUnits != null) { st.units = seedUnits; st.cash = seedCash || 0; }
+    st.startUnits = st.units + (st.cash || 0) / lastDaily.c;
+    events.push({ kind: "ladder-armed", prev, at: lastDaily.t, px: lastDaily.c,
+                  units: st.units, cash: st.cash, rungs, stepPct });
+    return { st, events };
+  }
+
+  const f = 1 - feeBps / 1e4;
+
+  // Rungs first, against every FRESH 15m bar since the last check — skipping this would let
+  // price cross a rung between two runs and never notice, stranding cash in an unfilled level.
+  if (Array.isArray(st.open) && st.open.length && fineBars && fineBars.length) {
+    const freshFine = fineBars.filter(b => b.t > (st.lastFineT || 0));
+    for (const b of freshFine) {
+      if (!st.open.length) break;
+      const still = [];
+      for (const r of st.open) {
+        if (b.l <= r.px && st.cash >= r.usdt - 1e-9 && r.usdt >= minOrderUsdt) {
+          const got = (r.usdt / r.px) * f;
+          st.units += got; st.cash -= r.usdt; st.fills++;
+          events.push({ kind: "ladder-fill", at: b.t, px: r.px, usdt: r.usdt, units: got });
+        } else still.push(r);
+      }
+      st.open = still;
+    }
+    if (freshFine.length) st.lastFineT = freshFine[freshFine.length - 1].t;
+  }
+
+  // The daily decision — at most one sell or one sweep per run: a dot that opens and closes
+  // between two runs is missed, not retroactively acted on. Same honesty rule as liveFlipStep.
+  if (lastDaily.t > (st.lastT || 0)) {
+    st.lastT = lastDaily.t;
+    const red = dPrev >= 0 && d0 < 0, green = dPrev <= 0 && d0 > 0;
+    const px = lastDaily.c;
+    if (red && st.units * px >= minOrderUsdt) {
+      const sell = st.units;
+      const proceeds = sell * px * f;
+      st.cash += proceeds; st.units = 0; st.sells++;
+      const slice = proceeds / rungs;
+      st.open = [];
+      for (let k = 1; k <= rungs; k++) st.open.push({ px: px * (1 - stepPct * k / 100), usdt: slice });
+      events.push({ kind: "ladder-sell", at: lastDaily.t, px, units: sell, cash: proceeds, rungs: st.open.length });
+    } else if (green && st.cash >= minOrderUsdt) {
+      const spent = st.cash;
+      const got = (spent / px) * f;
+      st.units += got; st.cash = 0; st.open = []; st.trips++;
+      events.push({ kind: "ladder-sweep", at: lastDaily.t, px, units: got, cash: spent });
+    }
   }
   return { st, events };
 }
@@ -3979,11 +4188,13 @@ async function runAccumulator(book = primaryAccumBook()) {
         // all filled, because until then the ladder still has cash out against those coins and
         // handing the same balance to a second strategy would sell it twice.
         const flipWant = String(book.flipTf || "off");
-        const flipTf = flipWant.toLowerCase() === "off" ? null
-                     : (FLIP_TFS.find(t => t.toLowerCase() === flipWant.toLowerCase()) || null);
-        if (flipWant.toLowerCase() !== "off" && !flipTf) console.log(`accumulator: unknown flip timeframe "${flipWant}" — ladder keeps the coins`);
-        const flipBlocked = flipTf && state.open && state.open.length > 0;
-        const flipOwns = !!flipTf && !flipBlocked;
+        const wantLower = flipWant.toLowerCase();
+        const isDotLadder = wantLower === "dotladder";
+        const flipTf = (wantLower === "off" || isDotLadder) ? null
+                     : (FLIP_TFS.find(t => t.toLowerCase() === wantLower) || null);
+        if (wantLower !== "off" && !isDotLadder && !flipTf) console.log(`accumulator: unknown flip timeframe "${flipWant}" — ladder keeps the coins`);
+        const flipBlocked = (!!flipTf || isDotLadder) && state.open && state.open.length > 0;
+        const flipOwns = (!!flipTf || isDotLadder) && !flipBlocked;
 
         const d = accumStep(state, bars, flipOwns
           ? { ...book.cfg, paused: true, pausedWhy: `the ${flipTf} dot flip holds the coins — ladder stood down` }
@@ -4125,7 +4336,153 @@ async function runAccumulator(book = primaryAccumBook()) {
 
           // ── AND THE ONE THAT IS REAL ───────────────────────────────────────────────────────
           let lf = await getJSON(book.flipKey, null);
-          if (flipBlocked) {
+          let ll = await getJSON(LIVE_LADDER_KEY, null);
+          // Three owners now compete for the same balance: the pump ladder (state.units/cash,
+          // the fallback), the dot flip (lf) and the dot-ladder (ll). Whichever is NOT selected
+          // this run is stood down first and its balance folded back — the same handover the
+          // flip already did when toggled off, done for two owners so neither is left holding a
+          // position the selector no longer knows about.
+          if (!isDotLadder && ll && ll.tf) {
+            state.units = Number(ll.units) || 0; state.cash = Number(ll.cash) || 0;
+            console.log(`live dot-ladder stood down from ${ll.tf} — coins handed back: ${state.units.toFixed(8)} ${coin}` +
+                        (state.cash > 0 ? ` + ${state.cash.toFixed(2)} USDT still to be bought back` : ""));
+            await pushLog({ coin, result: "LADDER OFF",
+              skipped: `live dot-ladder switched off after ${ll.trips} round trip${ll.trips === 1 ? "" : "s"} — ${state.units.toFixed(8)} ${coin}${state.cash > 0 ? ` plus ${state.cash.toFixed(2)} USDT still in cash` : ""} handed back.` });
+            ll.tf = null; await setJSON(LIVE_LADDER_KEY, ll);
+            state.liveLadder = { tf: null, blocked: false, why: "off" };
+          }
+          if (isDotLadder && lf && lf.tf) {
+            state.units = Number(lf.units) || 0; state.cash = Number(lf.cash) || 0;
+            console.log(`live flip stood down from ${lf.tf} — dot-ladder takes over: ${state.units.toFixed(8)} ${coin}` +
+                        (state.cash > 0 ? ` + ${state.cash.toFixed(2)} USDT still to be bought back` : ""));
+            await pushLog({ coin, result: "FLIP OFF",
+              skipped: `${lf.tf} dot flip switched off after ${lf.trips} round trip${lf.trips === 1 ? "" : "s"} — the dot-ladder takes the coins: ${state.units.toFixed(8)} ${coin}${state.cash > 0 ? ` plus ${state.cash.toFixed(2)} USDT still in cash` : ""}.` });
+            lf.tf = null; await setJSON(book.flipKey, lf);
+            state.liveFlip = { tf: null, blocked: false, why: "off — dot-ladder holds the coins" };
+          }
+          if (isDotLadder) {
+            if (flipBlocked) {
+              state.liveLadder = { tf: null, want: "dotladder", blocked: true,
+                why: `waiting for ${state.open.length} resting pump-ladder rung${state.open.length === 1 ? "" : "s"} to fill before the dot-ladder can take the coins` };
+              console.log(`live dot-ladder: NOT armed — ${state.liveLadder.why}`);
+            } else {
+              const lbars = flipBars["1D"];
+              let fineLadder = null;
+              try { fineLadder = await fetchCandles(coin, "15m", 200); }
+              catch (e) { console.error("live dot-ladder: 15m fetch failed (rungs untouched this run):", e && e.message); }
+              if (!lbars || lbars.length < 60) {
+                const held = ll && ll.tf === "1D";
+                state.liveLadder = held
+                  ? { tf: ll.tf, blocked: false, stale: true, why: "no 1D candles this run — the arm is untouched" }
+                  : { tf: null, blocked: true, why: "no 1D candles came back this run (60+ bars needed) — unchanged, retried next run" };
+                console.log(`live dot-ladder: no daily candles this run — arm left as it was`);
+              } else {
+                const capUsdt = num("ACCUM_LADDER_MAX_USDT", num("ACCUM_FLIP_MAX_USDT", 1500));
+                const armedExec = book.exec === "armed";
+                const minOrder = num("ACCUM_MIN_ORDER_USDT", 10);
+                const wBase = PF && Number.isFinite(PF.baseBalance) ? PF.baseBalance : null;
+                const wQuote = PF && Number.isFinite(PF.quoteBalance) ? PF.quoteBalance : null;
+                const bookUnits = Number((ll && ll.tf === "1D" ? ll.units : state.units)) || 0;
+                const bookCash = Number((ll && ll.tf === "1D" ? ll.cash : state.cash)) || 0;
+                const shortOfCoins = wBase != null && bookUnits * px >= minOrder && wBase * px < minOrder;
+                const shortOfCash = wQuote != null && bookCash >= minOrder && wQuote < minOrder;
+                let outOfSync = false;
+                if (armedExec && (shortOfCoins || shortOfCash)) {
+                  const detail = shortOfCoins
+                    ? `the strategy's book holds ${bookUnits.toFixed(8)} ${coin} but the SPOT wallet has ${wBase.toFixed(8)} — about ${(wBase * px).toFixed(2)} USDT, under the ${minOrder} minimum`
+                    : `the book holds ${bookCash.toFixed(2)} USDT but the SPOT wallet has ${wQuote.toFixed(2)}`;
+                  state.liveLadder = { tf: null, want: "dotladder", blocked: true,
+                    why: `${detail}. Nothing can be traded until the two agree — re-arm to reseed from what is actually there.` };
+                  console.log(`live dot-ladder: STOOD DOWN — ${state.liveLadder.why}`);
+                  await pushLog({ coin, result: "LADDER OUT OF SYNC", skipped: state.liveLadder.why });
+                  outOfSync = true;
+                }
+                const stackUsdt = ((Number(state.units) || 0) * px) + (Number(state.cash) || 0);
+                if (outOfSync) {
+                  // already reported
+                } else if (armedExec && stackUsdt > capUsdt) {
+                  state.liveLadder = { tf: null, want: "dotladder", blocked: true,
+                    why: `the whole stack is ${stackUsdt.toFixed(0)} USDT but ACCUM_LADDER_MAX_USDT is ${capUsdt} — a red dot sells it all in one order, so it would be refused. Raise the cap above ${Math.ceil(stackUsdt / 50) * 50} to arm this.` };
+                  console.log(`live dot-ladder: NOT armed — ${state.liveLadder.why}`);
+                  await pushLog({ coin, result: "LADDER BLOCKED", skipped: state.liveLadder.why });
+                } else {
+                  const llBefore = ll ? JSON.parse(JSON.stringify(ll)) : null;
+                  let llUnplaced = null;
+                  const wasArmed = ll && ll.tf === "1D";
+                  const seedUnits = wasArmed ? null : (Number(state.units) || 0);
+                  const seedCash = wasArmed ? 0 : (Number(state.cash) || 0);
+                  const r = liveLadderStep(ll, lbars, fineLadder, { seedUnits, seedCash });
+                  ll = r.st;
+                  for (const e of r.events) {
+                    if (e.kind === "ladder-armed") {
+                      await pushLog({ coin, result: "LADDER ARMED",
+                        skipped: `dot-ladder (2 rungs, 5% apart) is now live on the real balance — ${e.units.toFixed(8)} ${coin}${e.cash > 0 ? ` + ${e.cash.toFixed(2)} USDT` : ""} at ${formatPrice(e.px)}. No order placed on arming: it waits for the first red dot AFTER this bar. The pump ladder and dot flip are stood down.` });
+                      continue;
+                    }
+                    const isSell = e.kind === "ladder-sell";
+                    const isFill = e.kind === "ladder-fill";
+                    let execNote = "Measure only — no order placed.";
+                    try {
+                      const prods = await spotProducts();
+                      if (isSell) {
+                        const reserveBps = num("ACCUM_SELL_RESERVE_BPS", 15);
+                        const walletBase = PF && Number.isFinite(PF.baseBalance) ? PF.baseBalance : null;
+                        const sellable = walletBase != null ? walletBase * (1 - reserveBps / 1e4) : null;
+                        const sellQty = sellable != null ? Math.min(e.units, sellable) : e.units;
+                        const built = buildSpotOrder(coin, "Sell", { price: e.px, baseQty: sellQty }, prods);
+                        if (built.err) { execNote = `Spot order NOT built: ${built.err}`; if (armedExec) llUnplaced = built.err; }
+                        else {
+                          const sr = await sendSpotOrder(built.order, sellQty * e.px, { cap: capUsdt, exec: book.exec });
+                          execNote = sr.ok ? `SPOT SELL PLACED (${built.order.clOrdID})`
+                                   : sr.dry ? `dry run — would have sent a SPOT sell (${sr.why})`
+                                            : `spot sell refused: ${sr.error}`;
+                          if (armedExec && !sr.ok) llUnplaced = sr.dry ? sr.why : sr.error;
+                        }
+                      } else {
+                        const walletQuote = PF && Number.isFinite(PF.quoteBalance) ? PF.quoteBalance : null;
+                        const buyQty = walletQuote != null ? Math.min(e.cash, walletQuote) : e.cash;
+                        const built = buildSpotOrder(coin, "Buy", { price: e.px, quoteQty: buyQty }, prods);
+                        if (built.err) { execNote = `Spot order NOT built: ${built.err}`; if (armedExec) llUnplaced = built.err; }
+                        else {
+                          const sr = await sendSpotOrder(built.order, buyQty, { cap: capUsdt, exec: book.exec });
+                          execNote = sr.ok ? `SPOT BUY PLACED (${built.order.clOrdID})`
+                                   : sr.dry ? `dry run — would have sent a SPOT buy (${sr.why})`
+                                            : `spot buy refused: ${sr.error}`;
+                          if (armedExec && !sr.ok) llUnplaced = sr.dry ? sr.why : sr.error;
+                        }
+                      }
+                    } catch (err) {
+                      execNote = "spot path errored (no order sent): " + (err && err.message);
+                      if (armedExec) llUnplaced = String(err && err.message || err);
+                    }
+                    await pushLog({ coin, result: isSell ? "LADDER SELL" : (isFill ? "LADDER FILL" : "LADDER SWEEP"),
+                      skipped: isSell
+                        ? `red dot — sold the whole stack, ${e.units.toFixed(8)} ${coin} at ${formatPrice(e.px)}, laddering ${e.rungs} buy-backs 5% apart. ${execNote}`
+                        : isFill
+                        ? `rung filled at ${formatPrice(e.px)} — ${e.units.toFixed(8)} ${coin} on ${e.usdt.toFixed(2)} USDT. ${execNote}`
+                        : `green dot — swept the remaining cash back to coins, ${e.units.toFixed(8)} ${coin} at ${formatPrice(e.px)} on ${e.cash.toFixed(2)} USDT. ${execNote}` });
+                  }
+                  if (llUnplaced) {
+                    ll = llBefore || { tf: null, units: 0, cash: 0, trips: 0, sells: 0, fills: 0, lastT: 0, lastFineT: 0, startUnits: 0, open: [] };
+                    console.error(`live dot-ladder: ORDER DID NOT PLACE (${llUnplaced}) — book rolled back, retried next run`);
+                    await pushLog({ coin, result: "LADDER UNPLACED",
+                      skipped: `a dot-ladder order did not reach the venue (${llUnplaced}). The strategy's book has been rolled back to match the wallet — nothing was bought or sold. It will retry on the next run.` });
+                  }
+                  const lpx = lbars[lbars.length - 1].c;
+                  ll.unitsNow = +(ll.units + (ll.cash || 0) / lpx).toFixed(8);
+                  ll.gainPct = +(((ll.unitsNow / (ll.startUnits || ll.unitsNow || 1)) - 1) * 100).toFixed(2);
+                  ll.holding = (ll.units || 0) * lpx > (ll.cash || 0);
+                  await setJSON(LIVE_LADDER_KEY, ll);
+                  state.units = ll.units; state.cash = ll.cash || 0;
+                  state.liveLadder = { tf: ll.tf, blocked: false, armedAt: ll.armedAt, units: ll.units,
+                                       cash: ll.cash, unitsNow: ll.unitsNow, startUnits: ll.startUnits,
+                                       gainPct: ll.gainPct, holding: ll.holding, trips: ll.trips, sells: ll.sells,
+                                       fills: ll.fills, resting: Array.isArray(ll.open) ? ll.open.length : 0 };
+                  console.log(`live dot-ladder (REAL, 2x5%): ${ll.unitsNow} units vs ${ll.startUnits} at arming — ${ll.gainPct >= 0 ? "+" : ""}${ll.gainPct}% · ${ll.sells} sells, ${ll.fills} fills, ${ll.trips} sweeps · ${ll.holding ? "holding coins" : "in cash, rungs resting"}`);
+                }
+              }
+            }
+          } else if (flipBlocked) {
             state.liveFlip = { tf: null, want: flipTf, blocked: true,
               why: `waiting for ${state.open.length} resting ladder rung${state.open.length === 1 ? "" : "s"} to fill before the flip can take the coins` };
             console.log(`live flip ${flipTf}: NOT armed — ${state.liveFlip.why}`);
@@ -5039,6 +5396,12 @@ export default async function cipherAgent() {
     // Anything held with no plan gets adopted — see adoptOrphans. Bookkeeping only, no orders.
     const adopted = await adoptOrphans(nowOpen, bookMap);
     if (adopted.length) console.log(`adopted ${adopted.length} plan-less position(s): ${adopted.map(p => p.coin + " " + p.dir).join(", ")} — plan and book attached, no orders placed`);
+    // ── THEN MAKE SURE WHAT HAS A PLAN ACTUALLY HAS A STOP AT THE VENUE (2026-09-02) ────────────
+    // Runs right after adoption so a position just given a plan this run (like SOL) gets checked
+    // in the SAME cycle, not next one. See protectOpenPositions() above for the two bugs this closes.
+    const protect = await protectOpenPositions(nowOpen, priceOf);
+    if (protect.placed || protect.failed || protect.blind)
+      console.log(`protect sweep: ${protect.placed} stop(s) attached, ${protect.failed} failed, ${protect.alreadyOk} already ok, ${protect.blind} unreadable`);
     // ── AND THE ONES IT COULD NOT ADOPT ─────────────────────────────────────────────────────
     // Reported EVERY run, not once when it appeared. A warning you have to have been watching
     // for is not a warning; this is money sitting at the venue with no stop on it, and it stays
