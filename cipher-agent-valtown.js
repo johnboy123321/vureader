@@ -714,6 +714,50 @@ function buildTradePlan(candles, dir, entry) {
 // ═══════════════════════ GUARDS (same rules as the app's exec) ═══════════════════════
 // Leveraged ETFs / stock tickers must never reach a crypto exchange.
 const NOT_CRYPTO = /^(SPY|QQQ|MU|DIA|IWM|TLT|GLD|SLV|VOO|VTI|ARKK|TQQQ|SQQQ|SOXL|SPXL|UPRO|LABU|NVDL|TSLL|MSTU|MSTX)[A-Z]?$/;
+// ═══════════ THE ONE VALIDATED FILTER: NO 1D SHORTS IN A BULL REGIME (2026-09-12) ═══════════
+// Every other filter this project has tried is still measure-only, because every one of them
+// failed when it was finally tested forward — the relative-strength ladder inverted, the regime
+// arm went negative in both live boxes. This one is different, and it is worth writing down why,
+// because the bar it cleared is the bar the next idea has to clear too:
+//
+//   1. Forward-collected, not mined from the same history that suggested it. 19 distinct 1D
+//      short setups across 9 coins, every one resolving at a full stop. Not 91 — the records
+//      were deduplicated first, see shadowRecord.
+//   2. It survived a resolution audit. A 1D stop is ~6.6% wide and was being graded on 4H bars,
+//      which can contain both the stop and the 14.8% target — the artefact that made "43 of 43
+//      were losses" on 2026-08-18. secondOpinion() re-walked all 78 records on 1H bars: agree
+//      78/78, 78 stop / 0 target / 0 timeout. The stop genuinely traded first.
+//   3. An independent pre-registered scan found it without being asked. Run #575's insight
+//      scanner, 14 buckets watched: `timeframe=1D −1R over 55, holds in both halves`.
+//
+// SCOPED TO THE REGIME IT WAS OBSERVED IN, on purpose. Everything above was measured in a bull
+// market (BTC +10.2% over its 200D line the day this shipped), and [[cipher-backtest-verdict]]'s
+// year-by-year showed shorts IMPROVING, to +0.11R in 2026 — so "1D shorts always lose" is not
+// what the evidence says, and deleting the short engine would be fitting one month. The rule
+// applies while the regime reads bull and lifts itself when it does not, at which point fresh
+// evidence starts accruing on its own.
+//
+// AND IT DOES NOT BLIND ITS OWN MEASUREMENT. The refusal happens in the decision loop AFTER
+// rankPool.push(), which is what feeds the shadow framework, so every trade this rule blocks is
+// still recorded and still graded on forward candles. If 1D shorts start paying, the shadow
+// record will say so and this gets revoked. A filter that stops measuring what it filters can
+// never be proven wrong, which is the one property no rule in this bot is allowed to have.
+//
+// GATE_1D_SHORTS=0 turns it off; GATE_1D_SHORTS_REGIME names the regime it applies in.
+const SHORT_1D_GATE        = String(env("GATE_1D_SHORTS", "1")) !== "0";
+const SHORT_1D_GATE_REGIME = String(env("GATE_1D_SHORTS_REGIME", "bull"));
+
+// Returns a refusal reason, or null to allow the trade through.
+function gate1dShort(dir, planTf, regimeLabel) {
+  if (!SHORT_1D_GATE) return null;
+  if (dir !== "short") return null;
+  if ((planTf || "1D") !== "1D") return null;
+  if (regimeLabel !== SHORT_1D_GATE_REGIME) return null;
+  return `1D shorts are refused while the regime reads ${regimeLabel} — 19 of 19 distinct 1D `
+       + `short setups on record resolved at a full stop, and re-walking all 78 records on 1H `
+       + `agreed 78/78. Still recorded as a shadow decision, so this lifts itself if that changes.`;
+}
+
 function planValid(t) {
   const en = +t.entry, sl = +t.sl, isLong = (t.dir || "long") !== "short";
   if (!Number.isFinite(en) || en <= 0) return "no entry price";
@@ -1967,11 +2011,60 @@ function hedgeCloseOrder(pos) {
 const DEHEDGE_KEY = "cipher_dehedge_failed";
 const DEHEDGE_GIVE_UP = 3;
 
+// ── A FIX TO THE ORDER PATH MUST UN-LATCH WHAT THE BROKEN PATH GAVE UP ON (2026-09-12) ────────
+// The give-up counter below is deliberately sticky: three refusals and the leg is left alone until
+// its size changes, because re-asking a venue that will never accept a dust stub is pure noise.
+// That is right when the VENUE refused. It is exactly wrong when the refusal came from this file.
+//
+// Every latched entry on 2026-09-12 read `"refPx required to size-check the order"` — which was
+// never the venue at all. It was directGuards() rejecting the bot's own valid reduce-only close
+// (found and fixed 2026-09-08, finally deployed 2026-09-12). So the counters had recorded a defect
+// that no longer exists; worse, the give-up message had told John the legs were dust stubs he must
+// close by hand, when the bot could have closed them itself all along. Run #575 still reported
+// "3 given up on" with the WORKING code in place, because the latch outlived the bug it recorded.
+//
+// Bump DEHEDGE_CODE_REV whenever the order-building or de-hedge path changes. On the first run
+// after a bump every counter is zeroed — entries are kept, with prevN, so a genuine repeat failure
+// still reads as history rather than starting from nothing. Bounded by design: a bump buys at most
+// DEHEDGE_GIVE_UP fresh attempts per leg and then it latches again, so a real venue refusal costs
+// three more asks, once, and never a loop.
+const DEHEDGE_REV_KEY  = "cipher_dehedge_rev";
+const DEHEDGE_CODE_REV = "2026-09-12-reduceonly-guard";
+
+// Zero the give-up counters once, after the order path changes. Mutates `failed` in place and
+// returns how many legs were un-latched, so the caller can say so out loud rather than silently.
+function unlatchDehedge(failed, storedRev) {
+  if (storedRev === DEHEDGE_CODE_REV) return 0;
+  let n = 0;
+  for (const k of Object.keys(failed || {})) {
+    const e = failed[k];
+    if (!e || typeof e !== "object" || !(Number(e.n) > 0)) continue;
+    e.prevN = Number(e.n);
+    e.n = 0;
+    e.unlatchedBy = DEHEDGE_CODE_REV;
+    e.unlatchedAt = Date.now();
+    n++;
+  }
+  return n;
+}
+
 async function resolveHedges(positions) {
   const out = { found: 0, closed: 0, failed: 0, givenUp: 0 };
   if (String(env("HEDGE_FIX", "1")) !== "1") return out;
   const failed = (await getJSON(DEHEDGE_KEY, {})) || {};
   let failedDirty = false;
+  // ── un-latch first, so a leg the OLD code gave up on gets a fair try under the new one ──────
+  // The stamp is written whether or not anything needed clearing, or this would run every run.
+  const dehedgeRev = await getJSON(DEHEDGE_REV_KEY, null);
+  if (dehedgeRev !== DEHEDGE_CODE_REV) {
+    const unlatched = unlatchDehedge(failed, dehedgeRev);
+    if (unlatched) {
+      failedDirty = true;
+      console.log(`de-hedge: ${unlatched} leg(s) un-latched — they gave up under an order path `
+        + `that has since changed (now ${DEHEDGE_CODE_REV}), so they get ${DEHEDGE_GIVE_UP} fresh attempts`);
+    }
+    try { await setJSON(DEHEDGE_REV_KEY, DEHEDGE_CODE_REV); } catch { }
+  }
   const bySym = new Map();
   for (const p of positions) {
     if (!(Math.abs(Number(p.size) || 0) > 0)) continue;
@@ -5229,6 +5322,12 @@ export default async function cipherAgent() {
     if (held.has(book + "|" + coin)) { await pushLog({ coin, dir: sig.bias, book, score: sig.score, skipped: `already holding ${coin} in the ${book} book` }); continue; }
     if (sameDir(book, sig.bias) >= bcfg.corrMax()) { await pushLog({ coin, dir: sig.bias, book, score: sig.score, skipped: `correlation guard — already ${sameDir(book, sig.bias)} ${sig.bias} positions in the ${book} book (max ${bcfg.corrMax()})` }); continue; }
     if (placedInBook[book] + placedToday >= CFG.dayCap() || placedInBook[book] >= bcfg.dayCap()) { await pushLog({ coin, dir: sig.bias, book, score: sig.score, skipped: `daily cap reached for the ${book} book (${bcfg.dayCap()})` }); continue; }
+    // The only filter in this bot that is allowed to refuse a trade on evidence — see gate1dShort.
+    // Placed after rankPool.push() above, so the decision it blocks is still measured.
+    {
+      const why1d = gate1dShort(sig.bias, sig.planTf, REGIME.label);
+      if (why1d) { await pushLog({ coin, dir: sig.bias, book, score: sig.score, skipped: "REFUSED — " + why1d }); continue; }
+    }
 
     const planBars = bars[sig.planTf] || await fetchCandles(coin, sig.planTf || "1D", 260);
     const plan = planBars ? buildTradePlan(planBars, sig.bias, sig.price) : null;
