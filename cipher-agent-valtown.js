@@ -714,50 +714,6 @@ function buildTradePlan(candles, dir, entry) {
 // ═══════════════════════ GUARDS (same rules as the app's exec) ═══════════════════════
 // Leveraged ETFs / stock tickers must never reach a crypto exchange.
 const NOT_CRYPTO = /^(SPY|QQQ|MU|DIA|IWM|TLT|GLD|SLV|VOO|VTI|ARKK|TQQQ|SQQQ|SOXL|SPXL|UPRO|LABU|NVDL|TSLL|MSTU|MSTX)[A-Z]?$/;
-// ═══════════ THE ONE VALIDATED FILTER: NO 1D SHORTS IN A BULL REGIME (2026-09-12) ═══════════
-// Every other filter this project has tried is still measure-only, because every one of them
-// failed when it was finally tested forward — the relative-strength ladder inverted, the regime
-// arm went negative in both live boxes. This one is different, and it is worth writing down why,
-// because the bar it cleared is the bar the next idea has to clear too:
-//
-//   1. Forward-collected, not mined from the same history that suggested it. 19 distinct 1D
-//      short setups across 9 coins, every one resolving at a full stop. Not 91 — the records
-//      were deduplicated first, see shadowRecord.
-//   2. It survived a resolution audit. A 1D stop is ~6.6% wide and was being graded on 4H bars,
-//      which can contain both the stop and the 14.8% target — the artefact that made "43 of 43
-//      were losses" on 2026-08-18. secondOpinion() re-walked all 78 records on 1H bars: agree
-//      78/78, 78 stop / 0 target / 0 timeout. The stop genuinely traded first.
-//   3. An independent pre-registered scan found it without being asked. Run #575's insight
-//      scanner, 14 buckets watched: `timeframe=1D −1R over 55, holds in both halves`.
-//
-// SCOPED TO THE REGIME IT WAS OBSERVED IN, on purpose. Everything above was measured in a bull
-// market (BTC +10.2% over its 200D line the day this shipped), and [[cipher-backtest-verdict]]'s
-// year-by-year showed shorts IMPROVING, to +0.11R in 2026 — so "1D shorts always lose" is not
-// what the evidence says, and deleting the short engine would be fitting one month. The rule
-// applies while the regime reads bull and lifts itself when it does not, at which point fresh
-// evidence starts accruing on its own.
-//
-// AND IT DOES NOT BLIND ITS OWN MEASUREMENT. The refusal happens in the decision loop AFTER
-// rankPool.push(), which is what feeds the shadow framework, so every trade this rule blocks is
-// still recorded and still graded on forward candles. If 1D shorts start paying, the shadow
-// record will say so and this gets revoked. A filter that stops measuring what it filters can
-// never be proven wrong, which is the one property no rule in this bot is allowed to have.
-//
-// GATE_1D_SHORTS=0 turns it off; GATE_1D_SHORTS_REGIME names the regime it applies in.
-const SHORT_1D_GATE        = String(env("GATE_1D_SHORTS", "1")) !== "0";
-const SHORT_1D_GATE_REGIME = String(env("GATE_1D_SHORTS_REGIME", "bull"));
-
-// Returns a refusal reason, or null to allow the trade through.
-function gate1dShort(dir, planTf, regimeLabel) {
-  if (!SHORT_1D_GATE) return null;
-  if (dir !== "short") return null;
-  if ((planTf || "1D") !== "1D") return null;
-  if (regimeLabel !== SHORT_1D_GATE_REGIME) return null;
-  return `1D shorts are refused while the regime reads ${regimeLabel} — 19 of 19 distinct 1D `
-       + `short setups on record resolved at a full stop, and re-walking all 78 records on 1H `
-       + `agreed 78/78. Still recorded as a shadow decision, so this lifts itself if that changes.`;
-}
-
 function planValid(t) {
   const en = +t.entry, sl = +t.sl, isLong = (t.dir || "long") !== "short";
   if (!Number.isFinite(en) || en <= 0) return "no entry price";
@@ -996,23 +952,9 @@ function directGuards(o) {
   const symbol = String(o.symbol || "").toUpperCase();
   const wl = CFG.whitelist().split(",").map(s => s.trim().toUpperCase());
   if (!wl.includes("*") && !wl.includes(symbol)) return `symbol ${symbol} not in whitelist`;
-  const qty = Number(o.orderQtyRq);
+  const qty = Number(o.orderQtyRq), refPx = Number(o.refPx || o.priceRp), sl = Number(o.stopLossRp);
   if (!(qty > 0)) return "orderQtyRq must be > 0";
   if (o.side !== "Buy" && o.side !== "Sell") return "side must be Buy or Sell";
-  // ── REDUCE-ONLY CLOSES SKIP THE OPENING-ORDER SANITY CHECKS (2026-09-08) ──────────────────────
-  // Everything below here exists to sanity-check a NEW position: is the stop on the correct side
-  // of a real entry price, is it far enough away, is the notional inside the cap. A reduce-only
-  // close (de-hedge, time-stop) carries none of that — no refPx, no stopLossRp — because it is not
-  // opening anything, only shrinking a position that already exists. Gating it on refPx meant
-  // every reduce-only close this file ever built was refused right here before it reached Phemex,
-  // logged as "refPx required to size-check the order" as if the VENUE had said no, when it was
-  // this function refusing its own valid order. Found 2026-09-08: AVAX (and ADA 08-31, UNI 09-03
-  // before it) sat holding both a long and a short for days because resolveHedges() kept building
-  // a correct reduce-only close and this gate kept rejecting it — three times, then giving up
-  // silently per coin (see DEHEDGE_GIVE_UP). reduceOnly can only ever shrink a position, never
-  // open or flip one, which is what makes skipping these checks safe for it and only it.
-  if (o.reduceOnly === true) return null;
-  const refPx = Number(o.refPx || o.priceRp), sl = Number(o.stopLossRp);
   if (!(refPx > 0)) return "refPx required to size-check the order";
   if (!(sl > 0)) return "refusing order with no stop loss";
   const isLong = o.side === "Buy";
@@ -1863,37 +1805,6 @@ function barsOpen(rec, now) {
   return Math.floor((now - rec.at) / ms);
 }
 
-// ── THE DECISION HAS TO BE INSIDE THE WINDOW (2026-09-12) ─────────────────────────────────────
-// Every grader in this file used to find its entry bar with `candles.findIndex(c => c.t >= rec.at)`
-// and treat the result as the moment of the decision. That is right whenever the fetched window
-// reaches back past `rec.at` — and silently, dangerously wrong when it does not, because then
-// EVERY candle is newer than the decision, findIndex returns 0, and the trade gets walked from
-// the START OF THE WINDOW instead: days or weeks after the signal was given.
-//
-// That is not harmless noise. In a trending market the first bar of a late window is already
-// beyond the target for a long (instant full win) or beyond the stop for a short (instant full
-// loss), so the error has a SIGN, and an arm fills up with 2.25s and −1s that no decision ever
-// earned. Its signature in the stored history is a whole bucket at exactly 2.25 or exactly −1
-// with identical halves — visible in the first entries of both the relative-strength and regime
-// arms, and the likeliest explanation for the maker arm reading +0.671R/decision over n=1501 on
-// 2026-09-12 while the realised book over the same rules ran at −0.071R/trade.
-//
-// The comment on gradeShadow asserting a decision "cannot age out of the window" is the
-// assumption that fails: 600 bars covers 100d at 4H but only 12.5d at 30m and 6.25d at 15m, and
-// the maker and time-stop arms retry records that never settle indefinitely, so records do age
-// past their window and were graded anyway. 382 of the maker arm's 600 remembered records were
-// older than a 30m window on the day this was found.
-//
-// Returning −1 makes the caller leave the record ungraded and try again on a later run. A record
-// that has aged out for good is simply retried until it falls off the end of the 600-record pool,
-// which costs a candle fetch and never a wrong number. Grading NOTHING is always recoverable;
-// grading a trade from the wrong week is not.
-function decisionBar(rec, candles) {
-  if (!candles || !candles.length) return -1;
-  if (candles[0].t > rec.at) return -1;      // window starts after the decision — cannot answer
-  return candles.findIndex(c => c.t >= rec.at);   // −1 when no bar has reached it yet
-}
-
 // What WOULD a time stop of N bars have scored on a decision we already have candles for?
 // Deliberately reuses gradeOne's walk so the two arms are scored by identical rules — the only
 // difference between them is when they give up.
@@ -1901,7 +1812,7 @@ function gradeWithTimeStop(rec, candles, maxBars) {
   const risk = Math.abs(rec.entry - rec.stop);
   if (!(risk > 0) || !candles || !candles.length) return null;
   const isLong = rec.dir !== "short";
-  const start = decisionBar(rec, candles);   // −1 if the window cannot reach the decision
+  const start = candles.findIndex(c => c.t >= rec.at);
   if (start < 0) return null;
   for (let i = start; i < candles.length; i++) {
     const c = candles[i];
@@ -1950,7 +1861,7 @@ function gradeMakerEntry(rec, candles, expiryH) {
   const risk = Math.abs(rec.entry - rec.stop);
   if (!(risk > 0) || !candles || !candles.length) return null;
   const isLong = rec.dir !== "short";
-  const start = decisionBar(rec, candles);   // −1 if the window cannot reach the decision
+  const start = candles.findIndex(c => c.t >= rec.at);
   if (start < 0) return null;
   const stopPct = risk / rec.entry;
   const takerGross = walkFromBar(rec, candles, start, rec.entry);
@@ -2011,60 +1922,11 @@ function hedgeCloseOrder(pos) {
 const DEHEDGE_KEY = "cipher_dehedge_failed";
 const DEHEDGE_GIVE_UP = 3;
 
-// ── A FIX TO THE ORDER PATH MUST UN-LATCH WHAT THE BROKEN PATH GAVE UP ON (2026-09-12) ────────
-// The give-up counter below is deliberately sticky: three refusals and the leg is left alone until
-// its size changes, because re-asking a venue that will never accept a dust stub is pure noise.
-// That is right when the VENUE refused. It is exactly wrong when the refusal came from this file.
-//
-// Every latched entry on 2026-09-12 read `"refPx required to size-check the order"` — which was
-// never the venue at all. It was directGuards() rejecting the bot's own valid reduce-only close
-// (found and fixed 2026-09-08, finally deployed 2026-09-12). So the counters had recorded a defect
-// that no longer exists; worse, the give-up message had told John the legs were dust stubs he must
-// close by hand, when the bot could have closed them itself all along. Run #575 still reported
-// "3 given up on" with the WORKING code in place, because the latch outlived the bug it recorded.
-//
-// Bump DEHEDGE_CODE_REV whenever the order-building or de-hedge path changes. On the first run
-// after a bump every counter is zeroed — entries are kept, with prevN, so a genuine repeat failure
-// still reads as history rather than starting from nothing. Bounded by design: a bump buys at most
-// DEHEDGE_GIVE_UP fresh attempts per leg and then it latches again, so a real venue refusal costs
-// three more asks, once, and never a loop.
-const DEHEDGE_REV_KEY  = "cipher_dehedge_rev";
-const DEHEDGE_CODE_REV = "2026-09-12-reduceonly-guard";
-
-// Zero the give-up counters once, after the order path changes. Mutates `failed` in place and
-// returns how many legs were un-latched, so the caller can say so out loud rather than silently.
-function unlatchDehedge(failed, storedRev) {
-  if (storedRev === DEHEDGE_CODE_REV) return 0;
-  let n = 0;
-  for (const k of Object.keys(failed || {})) {
-    const e = failed[k];
-    if (!e || typeof e !== "object" || !(Number(e.n) > 0)) continue;
-    e.prevN = Number(e.n);
-    e.n = 0;
-    e.unlatchedBy = DEHEDGE_CODE_REV;
-    e.unlatchedAt = Date.now();
-    n++;
-  }
-  return n;
-}
-
 async function resolveHedges(positions) {
   const out = { found: 0, closed: 0, failed: 0, givenUp: 0 };
   if (String(env("HEDGE_FIX", "1")) !== "1") return out;
   const failed = (await getJSON(DEHEDGE_KEY, {})) || {};
   let failedDirty = false;
-  // ── un-latch first, so a leg the OLD code gave up on gets a fair try under the new one ──────
-  // The stamp is written whether or not anything needed clearing, or this would run every run.
-  const dehedgeRev = await getJSON(DEHEDGE_REV_KEY, null);
-  if (dehedgeRev !== DEHEDGE_CODE_REV) {
-    const unlatched = unlatchDehedge(failed, dehedgeRev);
-    if (unlatched) {
-      failedDirty = true;
-      console.log(`de-hedge: ${unlatched} leg(s) un-latched — they gave up under an order path `
-        + `that has since changed (now ${DEHEDGE_CODE_REV}), so they get ${DEHEDGE_GIVE_UP} fresh attempts`);
-    }
-    try { await setJSON(DEHEDGE_REV_KEY, DEHEDGE_CODE_REV); } catch { }
-  }
   const bySym = new Map();
   for (const p of positions) {
     if (!(Math.abs(Number(p.size) || 0) > 0)) continue;
@@ -3317,22 +3179,9 @@ async function spotProducts() {
   } catch (e) { console.error("spot products read failed:", e && e.message); return null; }
 }
 
-// Build a spot order. Returns { order, debug } or { err } — never a half-built order.
+// Build a spot order. Returns { order } or { err } — never a half-built order.
 //   side "Sell": we are selling BASE (BTC), so baseQtyEv carries the size
 //   side "Buy" : we are spending QUOTE (USDT), so quoteQtyEv carries the spend
-//
-// ── DIAGNOSTIC FIELDS ADDED 2026-09-07 ─────────────────────────────────────────────────────
-// Every live BUY since 2026-09-04T15:07 has been refused with `phemex 11053: TE_PRICE_TOO_LARGE`
-// — ~22 attempts in a row, at different real BTC prices, all rejected identically — while SELLs
-// on the same symbol, using the same priceEp formula, have gone through. That asymmetry rules out
-// "priceScale is just wrong" (a wrong scale would break both sides the same way) and points at
-// something that only matters for a ByQuote BUY specifically. `ratioScale` is read off the
-// product table (below) and has never been used anywhere in this function — a strong candidate
-// for "the field ByQuote actually needs and Sell/ByBase doesn't." Rather than guess at a fix with
-// no way to test it against the live venue (Phemex is unreachable from every machine this was
-// investigated on), this now returns `debug` alongside `order` — never sent to the venue, since
-// only `order` is ever passed to sendSpotOrder — so the NEXT few failures put real numbers in the
-// log instead of the same unexplained error on repeat.
 function buildSpotOrder(sym, side, { price, baseQty, quoteQty }, products) {
   const symbol = "s" + String(sym).toUpperCase().replace(/^S/, "") + "USDT";
   const p = products && products[symbol];
@@ -3341,16 +3190,10 @@ function buildSpotOrder(sym, side, { price, baseQty, quoteQty }, products) {
     return { err: `incomplete scales for ${symbol} — refusing to send` };
   if (side !== "Buy" && side !== "Sell") return { err: "side must be Buy or Sell" };
   if (!(price > 0)) return { err: "spot order needs a price" };
-  const priceEp = Math.round(price * 10 ** p.priceScale);
   const order = {
     symbol, side, ordType: "Limit", timeInForce: "GoodTillCancel",
-    priceEp,
+    priceEp: Math.round(price * 10 ** p.priceScale),
     clOrdID: ("accum" + sym + Date.now()).replace(/[^a-zA-Z0-9]/g, "").slice(0, 30),
-  };
-  const debug = {
-    priceScale: p.priceScale, baseValueScale: p.baseValueScale, quoteValueScale: p.quoteValueScale,
-    ratioScale: p.ratioScale, baseTickSize: p.baseTickSize, quoteTickSize: p.quoteTickSize,
-    priceEp,
   };
   // qtyType is REQUIRED and tells the venue which of the two quantity fields to read. Missing it
   // was a real defect, caught 2026-08-19 by reading Phemex's own spot docs rather than trusting
@@ -3365,27 +3208,14 @@ function buildSpotOrder(sym, side, { price, baseQty, quoteQty }, products) {
     if (!(baseQty > 0)) return { err: "sell needs a base quantity" };
     order.qtyType = "ByBase";
     order.baseQtyEv = Math.floor(baseQty * 10 ** p.baseValueScale);
-    debug.baseQtyEv = order.baseQtyEv;
     if (!(order.baseQtyEv > 0)) return { err: "base quantity rounds to zero at this scale" };
   } else {
     if (!(quoteQty > 0)) return { err: "buy needs a quote amount" };
     order.qtyType = "ByQuote";
     order.quoteQtyEv = Math.floor(quoteQty * 10 ** p.quoteValueScale);
-    debug.quoteQtyEv = order.quoteQtyEv;
     if (!(order.quoteQtyEv > 0)) return { err: "quote amount rounds to zero at this scale" };
   }
-  return { order, debug };
-}
-
-// Render a buildSpotOrder debug object as a short, log-friendly string. Never touches `order`.
-function fmtSpotDebug(debug) {
-  if (!debug) return "";
-  return ` [priceScale=${debug.priceScale} baseVS=${debug.baseValueScale} quoteVS=${debug.quoteValueScale}` +
-         ` ratioScale=${debug.ratioScale} priceEp=${debug.priceEp}` +
-         (debug.baseQtyEv != null ? ` baseQtyEv=${debug.baseQtyEv}` : "") +
-         (debug.quoteQtyEv != null ? ` quoteQtyEv=${debug.quoteQtyEv}` : "") +
-         (debug.baseTickSize != null ? ` baseTick=${debug.baseTickSize}` : "") +
-         (debug.quoteTickSize != null ? ` quoteTick=${debug.quoteTickSize}` : "") + "]";
+  return { order };
 }
 
 // PREFLIGHT — read-only, answers "can this actually trade spot here?" from the runner itself.
@@ -3968,21 +3798,6 @@ const SHADOW_MAX_RECORDS  = 600;   // keep the state file sane
 const SHADOW_GRADE_AFTER_H = 4;    // don't try to resolve a trade that has had no time to move
 const SHADOW_TIMEOUT_BARS = 40;    // same time cap the app's backtester uses
 
-// Bump this whenever a change alters what a grade MEANS. maker_entry and time_stop keep running
-// totals forever (sum / n / seen), so a guard that stops new bad gradings cannot repair the bad
-// ones already inside those sums — on 2026-09-12 the taker arm read +0.671R/decision over n=1501,
-// roughly ten times anything the realised book has ever produced. The stamp lives on each arm's
-// own slot, so the wipe happens once per arm and the arms then refill under current rules only.
-const SHADOW_GRADER_REV = "2026-09-12-window-guard";
-
-// True exactly once per slot per revision, and only when there is something to throw away.
-function staleArms(slot) {
-  if (slot.graderRev === SHADOW_GRADER_REV) return false;
-  const had = !!(slot.arms && Object.keys(slot.arms).length);
-  slot.graderRev = SHADOW_GRADER_REV;
-  return had;
-}
-
 async function loadShadow() { return (await getJSON(SHADOW_KEY, {})) || {}; }
 async function saveShadow(sh) { await setJSON(SHADOW_KEY, sh); }
 
@@ -3992,38 +3807,11 @@ function shadowSlot(sh, id) {
 }
 
 // A decision, with everything needed to grade it later. `arm` is "baseline" or "variant".
-// Duplicate offers refused this run — reported on the rank_vs_threshold summary line.
-let SHADOW_DUPS_THIS_RUN = 0;
-
 function shadowRecord(sh, id, arm, t, meta) {
   const slot = shadowSlot(sh, id);
-  const rtf = t.planTf || t.tf || "1D";
-  const rentry = +t.entry, rstop = +t.sl;
-  // ── ONE RECORD PER DECISION, NOT ONE PER RUN (2026-09-12) ────────────────────────────────────
-  // The scanner re-offers the same candidate every run for as long as the structure holds, and
-  // every offer used to become its own record. Measured on 2026-09-12: a single ADA 1D short was
-  // on file FOURTEEN times across 23 hours, every copy scored −1, and the 322 graded records in
-  // the state file were only **183 distinct setups** — the 91 records on 1D were just 19.
-  //
-  // Duplicates are not extra evidence. An identical entry and stop resolve identically, so they
-  // inflate every n, and because the copies are perfectly correlated they also shrink every
-  // confidence interval towards a precision the data does not contain. The promotion gate reads
-  // exactly those counts (n ≥ SHADOW_MIN_RESOLVED, both halves the same sign), so thirty
-  // "records" could be six setups seen five times each — which is how a lever gets promoted on
-  // evidence that was never there. It is also the likeliest reason the relative-strength ladder
-  // looked monotonic on record counts and then inverted.
-  //
-  // An exact repeat of arm+coin+dir+tf+entry+stop is the same idea being re-offered, never a
-  // second independent one: these levels come off live structure as floats and do not recur by
-  // coincidence. So it is counted ONCE for as long as it stays on file. The arm is part of the
-  // identity on purpose — baseline and variant are meant to score the same decision, and
-  // dropping the variant's copy would break the comparison the experiment exists to make.
-  const dup = slot.records.find(r => r.arm === arm && r.coin === t.coin && r.dir === t.dir
-                                  && (r.tf || "1D") === rtf && r.entry === rentry && r.stop === rstop);
-  if (dup) { SHADOW_DUPS_THIS_RUN++; return; }
   slot.records.push({
-    at: Date.now(), arm, coin: t.coin, dir: t.dir, tf: rtf,
-    entry: rentry, stop: rstop, target: +(t.tp2 ?? t.tp1),
+    at: Date.now(), arm, coin: t.coin, dir: t.dir, tf: t.planTf || t.tf || "1D",
+    entry: +t.entry, stop: +t.sl, target: +(t.tp2 ?? t.tp1),
     quality: meta && meta.quality, note: meta && meta.note,
     reg: (meta && meta.reg) || null,            // "bull" | "bear" at the moment of the decision
     rs: (meta && meta.rs) != null ? meta.rs : null,  // 1 = trading the field's leader in your direction
@@ -4037,40 +3825,26 @@ function shadowRecord(sh, id, arm, t, meta) {
 // Walk real candles forward from the decision and score it in R. Stop is checked BEFORE target
 // within a candle — the pessimistic reading, same as the app's backtester. Anything still open
 // after the time cap is marked to market.
-// The single candle walk every grader in this file uses. Returns { R, how, ambiguous } — `how` is
-// "stop" | "target" | "timeout" — or null while the decision is still open. One implementation on
-// purpose: two arms compared by two different walks are not compared at all.
-// `capBars` overrides the time cap, in bars OF THE CANDLES PASSED IN, so the same decision can be
-// re-walked at a finer resolution over the same wall-clock horizon.
-function walkDecision(rec, candles, capBars) {
+function gradeOne(rec, candles) {
   const risk = Math.abs(rec.entry - rec.stop);
   if (!(risk > 0) || !candles || !candles.length) return null;
   const isLong = rec.dir !== "short";
-  const start = decisionBar(rec, candles);   // −1 if the window cannot reach the decision
+  const start = candles.findIndex(c => c.t >= rec.at);
   if (start < 0) return null;
-  const cap = capBars || SHADOW_TIMEOUT_BARS * (rec.tfMult || 4);
   for (let i = start; i < candles.length; i++) {
     const c = candles[i];
     const hitStop = isLong ? c.l <= rec.stop : c.h >= rec.stop;
     const hitTgt  = isLong ? c.h >= rec.target : c.l <= rec.target;
     if (hitStop && hitTgt) rec.ambiguous = (rec.ambiguous || 0) + 1;   // counted, never hidden
-    // Stop before target inside one bar — the pessimistic reading. Correct at a resolution where
-    // a single bar cannot hold both; a lie at one where it can. That is what SECOND_OPINION_TF
-    // exists to measure rather than assume.
-    if (hitStop) return { R: -1, how: "stop", ambiguous: hitTgt };
-    if (hitTgt) return { R: +Math.abs(rec.target - rec.entry) / risk, how: "target", ambiguous: false };
+    if (hitStop) return -1;
+    if (hitTgt) return +Math.abs(rec.target - rec.entry) / risk;
     // The cap is 40 bars OF THE SIGNAL'S timeframe. Graded on a finer one, that is 4x as many
     // bars — otherwise a 4H idea would be marked to market after less than a day.
-    if (i - start >= cap) {
-      return { R: (isLong ? c.c - rec.entry : rec.entry - c.c) / risk, how: "timeout", ambiguous: false };
+    if (i - start >= SHADOW_TIMEOUT_BARS * (rec.tfMult || 4)) {
+      return (isLong ? c.c - rec.entry : rec.entry - c.c) / risk;   // marked to market
     }
   }
   return null;                                  // not enough candles yet — leave it open
-}
-
-function gradeOne(rec, candles) {
-  const g = walkDecision(rec, candles);
-  return g ? g.R : null;
 }
 
 // ── GRADE ON A FINER TIMEFRAME THAN THE SIGNAL (2026-08-18) ──────────────────────────────────
@@ -4085,32 +3859,11 @@ function gradeOne(rec, candles) {
 // The same reasoning the confirmation watcher already uses.
 const GRADE_TF_BELOW = { "1D": "4H", "4H": "1H", "1H": "30m", "30m": "15m", "15m": "15m" };
 
-// ── SECOND OPINION ON THE WIDEST SIGNALS (2026-09-12) ────────────────────────────────────────
-// The 2026-08-18 fix above moved grading one timeframe DOWN because a bar wide enough to contain
-// both the stop and the target always scores as a loss (the stop is checked first). It was
-// verified on 4H signals — and never checked on 1D ones, whose stops are roughly twice as wide:
-// median 6.6% against 3.6%, with the target out at 14.8%. A 4H crypto bar spans that often.
-//
-// The live evidence on 2026-09-12: every one of the 19 distinct 1D setups on file had scored
-// EXACTLY −1. Nineteen for nineteen, zero variance. Strip them out and the whole graded book
-// moves from −0.130R to −0.030R and the "shorts are the problem" reading loses most of its
-// weight — so whether that block is the market or the measurement decides what gets changed next.
-//
-// This re-walks each already-graded 1D decision on 1H bars under identical rules and an equal
-// wall-clock cap, then logs how often the finer resolution disagrees. It is advisory: `R` is
-// never touched, nothing is filtered, no gate reads `R2`. If 1H keeps saying "stop", 1D shorts
-// are a real finding and can be acted on. If it says "target" where 4H said "stop", the 4H grade
-// is an artefact and every conclusion drawn from those records has to go.
-const SECOND_OPINION_TF   = { "1D": "1H" };   // signal timeframe → finer timeframe to re-check on
-const SECOND_OPINION_MULT = { "1D": 24 };     // finer bars per signal bar, to keep the cap equal
-
 async function gradeShadow(sh) {
   const cutoff = Date.now() - SHADOW_GRADE_AFTER_H * 3600e3;
   const need = new Map();                        // coin|tf → the records waiting on it
   for (const id of Object.keys(sh)) {
-    const slot = sh[id];
-    if (!slot || !Array.isArray(slot.records)) continue;   // not a grading slot — skip, never throw
-    for (const rec of slot.records) {
+    for (const rec of sh[id].records) {
       if (rec.R !== null || rec.at > cutoff) continue;
       const gtf = GRADE_TF_BELOW[rec.tf || "1D"] || "1H";
       const k = rec.coin + "|" + gtf;
@@ -4131,47 +3884,7 @@ async function gradeShadow(sh) {
       if (R !== null) { rec.R = +R.toFixed(3); rec.gtf = gtf; graded++; }
     }
   }
-  await secondOpinion(sh);
   return graded;
-}
-
-// Re-walk graded decisions whose timeframe has a SECOND_OPINION_TF, at that finer resolution.
-// Measures the grader against itself; changes nothing it reads.
-async function secondOpinion(sh) {
-  const need = new Map();
-  for (const id of Object.keys(sh)) {
-    const slot = sh[id];
-    if (!slot || !Array.isArray(slot.records)) continue;
-    for (const rec of slot.records) {
-      const ftf = SECOND_OPINION_TF[rec.tf || ""];
-      if (!ftf || rec.R === null || rec.R === undefined || rec.R2 !== undefined) continue;
-      const k = rec.coin + "|" + ftf;
-      if (!need.has(k)) need.set(k, []);
-      need.get(k).push(rec);
-    }
-  }
-  if (!need.size) return;
-  const cmp = { n: 0, agree: 0, flip: 0, sum: 0, sum2: 0, stop2: 0, tgt2: 0, to2: 0 };
-  for (const [k, recs] of need) {
-    const [coin, ftf] = k.split("|");
-    let candles = null;
-    try { candles = await fetchCandles(coin, ftf, 600); } catch { }
-    if (!candles) continue;
-    for (const rec of recs) {
-      const cap = SHADOW_TIMEOUT_BARS * (SECOND_OPINION_MULT[rec.tf] || 24);
-      const g = walkDecision(rec, candles, cap);
-      if (!g) continue;                          // finer window can't reach it — try a later run
-      rec.R2 = +g.R.toFixed(3); rec.how2 = g.how; rec.gtf2 = ftf;
-      cmp.n++; cmp.sum += rec.R; cmp.sum2 += rec.R2;
-      if ((rec.R > 0) === (rec.R2 > 0)) cmp.agree++;
-      else if (rec.R <= 0 && rec.R2 > 0) cmp.flip++;      // graded a loss, finer says a win
-      if (g.how === "stop") cmp.stop2++; else if (g.how === "target") cmp.tgt2++; else cmp.to2++;
-    }
-  }
-  if (cmp.n) console.log(`shadow second opinion: ${cmp.n} re-walked finer · graded mean `
-    + `${(cmp.sum / cmp.n).toFixed(3)}R · finer mean ${(cmp.sum2 / cmp.n).toFixed(3)}R · agree `
-    + `${cmp.agree}/${cmp.n} · graded-loss-but-finer-win ${cmp.flip} · finer outcomes: `
-    + `${cmp.stop2} stop / ${cmp.tgt2} target / ${cmp.to2} timeout`);
 }
 
 function armStats(records, arm) {
@@ -4505,7 +4218,6 @@ async function runAccumulator(book = primaryAccumBook()) {
                   execNote = r.ok ? `SPOT SELL PLACED (${built.order.clOrdID})`
                           : r.dry ? `dry run — would have sent a SPOT sell (${r.why})`
                                   : `spot sell refused: ${r.error}`;
-                  execNote += fmtSpotDebug(built.debug);   // DIAGNOSTIC, see buildSpotOrder — 2026-09-07
                 }
               } catch (err) { execNote = "spot path errored (no order sent): " + (err && err.message); }
               await pushLog({ coin, result: "ACCUM SELL",
@@ -4539,7 +4251,6 @@ async function runAccumulator(book = primaryAccumBook()) {
                     execNote = r2.ok ? `SPOT BUY PLACED (${built.order.clOrdID})`
                              : r2.dry ? `dry run — would have sent a SPOT buy (${r2.why})`
                                       : `spot buy refused: ${r2.error}`;
-                    execNote += fmtSpotDebug(built.debug);   // DIAGNOSTIC, see buildSpotOrder — 2026-09-07
                     if (ladderArmed && !r2.ok) ladderUnplaced = r2.dry ? r2.why : r2.error;
                   }
                 }
@@ -4873,9 +4584,6 @@ async function runAccumulator(book = primaryAccumBook()) {
                   execNote = sr.ok ? `SPOT ${isSell ? "SELL" : "BUY"} PLACED (${built.order.clOrdID})`
                            : sr.dry ? `dry run — would have sent a SPOT ${isSell ? "sell" : "buy"} (${sr.why})`
                                     : `spot ${isSell ? "sell" : "buy"} refused: ${sr.error}`;
-                  // DIAGNOSTIC (2026-09-07): the scales/priceEp actually used, never sent to the
-                  // venue — see the big comment above buildSpotOrder for why this was added.
-                  execNote += fmtSpotDebug(built.debug);
                   // Armed and NOT placed is the one outcome the book must never absorb. A dry
                   // note here means a brake fired (kill, cap) while we believed we were live.
                   if (armedExec && !sr.ok) placeFailed = sr.dry ? sr.why : sr.error;
@@ -5322,12 +5030,6 @@ export default async function cipherAgent() {
     if (held.has(book + "|" + coin)) { await pushLog({ coin, dir: sig.bias, book, score: sig.score, skipped: `already holding ${coin} in the ${book} book` }); continue; }
     if (sameDir(book, sig.bias) >= bcfg.corrMax()) { await pushLog({ coin, dir: sig.bias, book, score: sig.score, skipped: `correlation guard — already ${sameDir(book, sig.bias)} ${sig.bias} positions in the ${book} book (max ${bcfg.corrMax()})` }); continue; }
     if (placedInBook[book] + placedToday >= CFG.dayCap() || placedInBook[book] >= bcfg.dayCap()) { await pushLog({ coin, dir: sig.bias, book, score: sig.score, skipped: `daily cap reached for the ${book} book (${bcfg.dayCap()})` }); continue; }
-    // The only filter in this bot that is allowed to refuse a trade on evidence — see gate1dShort.
-    // Placed after rankPool.push() above, so the decision it blocks is still measured.
-    {
-      const why1d = gate1dShort(sig.bias, sig.planTf, REGIME.label);
-      if (why1d) { await pushLog({ coin, dir: sig.bias, book, score: sig.score, skipped: "REFUSED — " + why1d }); continue; }
-    }
 
     const planBars = bars[sig.planTf] || await fetchCandles(coin, sig.planTf || "1D", 260);
     const plan = planBars ? buildTradePlan(planBars, sig.bias, sig.price) : null;
@@ -5486,10 +5188,6 @@ export default async function cipherAgent() {
     // window. No extra trades, no extra risk — just a second question asked of the same data:
     // would giving up after N bars have made more R than holding on?
     const tsSlot = shadowSlot(SHADOW, "time_stop");
-    if (staleArms(tsSlot)) {
-      tsSlot.arms = {};
-      console.log(`shadow time_stop: totals discarded — built by the pre-guard grader (now ${SHADOW_GRADER_REV})`);
-    }
     tsSlot.arms = tsSlot.arms || {};
     const src = (SHADOW.rank_vs_threshold && SHADOW.rank_vs_threshold.records) || [];
     const byKey = new Map();
@@ -5528,11 +5226,6 @@ export default async function cipherAgent() {
     // have returned, net of fees, against the marketable limit the bot actually sends? Graded on
     // the timeframe below the signal so a fill and a stop can be told apart within the bar.
     const meSlot = shadowSlot(SHADOW, "maker_entry");
-    if (staleArms(meSlot)) {
-      meSlot.arms = { taker: { sum: 0, n: 0 }, maker: { sum: 0, n: 0, filled: 0, missed: 0 } };
-      meSlot.seen = [];
-      console.log(`shadow maker_entry: totals discarded — built by the pre-guard grader (now ${SHADOW_GRADER_REV})`);
-    }
     meSlot.arms = meSlot.arms || { taker: { sum: 0, n: 0 }, maker: { sum: 0, n: 0, filled: 0, missed: 0 } };
     meSlot.seen = meSlot.seen || [];
     const meNeed = new Map();
@@ -5566,7 +5259,7 @@ export default async function cipherAgent() {
 
     const v = shadowJudge(SHADOW, "rank_vs_threshold");
     await saveShadow(SHADOW);
-    console.log(`shadow rank_vs_threshold: baseline ${v.base.n} trades @ ${v.base.meanR}R · variant ${v.varr.n} @ ${v.varr.meanR}R · edge ${v.edge >= 0 ? "+" : ""}${v.edge}R${v.ready ? "" : " (still gathering)"}${v.changed ? " — " + v.changed.toUpperCase() : ""}${gradedN ? ` · graded ${gradedN} this run` : ""}${SHADOW_DUPS_THIS_RUN ? ` · ${SHADOW_DUPS_THIS_RUN} duplicate offer(s) not re-recorded` : ""}`);
+    console.log(`shadow rank_vs_threshold: baseline ${v.base.n} trades @ ${v.base.meanR}R · variant ${v.varr.n} @ ${v.varr.meanR}R · edge ${v.edge >= 0 ? "+" : ""}${v.edge}R${v.ready ? "" : " (still gathering)"}${v.changed ? " — " + v.changed.toUpperCase() : ""}${gradedN ? ` · graded ${gradedN} this run` : ""}`);
     if (v.changed) await pushLog({ shadow: "rank_vs_threshold", result: v.changed.toUpperCase(),
       skipped: `ranking ${v.changed}: variant ${v.varr.meanR}R vs baseline ${v.base.meanR}R over ${v.varr.n}/${v.base.n} resolved trades` });
 
