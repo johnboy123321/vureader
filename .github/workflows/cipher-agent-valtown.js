@@ -1,0 +1,6623 @@
+
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  CIPHER AGENT — the 24/7 half of MarketCipherAI
+//
+//  Runs on Val Town as a CRON val (every 15 min on the free plan). Scans a rotating
+//  batch of coins, computes VuManChu Cipher B + structure signals exactly as the
+//  browser app does, builds an ATR trade plan, applies every guard, and places the
+//  order through the EXISTING Phemex relay val. No browser, no open tab, no laptop.
+//
+//  Deliberately does NOT duplicate: order signing (the relay owns that), the
+//  discovery lab, or the learning layer. Those stay in the app. This is the core
+//  loop only — the thing that must never sleep.
+//
+//  ── SETUP ──────────────────────────────────────────────────────────────────────
+//  1. New val → type: Cron. Interval: every 15 minutes.
+//  2. Paste this file (or import it from the GitHub repo like the relay does).
+//  3. Environment variables (val settings → Environment variables):
+//       RELAY_URL    = https://jboy--cc5bad508df411f1b9601607ee4eb77e.web.val.run
+//       RELAY_TOKEN  = (the same token the app uses — Settings → exec token)
+//       MODE         = dry        ← start here. 'armed' places real testnet orders.
+//       RISK_GBP     = 10
+//       MIN_SCORE    = 6
+//       DAY_CAP      = 25
+//       CORR_MAX     = 6
+//       BATCH        = 20         ← coins scanned per run; keeps runs under 60s
+//       AGENT_TOKEN  = (any long random string — protects the /decisions endpoint)
+//  4. Watch the val's logs for the first run, then flip MODE to armed.
+//
+//  Safety that is NOT optional and cannot be configured away:
+//    · never places an order without a stop loss
+//    · stop must be the correct side of entry, 0.3%–35% away
+//    · the relay is testnet-locked and enforces its own notional cap
+//    · MODE=off kills all placing instantly
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// ── Runtime-agnostic: the SAME file runs on Val Town (Deno) and GitHub Actions (Node). ──
+// Keeping one file rather than two copies is deliberate: duplicated trading logic drifts, and
+// a divergence between "what I tested" and "what runs" is the worst class of bug here.
+const IS_DENO = typeof Deno !== "undefined" && Deno.env && typeof Deno.env.get === "function";
+const env = (k, d) => {
+  const v = IS_DENO ? Deno.env.get(k) : (typeof process !== "undefined" ? process.env[k] : undefined);
+  return (v === undefined || v === null || v === "") ? d : v;
+};
+const num = (k, d) => { const v = parseFloat(env(k, "")); return Number.isFinite(v) ? v : d; };
+
+const CFG = {
+  relayUrl: () => String(env("RELAY_URL", "")).replace(/\/+$/, ""),
+  relayToken: () => env("RELAY_TOKEN", ""),
+  mode: () => String(env("MODE", "dry")).toLowerCase(),   // off | dry | armed
+  risk: () => num("RISK_GBP", 10),
+  minScore: () => num("MIN_SCORE", 6),
+  // ── THE CONFLUENCE PATH IS OFF BY DEFAULT (2026-09-19) ─────────────────────────────────────
+  // 3-year replay: 940 trades, −£0.74 a trade, interval excluding zero — one of only two
+  // statistically real losers in the whole record (see the setup-evidence note). The three
+  // pattern detectors (divergence, rollover, green dot) are untouched and still trade.
+  // CONFLUENCE=1 in the workflow turns it back on. While it is off the run still counts how many
+  // coins it WOULD have fired on and prints that, so the decision stays measurable.
+  confluence: () => String(env("CONFLUENCE", "0")) === "1",
+  dayCap: () => num("DAY_CAP", 25),
+  corrMax: () => num("CORR_MAX", 6),
+  batch: () => num("BATCH", 20),
+  universe: () => num("UNIVERSE", 100),
+  // ── Direct execution (2026-08-15). See the EXEC section below for why. ──
+  direct: () => String(env("EXEC_DIRECT", "0")) === "1" && !!env("PHEMEX_KEY", "") && !!env("PHEMEX_SECRET", ""),
+  phemexKey: () => env("PHEMEX_KEY", ""),
+  phemexSecret: () => env("PHEMEX_SECRET", ""),
+  maxNotional: () => num("MAX_NOTIONAL_USDT", 2000),
+  whitelist: () => String(env("WHITELIST", DEFAULT_WHITELIST)),
+  kill: () => String(env("KILL", "0")) === "1",
+  maxAttempts: () => num("MAX_ATTEMPTS", 3),
+  // immediate = enter where price is when the signal fires (how it has always worked)
+  // structure = rest a limit at the zone the move came from and let price come back
+  entryMode: () => String(env("ENTRY_MODE", "immediate")).toLowerCase(),
+  entryExpiryH: () => num("ENTRY_EXPIRY_H", 8),
+  // ── WHICH TIMEFRAME THE REAL COINS FOLLOW (2026-08-19) ────────────────────────────────────
+  // "off" = the pump ladder keeps the stack, which is how this has always worked and stays the
+  // default. Any of the eight timeframes = the dot flip on that timeframe trades the real spot
+  // balance instead, and the ladder stands down. Set from the app panel via the relay; the env
+  // var is the fallback for when the relay cannot be reached.
+  accumFlipTf: () => String(env("ACCUM_FLIP_TF", "off")),
+  // The extra accumulator books, as "XRP:ladder,SOL:30m". Empty means BTC only, exactly as before.
+  accumBooks: () => String(env("ACCUM_BOOKS", "")),
+};
+// The relay's own default list, duplicated here so direct mode enforces the SAME gate. If these
+// two ever need to differ, that must be a deliberate decision, not drift.
+const DEFAULT_WHITELIST = "BTCUSDT,ETHUSDT,SOLUSDT,XRPUSDT,BNBUSDT,DOGEUSDT,ADAUSDT,LINKUSDT,AVAXUSDT,DOTUSDT,LTCUSDT,BCHUSDT,UNIUSDT,ATOMUSDT,NEARUSDT,APTUSDT,ARBUSDT,OPUSDT,SUIUSDT,TONUSDT,TRXUSDT,POLUSDT,FILUSDT,INJUSDT,AAVEUSDT";
+
+// ── State: must survive between runs (the rotation cursor and the fired-set ARE the memory).
+// Val Town → its blob store. GitHub Actions → a JSON file the workflow commits back to the repo.
+// Imports are dynamic so neither runtime chokes on the other's module.
+const KEY = { cursor: "cipher_cursor", fired: "cipher_fired", log: "cipher_log" };
+const STATE_FILE = env("STATE_FILE", "agent-state.json");
+let _blob = null, _fs = null, _fileState = null;
+
+async function loadFileState() {
+  if (_fileState) return _fileState;
+  if (!_fs) _fs = await import("node:fs/promises");
+  try { _fileState = JSON.parse(await _fs.readFile(STATE_FILE, "utf8")); }
+  catch { _fileState = {}; }                       // first run, or the file isn't there yet
+  return _fileState;
+}
+async function getJSON(k, d) {
+  try {
+    if (IS_DENO) {
+      if (!_blob) ({ blob: _blob } = await import("https://esm.town/v/std/blob"));
+      const v = await _blob.getJSON(k); return v ?? d;
+    }
+    const s = await loadFileState();
+    return (k in s) ? s[k] : d;
+  } catch { return d; }
+}
+async function setJSON(k, v) {
+  try {
+    if (IS_DENO) {
+      if (!_blob) ({ blob: _blob } = await import("https://esm.town/v/std/blob"));
+      return await _blob.setJSON(k, v);
+    }
+    const s = await loadFileState();
+    s[k] = v;
+    if (!_fs) _fs = await import("node:fs/promises");
+    await _fs.writeFile(STATE_FILE, JSON.stringify(s, null, 2));
+  } catch (e) { console.error("state write failed:", k, e && e.message); }
+}
+
+// ═══════════════════════ INDICATORS (identical maths to the app) ═══════════════════════
+// Exact VuManChu inputs from John's TradingView header. Divergence levels are ASYMMETRIC.
+const VMC = { chlen: 9, avg: 12, malen: 3,
+  osLevel: -53, obLevel: 53, osLevel2: -60, obLevel2: 60, osLevel3: -75, obLevel3: 100,
+  divOB: 45, divOS: -65,
+  mfiPeriod: 60, mfiMult: 150, mfiPosY: 2.5 };
+
+function emaArr(arr, p) {
+  const k = 2 / (p + 1); const out = []; let e = arr[0];
+  for (let i = 0; i < arr.length; i++) { e = i === 0 ? arr[0] : arr[i] * k + e * (1 - k); out.push(e); }
+  return out;
+}
+function smaArr(arr, p) {
+  const out = [];
+  for (let i = 0; i < arr.length; i++) { if (i < p - 1) { out.push(NaN); continue; } let s = 0; for (let j = i - p + 1; j <= i; j++) s += arr[j]; out.push(s / p); }
+  return out;
+}
+function waveTrend(c) {
+  const src = c.map(x => (x.h + x.l + x.c) / 3);
+  const esa = emaArr(src, VMC.chlen);
+  const de = emaArr(src.map((v, i) => Math.abs(v - esa[i])), VMC.chlen);
+  const ci = src.map((v, i) => de[i] === 0 ? 0 : (v - esa[i]) / (0.015 * de[i]));
+  const wt1 = emaArr(ci, VMC.avg);
+  const wt2 = smaArr(wt1, VMC.malen);
+  return { wt1, wt2 };
+}
+function vmcMoneyFlow(c) {
+  const raw = c.map(x => { const rng = x.h - x.l; return rng === 0 ? 0 : ((x.c - x.o) / rng) * VMC.mfiMult; });
+  return smaArr(raw, VMC.mfiPeriod).map(v => v - VMC.mfiPosY);
+}
+function rsiArr(c, p = 14) {
+  const cl = c.map(x => x.c); const out = new Array(cl.length).fill(NaN);
+  let rg = 0, rl = 0;
+  for (let i = 1; i < cl.length; i++) {
+    const ch = cl[i] - cl[i - 1], g = Math.max(ch, 0), l = Math.max(-ch, 0);
+    if (i <= p) { rg += g; rl += l; if (i === p) { rg /= p; rl /= p; out[i] = 100 - 100 / (1 + rg / (rl || 1e-9)); } }
+    else { rg = (rg * (p - 1) + g) / p; rl = (rl * (p - 1) + l) / p; out[i] = 100 - 100 / (1 + rg / (rl || 1e-9)); }
+  }
+  return out;
+}
+function atrArr(c, p = 14) {
+  const tr = [0];
+  for (let i = 1; i < c.length; i++) tr.push(Math.max(c[i].h - c[i].l, Math.abs(c[i].h - c[i - 1].c), Math.abs(c[i].l - c[i - 1].c)));
+  const out = new Array(c.length).fill(NaN);
+  let a = 0;
+  for (let i = 1; i < c.length; i++) {
+    if (i <= p) { a += tr[i]; if (i === p) out[i] = a / p; }
+    else { a = (out[i - 1] * (p - 1) + tr[i]) / p; out[i] = a; }
+  }
+  return out;
+}
+
+// ═══════════════════════ MARKET DATA (Binance, OKX fallback) ═══════════════════════
+const TF_MS = { "15m": 9e5, "30m": 1.8e6, "1H": 36e5, "4H": 144e5, "1D": 864e5, "1W": 6048e5 };
+function dropUnclosed(arr, tf) {
+  if (!arr || !arr.length) return arr;
+  const ms = TF_MS[tf]; if (!ms) return arr;
+  const t = +arr[arr.length - 1].t;
+  return (Number.isFinite(t) && (t + ms) > Date.now()) ? arr.slice(0, -1) : arr;
+}
+let _binanceUp = true;   // Binance geo-blocks GitHub's US runners; after the first failure we
+                         // skip straight to OKX rather than paying the timeout on every call.
+async function fetchCandles(sym, tf, bars = 260) {
+  const s = String(sym).toUpperCase().replace(/USDT$/, "");
+  // 5m and 2H added 2026-08-19 for the dot-flip timeframe switch. 3H is NOT a standard exchange
+  // interval anywhere, so it is built locally from 1H bars further down rather than requested.
+  const binInt = { "5m": "5m", "15m": "15m", "30m": "30m", "1H": "1h", "2H": "2h", "4H": "4h", "1D": "1d", "1W": "1w" }[tf];
+  const okxBar = { "5m": "5m", "15m": "15m", "30m": "30m", "1H": "1H", "2H": "2H", "4H": "4H", "1D": "1Dutc", "1W": "1Wutc" }[tf];
+  if (!binInt && !okxBar) return null;
+  if (_binanceUp) try {
+    const r = await fetch(`https://api.binance.com/api/v3/klines?symbol=${s}USDT&interval=${binInt}&limit=${Math.min(bars, 1000)}`);
+    if (!r.ok) _binanceUp = false;
+    if (r.ok) { const d = await r.json(); if (Array.isArray(d) && d.length) return dropUnclosed(d.map(k => ({ t: k[0], o: +k[1], h: +k[2], l: +k[3], c: +k[4], v: +k[5] })), tf); }
+  } catch { _binanceUp = false; }
+  try {
+    const r = await fetch(`https://www.okx.com/api/v5/market/candles?instId=${s}-USDT&bar=${okxBar}&limit=${Math.min(bars, 300)}`);
+    if (r.ok) { const j = await r.json(); if (j.data && j.data.length) return dropUnclosed(j.data.map(k => ({ t: +k[0], o: +k[1], h: +k[2], l: +k[3], c: +k[4], v: +k[5] })).reverse(), tf); }
+  } catch { /* no data */ }
+  return null;
+}
+// ── THE VENUE'S OWN CANDLES (2026-08-22) ──────────────────────────────────────────────────────
+// Used ONLY for grading, never for signals. Signals stay on Binance/OKX deliberately: those are
+// the deep books where the structure this bot reads actually means something, and a signal taken
+// from a thin testnet book would be noise. But a POSITION lives and dies on the venue, so the
+// question "did price trade through the stop" has to be asked of the venue.
+//
+// ── PROBED AGAINST THE REAL API, 2026-08-23 ──────────────────────────────────────────────────
+// The shape is confirmed, not assumed. GET /exchange/public/md/v2/kline/last returns
+//   { code, msg, data: { total, rows: [ [ t(sec), interval, lastClose, open, high, low, close,
+//                                         volume, turnover, symbol ], ... ] } }
+// with prices as STRINGS in real units — no scaling on USDT-M contracts — and rows NEWEST FIRST.
+// The scale check is kept anyway, because "no scaling today" is not a promise, and it costs one
+// division to be sure. Nothing here can throw into the caller.
+//
+// ── AND THE REASON THIS WILL REFUSE ON TESTNET ───────────────────────────────────────────────
+// Measured the same minute, same call:
+//     mainnet newest BTC 15m bar : 2026-08-23 18:45   (0.5h old)   close 77317.6
+//     TESTNET newest BTC 15m bar : 2026-07-16 06:45   (38.5d old)  close 64748.6   −16.3%
+// Testnet SOL was worse: o=h=l=c=81.14 at zero volume, after a jump from 208.13. Grading a trade
+// from today against a candle from last month is a far larger error than the mainnet-vs-venue
+// basis this whole change exists to remove — and the scale check does NOT catch it, because
+// 64748/78511 is 0.82 and sails through a factor-of-three window. Hence the freshness gate.
+// On testnet this reader will therefore return null every time and the pass will fall back,
+// labelled "reference". That is the correct answer: this venue publishes no usable history, so
+// the grading question cannot be settled here. It becomes real on a venue whose feed is alive.
+const PHEMEX_RES = { "1m": 60, "5m": 300, "15m": 900, "30m": 1800, "1H": 3600, "4H": 14400, "1D": 86400 };
+const PX_SCALES = [1, 1e2, 1e4, 1e8];
+// Phemex rejects anything else with a 400. Snap UP so we never ask for fewer bars than we need.
+const PHEMEX_LIMITS = [5, 10, 50, 100, 500, 1000];
+// How old the newest bar may be before the feed counts as dead. The agent wakes every 15–40
+// minutes, so three hours is generous for a live venue and instant for a frozen one.
+const VENUE_MAX_AGE_MS = 3 * 36e5;
+
+// PURE, so the scale logic can be tested without a venue. Returns bars or null — never partial.
+function parsePhemexKlines(body, tf, refPx, nowMs = Date.now()) {
+  const rows = (body && body.data && (body.data.rows || body.data.klines || body.data)) || null;
+  if (!Array.isArray(rows) || !rows.length) return null;
+  const num = v => { const n = Number(v); return Number.isFinite(n) ? n : NaN; };
+  // Locate the OHLC block. The documented layout puts open/high/low/close at 3..6; accept a row
+  // that is at least that long and whose four candidates are finite and ordered like a candle.
+  const cand = rows.filter(r => Array.isArray(r) && r.length >= 7);
+  if (!cand.length) return null;
+  const raw = cand.map(r => ({ t: num(r[0]), o: num(r[3]), h: num(r[4]), l: num(r[5]), c: num(r[6]) }))
+                  .filter(b => Number.isFinite(b.o) && Number.isFinite(b.h) && Number.isFinite(b.l) && Number.isFinite(b.c)
+                            && b.h >= b.l && b.h >= b.c && b.l <= b.c);
+  if (!raw.length) return null;
+  // Timestamps: seconds or milliseconds. Anything before 2001 in ms is really seconds.
+  const toMs = t => (t > 0 && t < 1e12) ? t * 1000 : t;
+  // ── THE SCALE CHECK ─────────────────────────────────────────────────────────────────────────
+  // Without a reference we cannot tell 78240 from 7824000000 with any confidence, and guessing
+  // wrong grades every open position as a stop-out. With one, only one scale can be right.
+  if (!(Number.isFinite(refPx) && refPx > 0)) return null;
+  const mid = raw[raw.length - 1].c;
+  let scale = null;
+  for (const s of PX_SCALES) {
+    const r = (mid / s) / refPx;
+    if (r > 0.33 && r < 3) { scale = s; break; }
+  }
+  if (scale === null) return null;                    // refuse rather than invent a range
+  // Oldest first, to match every other candle source in this file. Phemex returns newest first,
+  // and the resolution pass reads the LAST element as "the price now".
+  const out = raw.map(b => ({ t: toMs(b.t), o: b.o / scale, h: b.h / scale, l: b.l / scale, c: b.c / scale }))
+                 .sort((x, y) => x.t - y.t);
+
+  // ── IS THIS FEED ALIVE? ─────────────────────────────────────────────────────────────────────
+  // Phemex testnet's klines were 38.5 days behind mainnet when this was written, and its SOL
+  // series was a flat line at zero volume. Grading a trade from today against a candle from last
+  // month is far worse than the mainnet-vs-venue basis this whole change exists to remove, and
+  // nothing above would have caught it — a 16% price difference sails through the scale check.
+  const newest = out[out.length - 1];
+  if (!newest || !(Number.isFinite(newest.t))) return null;
+  if (nowMs - newest.t > VENUE_MAX_AGE_MS) return null;          // frozen feed
+  if (out.every(b => b.h === b.l)) return null;                  // dead market, not a quiet one
+  return out;
+}
+
+async function phemexCandles(coin, tf, bars, refPx) {
+  const res = PHEMEX_RES[tf];
+  if (!res) return null;
+  try {
+    const sym = String(coin).toUpperCase().replace(/USDT$/, "") + "USDT";
+    const want = Number(bars) || 100;
+    const limit = PHEMEX_LIMITS.find(x => x >= want) || 1000;
+    // /kline (without /last) takes from+to and 400s on a limit. This is the one that takes a limit.
+    const r = await phemexPublic("/exchange/public/md/v2/kline/last",
+      `symbol=${encodeURIComponent(sym)}&resolution=${res}&limit=${limit}`);
+    if (!r || r.status !== 200) return null;
+    return parsePhemexKlines(r.data, tf, refPx);
+  } catch { return null; }
+}
+
+async function topUniverse(n) {
+  const EXCL = /(UP|DOWN|BULL|BEAR)$/;
+  const STABLE = new Set(["USDC", "BUSD", "FDUSD", "TUSD", "DAI", "USDP", "USTC", "EUR", "GBP", "AEUR", "PAXG", "USDT", "EURI"]);
+  const keep = (sym) => sym && !EXCL.test(sym) && !STABLE.has(sym);
+  // Binance blocks US IPs, and GitHub's runners are US-hosted — on Actions this call fails and we
+  // fall through to OKX. Without the OKX step the agent silently dropped to a 10-coin hardcoded
+  // list and scanned the same coins twice per run (found on the first live run, 2026-08-11).
+  try {
+    const r = await fetch("https://api.binance.com/api/v3/ticker/24hr");
+    if (r.ok) {
+      const d = await r.json();
+      const list = d.filter((x) => x.symbol.endsWith("USDT"))
+        .map((x) => ({ sym: x.symbol.slice(0, -4), vol: parseFloat(x.quoteVolume) }))
+        .filter((x) => keep(x.sym) && Number.isFinite(x.vol))
+        .sort((a, b) => b.vol - a.vol).map((x) => x.sym).slice(0, n);
+      if (list.length >= 20) return list;
+    }
+  } catch { /* fall through to OKX */ }
+  try {
+    const r = await fetch("https://www.okx.com/api/v5/market/tickers?instType=SPOT");
+    if (r.ok) {
+      const j = await r.json();
+      const list = (j.data || []).filter((x) => x.instId.endsWith("-USDT"))
+        .map((x) => ({ sym: x.instId.split("-")[0], vol: parseFloat(x.volCcy24h) }))
+        .filter((x) => keep(x.sym) && Number.isFinite(x.vol))
+        .sort((a, b) => b.vol - a.vol).map((x) => x.sym).slice(0, n);
+      if (list.length >= 20) { console.log("universe: OKX (" + list.length + " coins) — Binance unreachable"); return list; }
+    }
+  } catch { /* fall through to the fixed list */ }
+  console.warn("universe: BOTH exchanges unreachable — using the 10-coin fallback list");
+  return ["BTC", "ETH", "SOL", "XRP", "BNB", "DOGE", "ADA", "LINK", "AVAX", "DOT"];
+}
+
+
+// ═══════════════════════ DETECTORS ═══════════════════════
+// EXTRACTED VERBATIM from index.html so the server and the app cannot drift. Do not hand-edit:
+// re-extract if the app's versions change. Ported 2026-08-11 to bring the agent to parity —
+// before this it only had confluence scoring and missed everything these catch.
+function formatPrice(p) {
+  const n = Number(p);
+  if (!Number.isFinite(n)) return String(p);
+  if (n >= 1000) return n.toFixed(1);
+  if (n >= 1) return n.toFixed(4);
+  if (n >= 0.01) return n.toFixed(6);
+  return n.toPrecision(6);
+}
+
+function ema200At(c, i) {
+  if (!c || c.length < 200) return null;
+  const k = 2 / 201; let e = c[0].c;
+  for (let j = 1; j <= i; j++) e = c[j].c * k + e * (1 - k);
+  return e;
+}
+
+function volRatio(c, i) {
+  if (i == null || i < 20) return null;
+  let s = 0; for (let k = i - 20; k < i; k++) s += (c[k].v || 0);
+  const avg = s / 20;
+  return avg > 0 ? (c[i].v || 0) / avg : null;
+}
+
+function wtPivots(wt, kind, left = 2, right = 2) {
+  const out = [];
+  for (let i = left; i < wt.length - right; i++) {
+    const v = wt[i]; if (!Number.isFinite(v)) continue;
+    let ok = true;
+    for (let k = i - left; k <= i + right; k++) {
+      if (k === i || !Number.isFinite(wt[k])) continue;
+      if (kind === 'high' ? wt[k] > v : wt[k] < v) { ok = false; break; }
+    }
+    if (ok) out.push(i);
+  }
+  return out;
+}
+
+// ═══════════════════ MARKET STRUCTURE — where, not whether (2026-08-15) ═══════════════════
+// John's diagnosis, and it is the right one: "VuManChu is great at direction, not entries."
+// Every detector here is momentum — WaveTrend crosses, MFI flips, divergences. They answer
+// "is something turning?" and say nothing about WHERE. So entry has been "wherever price is when
+// the oscillator fires", which on a cross is often well after the move started, and the stop has
+// been ten bars back plus a quarter ATR — defensible, but arbitrary.
+//
+// These functions answer the other half. They are NOT new firing triggers; adding a twelfth
+// trigger to a system with eleven would mostly add noise. They are LOCATIONS: the level a move
+// came from, and the level that invalidates the idea if price trades back through it.
+//
+// Definitions are deliberately explicit, because "order block" means slightly different things to
+// different people and any published claim about them is therefore unfalsifiable. These are ours,
+// they are testable, and the lab can search their parameters like anything else.
+
+// Swing pivots on PRICE (wtPivots above does the same job on the oscillator).
+function pricePivots(c, left = 2, right = 2) {
+  const highs = [], lows = [];
+  for (let i = left; i < c.length - right; i++) {
+    let isH = true, isL = true;
+    for (let k = i - left; k <= i + right; k++) {
+      if (k === i) continue;
+      if (c[k].h >= c[i].h) isH = false;
+      if (c[k].l <= c[i].l) isL = false;
+    }
+    if (isH) highs.push(i);
+    if (isL) lows.push(i);
+  }
+  return { highs, lows };
+}
+
+// Break of structure / change of character.
+//   BOS   = price takes out the last swing high while already trending up (continuation)
+//   CHoCH = price takes out the last swing LOW while trending up (the trend's character changed)
+// Trend is defined by the swings themselves — higher highs AND higher lows — not by an average,
+// so it agrees with what you would call it looking at the chart.
+function marketStructure(c) {
+  const { highs, lows } = pricePivots(c);
+  if (highs.length < 2 || lows.length < 2) return { trend: "none", lastBOS: null, lastCHoCH: null, swingHigh: null, swingLow: null };
+  const hv = highs.slice(-3).map(i => c[i].h), lv = lows.slice(-3).map(i => c[i].l);
+  const up = hv.length >= 2 && hv.at(-1) > hv.at(-2) && lv.at(-1) > lv.at(-2);
+  const dn = hv.length >= 2 && hv.at(-1) < hv.at(-2) && lv.at(-1) < lv.at(-2);
+  const trend = up ? "up" : dn ? "down" : "none";
+  const lastHigh = c[highs.at(-1)].h, lastLow = c[lows.at(-1)].l;
+  const px = c.at(-1).c;
+  let lastBOS = null, lastCHoCH = null;
+  if (px > lastHigh) (trend === "down" ? (lastCHoCH = "bullish") : (lastBOS = "bullish"));
+  if (px < lastLow)  (trend === "up"   ? (lastCHoCH = "bearish") : (lastBOS = "bearish"));
+  return { trend, lastBOS, lastCHoCH, swingHigh: lastHigh, swingLow: lastLow, highIdx: highs.at(-1), lowIdx: lows.at(-1) };
+}
+
+// FAIR VALUE GAP: three candles where price moved so fast it left a hole in the traded range.
+// Bullish gap = candle i's LOW is above candle i-2's HIGH — nothing traded in between.
+// A gap only counts while it is UNFILLED: once price trades back through it the imbalance is gone,
+// which is the whole idea. Returns newest first.
+function findFVGs(c, lookback = 60) {
+  const out = [];
+  const start = Math.max(2, c.length - lookback);
+  for (let i = start; i < c.length; i++) {
+    const a = c[i - 2], z = c[i];
+    if (z.l > a.h) out.push({ kind: "bullish", top: z.l, bottom: a.h, at: i });
+    if (z.h < a.l) out.push({ kind: "bearish", top: a.l, bottom: z.h, at: i });
+  }
+  // Drop any the market has since traded back through.
+  return out.filter(g => {
+    for (let j = g.at + 1; j < c.length; j++) {
+      if (g.kind === "bullish" && c[j].l <= g.bottom) return false;
+      if (g.kind === "bearish" && c[j].h >= g.top) return false;
+    }
+    return true;
+  }).reverse();
+}
+
+// ORDER BLOCK: the last opposing candle before an impulsive move that broke structure.
+// The reasoning is not mystical — it is the last price at which the other side was in control
+// before they lost it, so it is a level with unfinished business. Ours requires the move to be
+// genuinely impulsive (>= 1.2 ATR over 3 candles) so that any old red candle does not qualify.
+function findOrderBlocks(c, lookback = 60) {
+  const atr = atrArr(c, 14);
+  const out = [];
+  const start = Math.max(4, c.length - lookback);
+  for (let i = start; i < c.length - 3; i++) {
+    const a = atr[i]; if (!Number.isFinite(a) || a <= 0) continue;
+    const move3 = c[i + 3].c - c[i].c;
+    if (Math.abs(move3) < 1.2 * a) continue;                 // not impulsive enough to count
+    if (move3 > 0 && c[i].c < c[i].o) out.push({ kind: "bullish", top: Math.max(c[i].o, c[i].c), bottom: c[i].l, at: i, impulse: +(move3 / a).toFixed(2) });
+    if (move3 < 0 && c[i].c > c[i].o) out.push({ kind: "bearish", top: c[i].h, bottom: Math.min(c[i].o, c[i].c), at: i, impulse: +(Math.abs(move3) / a).toFixed(2) });
+  }
+  return out.filter(b => {                                    // still untouched?
+    for (let j = b.at + 4; j < c.length; j++) {
+      if (b.kind === "bullish" && c[j].l <= b.bottom) return false;
+      if (b.kind === "bearish" && c[j].h >= b.top) return false;
+    }
+    return true;
+  }).reverse();
+}
+
+// The nearest unfilled zone that price would have to come BACK to — the pullback entry.
+// For a long: a bullish zone below current price. Rejects zones so far away the trade would be a
+// different idea by the time it filled (>8% is not a pullback, it is a crash).
+function nearestZone(c, dir, maxAwayPct = 8) {
+  const px = c.at(-1).c;
+  const want = dir === "short" ? "bearish" : "bullish";
+  const zones = [...findOrderBlocks(c).map(z => ({ ...z, src: "OB" })), ...findFVGs(c).map(z => ({ ...z, src: "FVG" }))]
+    .filter(z => z.kind === want)
+    .filter(z => (dir === "short" ? z.bottom > px : z.top < px))        // must be a RETURN, not chasing
+    .map(z => ({ ...z, away: Math.abs((dir === "short" ? z.bottom : z.top) - px) / px * 100 }))
+    .filter(z => z.away <= maxAwayPct)
+    .sort((a, b) => a.away - b.away);
+  return zones[0] || null;
+}
+
+function vmcVwapWave(c) {
+  const { wt1, wt2 } = waveTrend(c);
+  return wt1.map((v, i) => v - wt2[i]);
+}
+
+function detectWTDivergence(c) {
+  if (!c || c.length < 80) return null;
+  const { wt1, wt2 } = waveTrend(c), n = c.length, i = n - 1;
+  const mf = vmcMoneyFlow(c);
+  const FRESH = 4; // the confirming cross must be on one of the last few closed bars
+
+  for (const dir of ['short', 'long']) {
+    const bear = dir === 'short';
+    const piv = wtPivots(wt2, bear ? 'high' : 'low');
+    if (piv.length < 2) continue;
+    const b = piv[piv.length - 1], a = piv[piv.length - 2];
+    if (n - 1 - b > 30 || b - a < 3) continue;          // stale, or the two pivots are the same swing
+
+    // price extreme at each pivot (small window around it, since price and WT rarely peak on the same bar)
+    const pxAt = (idx) => { const s = Math.max(0, idx - 2), e = Math.min(n, idx + 3); const seg = c.slice(s, e);
+      return bear ? Math.max(...seg.map(x => x.h)) : Math.min(...seg.map(x => x.l)); };
+    const pA = pxAt(a), pB = pxAt(b), wA = wt2[a], wB = wt2[b];
+
+    const priceExtends = bear ? pB > pA * 1.001 : pB < pA * 0.999;   // genuinely higher high / lower low
+    const wtFails = bear ? wB < wA - 1 : wB > wA + 1;                 // momentum did not follow
+    if (!priceExtends || !wtFails) continue;
+    const extreme = bear ? wB >= VMC.divOB : wB <= VMC.divOS;         // VuManChu divergence zones (+45 / −65)
+    if (!extreme) continue;
+
+    // ── COMPARABILITY CHECK (2026-08-10, found in testing — do not remove) ──
+    // WaveTrend divides by recent volatility. If volatility EXPANDED between the two pivots, the
+    // second WT reading is scaled down by a bigger divisor, so it prints a "lower high" even when
+    // real momentum grew — a permanent fake divergence that would short every strong rally.
+    // Measured on test cases: genuine divergences ran at 0.87–0.93× ATR (a grind, volatility flat
+    // or contracting); false ones at 2.8–3.4× (blow-off expansion). 1.5× sits clear of both.
+    const atr = atrArr(c, 14);
+    const atrA = atr[a], atrB = atr[b];
+    if (Number.isFinite(atrA) && Number.isFinite(atrB) && atrA > 0 && atrB / atrA > 1.5) continue;
+
+    // Confirmation: a WT cross in our direction that happened AT OR AFTER the second pivot.
+    // Anchoring to the pivot (not to "the last N bars") is what makes this robust — the pivot
+    // itself is only confirmed 2 bars late, so a fixed window near `now` misses real signals.
+    // wt1 leads wt2, so the cross lands ON the wt2 pivot bar or 1–2 bars before it — searching
+    // strictly after the pivot finds nothing at all (caught in testing, 2026-08-10).
+    // Take the FIRST cross following the pivot, not the most recent one: searching backwards
+    // picks up an unrelated cross made 30 bars into the move and reports it as fresh.
+    let crossIdx = -1;
+    for (let k = Math.max(1, b - 2); k < n; k++) {
+      const d0 = wt1[k] - wt2[k], d1 = wt1[k - 1] - wt2[k - 1];
+      if (bear ? (d1 >= 0 && d0 < 0) : (d1 <= 0 && d0 > 0)) { crossIdx = k; break; }
+    }
+    if (crossIdx < 0) continue;
+    const barsSince = n - 1 - crossIdx;
+    if (barsSince > 10) continue;                      // the move is long gone — not a signal any more
+
+    const ev = [
+      `${bear ? 'Bearish' : 'Bullish'} divergence: price ${bear ? 'higher high' : 'lower low'} (${formatPrice(pA)} → ${formatPrice(pB)}), WaveTrend ${bear ? 'lower high' : 'higher low'} (${wA.toFixed(0)} → ${wB.toFixed(0)})`,
+      `Pivot in the ${bear ? 'overbought' : 'oversold'} zone (WT ${wB.toFixed(0)})`,
+      `${bear ? 'Red' : 'Green'} dot confirmed ${barsSince === 0 ? 'on the last closed bar' : barsSince + ' bars ago'}`
+    ];
+    const mfAgrees = bear ? mf[i] < mf[Math.max(0, i - 3)] : mf[i] > mf[Math.max(0, i - 3)];
+    if (mfAgrees) ev.push(`Money flow ${bear ? 'rolling over' : 'turning up'}`);
+    if (barsSince > FRESH) ev.push(`Note: already ${barsSince} bars into the move — chasing risk`);
+    return { match: true, dir, label: `Class A ${bear ? 'Bearish' : 'Bullish'} Divergence`,
+      stage: barsSince <= FRESH ? 'fresh' : 'late', ev };
+  }
+  return null;
+}
+
+function detectMomentumRollover(c) {
+  if (!c || c.length < 80) return null;
+  const { wt1, wt2 } = waveTrend(c), mf = vmcMoneyFlow(c), vw = vmcVwapWave(c);
+  // 6-bar window, not 3: on a daily chart the cross prints, then price takes a few bars to
+  // confirm the roll — a 3-bar window missed a cross that was only 4 bars old (caught in testing).
+  const n = c.length, i = n - 1, FRESH = 6;
+  for (const dir of ['short', 'long']) {
+    const bear = dir === 'short';
+    // a cross in our direction on one of the last few closed bars
+    let xi = -1;
+    for (let k = i; k >= n - FRESH && k >= 1; k--) {
+      const d0 = wt1[k] - wt2[k], d1 = wt1[k - 1] - wt2[k - 1];
+      if (bear ? (d1 >= 0 && d0 < 0) : (d1 <= 0 && d0 > 0)) { xi = k; break; }
+    }
+    if (xi < 0) continue;
+    // Tightened 2026-08-12: |wt2| > 10 fired on almost every coin (15 candidates from 20) — it
+    // described the market rather than finding anything. A mid-range cross now has to agree with
+    // the 50 EMA trend; only a genuine extreme-zone cross may go against it.
+    const w = wt2[xi];
+    const extremeZone = bear ? w >= VMC.obLevel : w <= VMC.osLevel;
+    const midRange = bear ? w >= 25 : w <= -25;
+    if (!extremeZone && !midRange) continue;
+    if (!extremeZone) {
+      const closes = c.map(x => x.c), e50 = emaArr(closes, 50);
+      const trendAgrees = bear ? closes[i] < e50[i] : closes[i] > e50[i];
+      if (!trendAgrees) continue;                 // counter-trend mid-range fade = noise
+    }
+    // VWAP wave (the early-warning wave) must agree, and be falling/rising into the cross
+    const vwOK = bear ? (vw[i] < vw[Math.max(0, i - 2)] && vw[i] < 0) : (vw[i] > vw[Math.max(0, i - 2)] && vw[i] > 0);
+    if (!vwOK) continue;
+    // money flow turning with it
+    const mfOK = bear ? mf[i] < mf[Math.max(0, i - 3)] : mf[i] > mf[Math.max(0, i - 3)];
+    if (!mfOK) continue;
+    const ev = [
+      `${bear ? 'Bearish' : 'Bullish'} WaveTrend cross at ${wt2[xi].toFixed(0)}${bear ? (wt2[xi] >= VMC.obLevel ? ' (overbought)' : ' (rolling over from above zero)') : (wt2[xi] <= VMC.osLevel ? ' (oversold)' : ' (turning up from below zero)')}`,
+      `VWAP wave ${bear ? 'below zero and falling' : 'above zero and rising'} (${vw[i].toFixed(1)}) — the early-warning wave agrees`,
+      `Money flow ${bear ? 'rolling over' : 'turning up'}`
+    ];
+    const extreme = bear ? wt2[xi] >= VMC.obLevel : wt2[xi] <= VMC.osLevel;
+    if (extreme) ev.push('Cross happened in the extreme zone — higher quality');
+    const age = i - xi;
+    ev.push(age === 0 ? 'Cross on the last closed bar' : `Cross ${age} bar${age === 1 ? '' : 's'} ago`);
+    return { match: true, dir, label: `Momentum Rollover ${bear ? 'Short' : 'Long'}`,
+      stage: extreme ? 'extreme' : 'mid-range', ev };
+  }
+  return null;
+}
+
+function detectGreenDotMFReversal(c) {
+  if (!c || c.length < 80) return null;
+  const { wt1, wt2 } = waveTrend(c); const mf = vmcMoneyFlow(c); const n = c.length, i = n-1;
+  // green dot must have printed on the last 1–2 closed bars (fresh), in oversold
+  let greenDot=false, gI=i;
+  for (let k=n-1;k>=n-2 && k>=1;k--){ const d0=wt1[k]-wt2[k], d1=wt1[k-1]-wt2[k-1]; if(d1<=0&&d0>0&&wt2[k]<=VMC.osLevel){greenDot=true;gI=k;break;} }
+  if (!greenDot) return null;
+  const mfUp = mf[i] > mf[Math.max(0,i-3)];                 // money flow turning up
+  if (!mfUp) return null;
+  // recent swing low (last 20 bars) for the stop
+  let lo=Infinity; for (let k=Math.max(0,n-20);k<n;k++){ if(c[k].l<lo) lo=c[k].l; }
+  if (!isFinite(lo)||lo<=0) return null;
+  const movePct = (c[i].c-lo)/lo*100;
+  if (movePct >= 40) return null;                            // already run too far — not a fresh reversal
+  // — scoring: deeper oversold, MF acceleration, volume, daily-trend gate —
+  let score = 4;
+  const ev = ['oversold green dot just fired', 'money flow turning up'];
+  const deepOS = wt2[gI] <= -60;
+  if (deepOS) { score++; ev.push('deep oversold (WT ≤ -60)'); } else ev.push('mild oversold');
+  const mfAccel = (mf[i] - mf[Math.max(0,i-2)]) > (mf[Math.max(0,i-2)] - mf[Math.max(0,i-4)]);
+  if (mfAccel) { score++; ev.push('MF accelerating, not just rising'); }
+  const vr = Math.max(volRatio(c, gI) || 0, volRatio(c, i) || 0);
+  if (vr >= 1.5) { score++; ev.push(`volume ${vr.toFixed(1)}× the 20-bar avg`); } else ev.push(`volume ${vr.toFixed(1)}× avg (modest)`);
+  const ema200 = ema200At(c, i);
+  const withTrend = ema200 == null ? null : c[i].c > ema200;
+  if (withTrend === true)  { score++; ev.push('above daily 200 EMA — with trend'); }
+  if (withTrend === false) { score--; ev.push('below daily 200 EMA — counter-trend, half size or skip'); }
+  ev.push(`+${movePct.toFixed(0)}% off the low (early)`);
+  const risk = c[i].c - lo*0.985;
+  return { match:true, dir:'long', label:'Green Dot MF Reversal', stage: withTrend === false ? 'counter-trend reversal' : 'reversal', score, base:lo,
+    entry:c[i].c, stop:lo*0.985, target:c[i].c + (risk>0?risk:c[i].c*0.02)*2, ev };
+}
+
+// ═══════════════════════ SIGNAL: confluence score (mirrors scanCoin) ═══════════════════════
+function analyzeTF(c) {
+  if (!c || c.length < 70) return null;
+  const { wt1, wt2 } = waveTrend(c), mf = vmcMoneyFlow(c), rsi = rsiArr(c), closes = c.map(x => x.c);
+  const e50 = emaArr(closes, 50), i = c.length - 1;
+  const d0 = wt1[i] - wt2[i], d1 = wt1[i - 1] - wt2[i - 1];
+  return {
+    price: closes[i],
+    trendUp: closes[i] > e50[i],
+    bullCross: d1 <= 0 && d0 > 0,
+    bearCross: d1 >= 0 && d0 < 0,
+    wt2: wt2[i],
+    deepOS: wt2[i] <= VMC.osLevel2,
+    deepOB: wt2[i] >= VMC.obLevel2,
+    mfOsc: mf[i],
+    rsi: rsi[i],
+  };
+}
+// Same scoring shape as the app's scanCoin: HTF agreement + entry trigger + money flow + extremes.
+function scoreCoin(tfData) {
+  const d1 = tfData["1D"], h4 = tfData["4H"], h1 = tfData["1H"];
+  if (!d1 && !h4 && !h1) return null;
+  const ups = [d1, h4].filter(Boolean).filter(x => x.trendUp).length;
+  const downs = [d1, h4].filter(Boolean).filter(x => !x.trendUp).length;
+  let bias = "neutral";
+  if (ups >= 1 && downs === 0) bias = "long";
+  else if (downs >= 1 && ups === 0) bias = "short";
+  if (bias === "neutral") return null;
+
+  const ev = []; let score = 0;
+  if (d1 && h4 && d1.trendUp === h4.trendUp) { score += 2; ev.push(`Daily & 4H agree (${d1.trendUp ? "up" : "down"})`); }
+  const entry = h1;
+  if (entry) {
+    if (bias === "short" ? entry.bearCross : entry.bullCross) { score += 2; ev.push(`1H ${bias === "short" ? "bearish" : "bullish"} WT cross`); }
+    if (bias === "short" ? entry.mfOsc < 0 : entry.mfOsc > 0) { score += 1; ev.push(`Money flow ${bias === "short" ? "negative" : "positive"}`); }
+    if (bias === "short" ? entry.deepOB : entry.deepOS) { score += 1; ev.push(`WT deeply ${bias === "short" ? "overbought" : "oversold"} (${Math.round(entry.wt2)})`); }
+    if (Number.isFinite(entry.rsi) && entry.rsi > 25 && entry.rsi < 75) { score += 1; ev.push(`RSI healthy (${Math.round(entry.rsi)})`); }
+  }
+  const px = (entry || d1 || h4).price;
+  // The plan must be built on the timeframe that actually triggered — a 1H entry with a daily
+  // ATR stop is a swing-width stop on an intraday idea, and never works out.
+  const planTf = entry ? "1H" : (h4 ? "4H" : "1D");
+  return { bias, score: Math.min(10, score), ev, price: px, planTf };
+}
+
+// ═══════════════════════ TRADE PLAN (identical to buildTradePlan) ═══════════════════════
+function buildTradePlan(candles, dir, entry) {
+  const atr = atrArr(candles, 14), a = atr[atr.length - 1];
+  if (!Number.isFinite(a) || a <= 0 || !Number.isFinite(entry)) return null;
+  const last10 = candles.slice(-10);
+  let stop;
+  if (dir === "short") { stop = Math.max(...last10.map(k => k.h)) + 0.25 * a; if (stop - entry < 0.6 * a) stop = entry + 1.5 * a; }
+  else { stop = Math.min(...last10.map(k => k.l)) - 0.25 * a; if (entry - stop < 0.6 * a) stop = entry - 1.5 * a; }
+  let stopKind = "swing10";
+
+  // ── STRUCTURAL STOP (2026-08-15) ─────────────────────────────────────────────────────────────
+  // "Ten bars back plus a quarter ATR" is defensible but arbitrary — it is a lookback, not a
+  // reason. The far side of the zone the move came from IS a reason: if price trades back through
+  // the level that caused the impulse, the idea is wrong, and that is what a stop is for.
+  //
+  // Only ever moves the stop CLOSER, never further out — a structural level beyond the swing stop
+  // would be widening risk to suit a story, which is how a plan becomes a hope. Since size is
+  // risk / stopDistance, a tighter honest stop also means a larger position on the same £ risk.
+  const st = marketStructure(candles);
+  const zone = nearestZone(candles, dir);
+  if (zone) {
+    const cand = dir === "short" ? zone.top + 0.15 * a : zone.bottom - 0.15 * a;   // just beyond it
+    const tighter = dir === "short" ? (cand < stop && cand > entry) : (cand > stop && cand < entry);
+    if (tighter && Math.abs(entry - cand) >= 0.4 * a) { stop = cand; stopKind = zone.src; }
+  }
+
+  // A structure stop can be enormous on a volatile coin — ADA came out 14.4% away, giving a
+  // 32% target from a momentum cross that has no edge over a move that size. If structure
+  // demands more than 3 ATR, the setup is not tradeable on this timeframe: refuse it rather
+  // than stretch the plan to fit (2026-08-12).
+  if (Math.abs(entry - stop) > 3 * a) return null;
+  const risk = Math.abs(entry - stop); if (!(risk > 0)) return null;
+  const sgn = dir === "short" ? -1 : 1;
+  return {
+    entry, stop, risk, targets: [1, 2.25, 4].map(m => entry + sgn * risk * m),
+    stopKind, trend: st.trend,
+    // The pullback level, carried but NOT acted on unless ENTRY_MODE=structure. Recorded either
+    // way so the two entry styles can be compared on real trades rather than argued about.
+    zone: zone ? { src: zone.src, top: zone.top, bottom: zone.bottom, awayPct: +zone.away.toFixed(2) } : null,
+  };
+}
+
+// ═══════════════════════ GUARDS (same rules as the app's exec) ═══════════════════════
+// Leveraged ETFs / stock tickers must never reach a crypto exchange.
+const NOT_CRYPTO = /^(SPY|QQQ|MU|DIA|IWM|TLT|GLD|SLV|VOO|VTI|ARKK|TQQQ|SQQQ|SOXL|SPXL|UPRO|LABU|NVDL|TSLL|MSTU|MSTX)[A-Z]?$/;
+// ═══════════ THE ONE VALIDATED FILTER: NO 1D SHORTS IN A BULL REGIME (2026-09-12) ═══════════
+// Every other filter this project has tried is still measure-only, because every one of them
+// failed when it was finally tested forward — the relative-strength ladder inverted, the regime
+// arm went negative in both live boxes. This one is different, and it is worth writing down why,
+// because the bar it cleared is the bar the next idea has to clear too:
+//
+//   1. Forward-collected, not mined from the same history that suggested it. 19 distinct 1D
+//      short setups across 9 coins, every one resolving at a full stop. Not 91 — the records
+//      were deduplicated first, see shadowRecord.
+//   2. It survived a resolution audit. A 1D stop is ~6.6% wide and was being graded on 4H bars,
+//      which can contain both the stop and the 14.8% target — the artefact that made "43 of 43
+//      were losses" on 2026-08-18. secondOpinion() re-walked all 78 records on 1H bars: agree
+//      78/78, 78 stop / 0 target / 0 timeout. The stop genuinely traded first.
+//   3. An independent pre-registered scan found it without being asked. Run #575's insight
+//      scanner, 14 buckets watched: `timeframe=1D −1R over 55, holds in both halves`.
+//
+// SCOPED TO THE REGIME IT WAS OBSERVED IN, on purpose. Everything above was measured in a bull
+// market (BTC +10.2% over its 200D line the day this shipped), and [[cipher-backtest-verdict]]'s
+// year-by-year showed shorts IMPROVING, to +0.11R in 2026 — so "1D shorts always lose" is not
+// what the evidence says, and deleting the short engine would be fitting one month. The rule
+// applies while the regime reads bull and lifts itself when it does not, at which point fresh
+// evidence starts accruing on its own.
+//
+// AND IT DOES NOT BLIND ITS OWN MEASUREMENT. The refusal happens in the decision loop AFTER
+// rankPool.push(), which is what feeds the shadow framework, so every trade this rule blocks is
+// still recorded and still graded on forward candles. If 1D shorts start paying, the shadow
+// record will say so and this gets revoked. A filter that stops measuring what it filters can
+// never be proven wrong, which is the one property no rule in this bot is allowed to have.
+//
+// GATE_1D_SHORTS=0 turns it off; GATE_1D_SHORTS_REGIME names the regime it applies in.
+const SHORT_1D_GATE        = String(env("GATE_1D_SHORTS", "1")) !== "0";
+const SHORT_1D_GATE_REGIME = String(env("GATE_1D_SHORTS_REGIME", "bull"));
+
+// Returns a refusal reason, or null to allow the trade through.
+function gate1dShort(dir, planTf, regimeLabel) {
+  if (!SHORT_1D_GATE) return null;
+  if (dir !== "short") return null;
+  if ((planTf || "1D") !== "1D") return null;
+  if (regimeLabel !== SHORT_1D_GATE_REGIME) return null;
+  return `1D shorts are refused while the regime reads ${regimeLabel} — 19 of 19 distinct 1D `
+       + `short setups on record resolved at a full stop, and re-walking all 78 records on 1H `
+       + `agreed 78/78. Still recorded as a shadow decision, so this lifts itself if that changes.`;
+}
+
+function planValid(t) {
+  const en = +t.entry, sl = +t.sl, isLong = (t.dir || "long") !== "short";
+  if (!Number.isFinite(en) || en <= 0) return "no entry price";
+  if (!Number.isFinite(sl) || sl <= 0) return "no stop loss — never trade stopless";
+  if (isLong && sl >= en) return `LONG stop ${sl} is not below entry ${en}`;
+  if (!isLong && sl <= en) return `SHORT stop ${sl} is not above entry ${en}`;
+  const dist = Math.abs(en - sl) / en;
+  // ── A STOP MUST BE WIDE ENOUGH TO PAY FOR THE TRADE (2026-08-18) ─────────────────────────────
+  // The old floor was 0.3%. Round-trip cost is about 22bps (2 x 6bps taker + 10bps slippage), and
+  // cost measured in R is simply cost% / stop% — so a 0.3% stop hands 73% of the risk to the
+  // exchange before the idea has a chance. For costs to stay under a tenth of R the stop has to
+  // clear ~2.2%. Three years of replay drew the same line independently: coins with an ATR under
+  // 2% of price lost £0.91 a trade while the rest made money.
+  //
+  // The exchange agrees. Every TE_SELL_SL_SHOULD_GT_BASE / TE_BUY_SL_SHOULD_LT_BASE rejection in
+  // the live log on 2026-08-17/18 was a stop between 0.4% and 0.8% wide — close enough to the
+  // market that it was already on the wrong side by the time the order arrived.
+  const MIN_STOP_PCT = num("MIN_STOP_PCT", 0.022);
+  if (dist < MIN_STOP_PCT) return `stop only ${(dist * 100).toFixed(2)}% from entry — below the ${(MIN_STOP_PCT * 100).toFixed(1)}% floor, costs would eat ${(0.0022 / dist * 100).toFixed(0)}% of the risk`;
+  if (dist > 0.35) return `stop ${(dist * 100).toFixed(0)}% from entry — implausible plan`;
+  const tp = +t.tp1;
+  if (Number.isFinite(tp) && tp > 0 && ((isLong && tp <= en) || (!isLong && tp >= en))) return `target ${tp} on the wrong side of entry`;
+  return null;
+}
+function roundQty(q) { if (q >= 100) return Math.round(q); if (q >= 1) return Math.round(q * 1e3) / 1e3; return Math.round(q * 1e6) / 1e6; }
+// Price rounding must scale with the price. `.toFixed(1)` was fine for BTC (64000.0) but for a
+// coin at 0.7035 it produced 0.7 — a BUY limit BELOW the market, which rests instead of filling —
+// and 0.0006307 became 0.0, which the exchange rejects. This was almost certainly being
+// misdiagnosed as "the testnet has no liquidity" (2026-08-10).
+function roundPx(p) {
+  if (!Number.isFinite(p) || p <= 0) return p;
+  if (p >= 1000) return +p.toFixed(1);
+  if (p >= 100) return +p.toFixed(2);
+  if (p >= 1) return +p.toFixed(4);
+  if (p >= 0.01) return +p.toFixed(6);
+  return +p.toPrecision(6);          // sub-cent coins keep 6 significant figures
+}
+// The venue's notional cap, learned from the relay's /status. Null until the first successful
+// call; sizing then falls back to the unclamped figure, which is the old behaviour.
+let RELAY_CAP = null;
+
+function buildOrder(t) {
+  const symbol = String(t.coin).toUpperCase() + "USDT";
+  const entry = +t.entry, sl = +t.sl, tp1 = +t.tp1;
+  if (!(Math.abs(entry - sl) > 0)) return { err: "zero stop distance" };
+  const isLong = (t.dir || "long") === "long";
+
+  // ── ENTRY: chase, or wait at the level? (2026-08-15) ─────────────────────────────────────────
+  // immediate  — cross 1% through to guarantee a fill. Takes whatever price the oscillator hands
+  //              you, which after a WaveTrend cross is often well into the move.
+  // structure  — rest a limit at the edge of the zone the move came from and let price return.
+  //              Better price, tighter stop, bigger size for the same risk — but it only trades
+  //              if price actually comes back, and the trades that never pull back are often the
+  //              best ones. That cost is real and is why this stays opt-in until measured.
+  let cross = roundPx(isLong ? entry * 1.01 : entry * 0.99);
+  let entryKind = "immediate";
+  if (CFG.entryMode() === "structure" && t.zone) {
+    const lvl = isLong ? t.zone.top : t.zone.bottom;
+    const stillValid = isLong ? (lvl < entry && lvl > sl) : (lvl > entry && lvl < sl);
+    if (stillValid) { cross = roundPx(lvl); entryKind = "zone:" + t.zone.src; }
+  }
+
+  // ── SIZE OFF THE PRICE WE WILL ACTUALLY GET, NOT THE ONE WE PLANNED (2026-08-15) ─────────────
+  // This used to divide the risk by |plannedEntry − stop|, but the order does not fill at the
+  // planned entry: immediate mode crosses 1% through it, structure mode rests below it. Sizing
+  // off a price we never trade at makes the £ risk wrong in both modes — and in structure mode it
+  // was wrong by the entire point of the feature, cancelling out the bigger position the better
+  // entry had earned. Found by a test asserting the size should grow. It had not.
+  // ── ...WHICH IS NOT ALWAYS THE ORDER PRICE (2026-08-18) ──────────────────────────────────────
+  // The 2026-08-15 note above is right for one of the two modes. A limit that crosses 1% THROUGH
+  // the market is marketable: it fills at the market, which is about `entry` — it does NOT fill at
+  // `cross`. Sizing off `cross` in immediate mode therefore adds a phantom 1% of price to the stop
+  // distance and buys too little. Measured over a 3-year replay of the live rules: the bot risked
+  // a mean of £7.28 every time it believed it was risking £10, and on a tight stop it was worse
+  // than that. A RESTING limit (structure mode) genuinely does fill at its own price, and there
+  // `cross` was always correct. So size off whichever price this order will actually trade at.
+  const fillPx = entryKind === "immediate" ? entry : cross;
+  const stopDist = Math.abs(fillPx - sl);
+  if (!(stopDist > 0)) return { err: "zero stop distance at the order price" };
+  let qty = roundQty(CFG.risk() / stopDist); if (!(qty > 0)) return { err: "computed qty <= 0" };
+
+  // ── SIZE TO THE VENUE CAP INSTEAD OF BEING REJECTED BY IT (2026-08-13) ──
+  // notional = qty × entry = risk / stopPercent. With risk 10 and a 2000 cap, ANY stop tighter
+  // than 0.5% breaches it — while planValid happily allows stops down to 0.3%. So every setup in
+  // the 0.3–0.5% band was built, approved, sent and refused, and those are the tightest, best
+  // R:R setups in the book (two in the Aug log at 2652 and 2609 USDT). A cap is a venue limit,
+  // not a signal about the trade: take it at the size that fits rather than throwing it away.
+  // The trade-off is explicit — such a trade risks LESS than RISK_GBP, and riskActual records it.
+  let clamped = false;
+  if (Number.isFinite(RELAY_CAP) && RELAY_CAP > 0) {
+    const maxQty = roundQty((RELAY_CAP * 0.98) / cross);   // 2% headroom absorbs qty rounding
+    if (maxQty > 0 && qty > maxQty) { qty = maxQty; clamped = true; }
+    if (!(qty > 0)) return { err: "notional cap leaves no tradeable size" };
+  }
+  const riskActual = +(qty * stopDist).toFixed(2);
+  const sizedOff = +fillPx;                     // recorded so "what did it actually risk" is answerable
+  const tp2 = Number(t.tp2);
+  const exitPx = Number.isFinite(tp2) && tp2 > 0 ? tp2 : (Number.isFinite(tp1) ? tp1 : undefined);
+  return {
+    order: {
+      symbol, side: isLong ? "Buy" : "Sell", posSide: isLong ? "Long" : "Short",
+      ordType: "Limit", priceRp: cross, timeInForce: "GoodTillCancel", orderQtyRq: qty,
+      refPx: entry, stopLossRp: sl, slTrigger: "ByMarkPrice",
+      takeProfitRp: exitPx,
+      clOrdID: ("agent" + t.coin + Date.now()).replace(/[^a-zA-Z0-9]/g, "").slice(0, 30),
+    },
+    meta: { symbol, qty, exitPx, riskActual, clamped, entryKind, sizedOff, stopKind: t.stopKind, zone: t.zone || undefined },
+  };
+}
+
+// ═══════════════════════ RELAY ═══════════════════════
+// A hung call must not eat the run's 45s budget and starve every coin after it.
+const RELAY_TIMEOUT_MS = 20000;
+
+// ── FAILURE FORENSICS (2026-08-15) ────────────────────────────────────────────────────────────
+// "ERR 502" tells you nothing. These four facts tell you almost everything:
+//   ms        — under ~1s means the request never reached the val (edge rejected it). A constant
+//               10–60s means the val ran and was killed. That single number separates every
+//               competing theory about this bug.
+//   cf-ray    — proves Cloudflare answered; its absence means the response came from elsewhere.
+//   server / cf-mitigated / cf-cache-status — names the edge behaviour (bot challenge, block).
+//   snippet   — Cloudflare's HTML names its OWN error number (502 vs 504 vs 524 origin-timeout
+//               vs 1015 rate-limited vs 1020 access-denied). We were throwing that away.
+function diagOf(res, ms, raw) {
+  const h = (k) => { try { return res.headers.get(k) || undefined; } catch { return undefined; } };
+  const d = { ms, status: res.status, cfRay: h("cf-ray"), server: h("server"),
+              mitigated: h("cf-mitigated"), cache: h("cf-cache-status"), via: h("via"),
+              valtown: h("x-valtown-request-id") || h("x-val-town-request-id") };
+  if (res.status >= 400 || (raw && raw[0] !== "{" && raw[0] !== "[")) d.snippet = String(raw || "").replace(/\s+/g, " ").slice(0, 300);
+  for (const k of Object.keys(d)) if (d[k] === undefined) delete d[k];
+  return d;
+}
+
+async function relay(path, body) {
+  const url = CFG.relayUrl(); if (!url) throw new Error("RELAY_URL not set");
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(), RELAY_TIMEOUT_MS);
+  const t0 = Date.now();
+  let res;
+  try {
+    res = await fetch(url + path, {
+      method: body ? "POST" : "GET",
+      headers: { "Content-Type": "application/json", Authorization: "Bearer " + CFG.relayToken() },
+      body: body ? JSON.stringify(body) : undefined,
+      signal: ac.signal,
+    });
+  } catch (e) {
+    // Even a thrown request must carry its timing — an abort at exactly RELAY_TIMEOUT_MS is a
+    // different animal from a DNS failure at 20ms, and the log has to be able to tell them apart.
+    e.ms = Date.now() - t0;
+    e.message = String(e.message || e) + ` [after ${e.ms}ms]`;
+    throw e;
+  } finally { clearTimeout(timer); }
+  // Read the body ONCE as text, then try to parse. Calling res.json() and falling back to
+  // res.text() in the catch throws "Body is unusable" — the failure handler itself failed, and
+  // that killed every scheduled run overnight (2026-08-12). Never re-read a consumed body.
+  const raw = await res.text();
+  const ms = Date.now() - t0;
+  let data; try { data = raw ? JSON.parse(raw) : {}; } catch { data = { raw: raw.slice(0, 500), parseError: true }; }
+  return { status: res.status, data, diag: diagOf(res, ms, raw) };
+}
+
+// ═══════════════════ DIRECT PHEMEX EXECUTION — no relay, no Cloudflare ═══════════════════
+// WHY (2026-08-15): ~83% of order POSTs were dying as Cloudflare HTML 502s in front of the
+// Val Town relay. The relay exists because a BROWSER cannot be trusted with an API key. This
+// agent is not a browser — it is a server-side runner that already holds secrets. So for the
+// bot's own orders the middleman is pure downside: one more hop, one more cold start, one more
+// free-tier edge that can answer with an HTML page instead of JSON.
+//
+// The relay stays exactly as it is for the app. This path is opt-in via EXEC_DIRECT=1, and if
+// the key/secret are missing the agent silently keeps using the relay — so a mis-set secret
+// degrades to yesterday's behaviour rather than to no trading at all.
+//
+// EVERY guard the relay enforced is re-implemented here. That is the price of removing it: the
+// relay was not just a signer, it was the safety net, and dropping the net without replacing it
+// would be the worst possible trade.
+const PHEMEX_BASE = "https://testnet-api.phemex.com";   // HARD LOCK. Going live = editing this line.
+const PHEMEX_TIMEOUT_MS = 15000;
+
+async function hmacHex(secret, msg) {
+  const enc = new TextEncoder();
+  const key = await globalThis.crypto.subtle.importKey("raw", enc.encode(secret), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+  const sig = await globalThis.crypto.subtle.sign("HMAC", key, enc.encode(msg));
+  return [...new Uint8Array(sig)].map(b => b.toString(16).padStart(2, "0")).join("");
+}
+
+// Byte-identical signing to phemex-relay-valtown.js: path + query + expiry + rawBody.
+// Public GET — no key, no signature. Used for the spot product table (price/quantity scales),
+// which must be read from the venue rather than assumed. Same hard-locked testnet base URL.
+async function phemexPublic(path, query) {
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(), PHEMEX_TIMEOUT_MS);
+  try {
+    const res = await fetch(PHEMEX_BASE + path + (query ? "?" + query : ""), { signal: ac.signal });
+    const raw = await res.text();
+    let data = null;
+    try { data = JSON.parse(raw); } catch { data = { parseError: true, raw: raw.slice(0, 300) }; }
+    return { status: res.status, data };
+  } finally { clearTimeout(timer); }
+}
+
+async function phemexCall(method, path, query, bodyObj) {
+  const expiry = Math.floor(Date.now() / 1000) + 60;
+  const bodyStr = bodyObj ? JSON.stringify(bodyObj) : "";
+  const signature = await hmacHex(CFG.phemexSecret(), path + (query || "") + expiry + bodyStr);
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(), PHEMEX_TIMEOUT_MS);
+  const t0 = Date.now();
+  let res;
+  try {
+    res = await fetch(PHEMEX_BASE + path + (query ? "?" + query : ""), {
+      method,
+      headers: {
+        "Content-Type": "application/json",
+        "x-phemex-access-token": CFG.phemexKey(),
+        "x-phemex-request-expiry": String(expiry),
+        "x-phemex-request-signature": signature,
+      },
+      body: bodyStr || undefined,
+      signal: ac.signal,
+    });
+  } catch (e) {
+    e.ms = Date.now() - t0;
+    e.message = String(e.message || e) + ` [phemex, after ${e.ms}ms]`;
+    throw e;
+  } finally { clearTimeout(timer); }
+  const raw = await res.text();                    // once. never twice.
+  const ms = Date.now() - t0;
+  let data; try { data = raw ? JSON.parse(raw) : {}; } catch { data = { raw: raw.slice(0, 500), parseError: true }; }
+  return { status: res.status, data, diag: { ...diagOf(res, ms, raw), venue: "phemex" } };
+}
+
+// The relay's refusals, restated. Returns an error string, or null if the order may go.
+function directGuards(o) {
+  if (CFG.kill()) return "KILL switch is ON — no orders placed.";
+  const symbol = String(o.symbol || "").toUpperCase();
+  const wl = CFG.whitelist().split(",").map(s => s.trim().toUpperCase());
+  if (!wl.includes("*") && !wl.includes(symbol)) return `symbol ${symbol} not in whitelist`;
+  const qty = Number(o.orderQtyRq);
+  if (!(qty > 0)) return "orderQtyRq must be > 0";
+  if (o.side !== "Buy" && o.side !== "Sell") return "side must be Buy or Sell";
+  // ── REDUCE-ONLY CLOSES SKIP THE OPENING-ORDER SANITY CHECKS (2026-09-08) ──────────────────────
+  // Everything below here exists to sanity-check a NEW position: is the stop on the correct side
+  // of a real entry price, is it far enough away, is the notional inside the cap. A reduce-only
+  // close (de-hedge, time-stop) carries none of that — no refPx, no stopLossRp — because it is not
+  // opening anything, only shrinking a position that already exists. Gating it on refPx meant
+  // every reduce-only close this file ever built was refused right here before it reached Phemex,
+  // logged as "refPx required to size-check the order" as if the VENUE had said no, when it was
+  // this function refusing its own valid order. Found 2026-09-08: AVAX (and ADA 08-31, UNI 09-03
+  // before it) sat holding both a long and a short for days because resolveHedges() kept building
+  // a correct reduce-only close and this gate kept rejecting it — three times, then giving up
+  // silently per coin (see DEHEDGE_GIVE_UP). reduceOnly can only ever shrink a position, never
+  // open or flip one, which is what makes skipping these checks safe for it and only it.
+  if (o.reduceOnly === true) return null;
+  const refPx = Number(o.refPx || o.priceRp), sl = Number(o.stopLossRp);
+  if (!(refPx > 0)) return "refPx required to size-check the order";
+  if (!(sl > 0)) return "refusing order with no stop loss";
+  const isLong = o.side === "Buy";
+  if (isLong && sl >= refPx) return `refusing order: LONG stop ${sl} must be BELOW entry ${refPx}`;
+  if (!isLong && sl <= refPx) return `refusing order: SHORT stop ${sl} must be ABOVE entry ${refPx}`;
+  const slDist = Math.abs(refPx - sl) / refPx;
+  if (slDist < 0.003) return `refusing order: stop is ${(slDist * 100).toFixed(2)}% from entry — too tight (min 0.3%)`;
+  if (o.takeProfitRp != null) {
+    const tp = Number(o.takeProfitRp);
+    if (!(tp > 0) || (isLong && tp <= refPx) || (!isLong && tp >= refPx)) return `refusing order: target ${tp} is on the wrong side of entry ${refPx}`;
+  }
+  const notional = qty * refPx, cap = CFG.maxNotional();
+  if (notional > cap) return `notional ${notional.toFixed(2)} USDT exceeds cap ${cap}`;
+  return null;
+}
+
+// Answers in the SAME shape as relay() so the loop above does not care which path ran.
+//   200 = placed · 4xx = a decision (will repeat, stays burned) · 5xx = a fault (worth retrying)
+async function directOrder(o) {
+  const bad = directGuards(o);
+  if (bad) return { status: 400, data: { error: bad }, diag: { venue: "direct", refused: true } };
+
+  const refPx = Number(o.refPx || o.priceRp);
+  const dp = (String(refPx).split(".")[1] || "").length || 2;
+  const px = (v) => String(Number(Number(v).toFixed(dp)));
+  const order = {
+    clOrdID: String(o.clOrdID || "cipher-" + Date.now()).slice(0, 40),
+    symbol: String(o.symbol).toUpperCase(), side: o.side, posSide: o.posSide || "Merged",
+    ordType: o.ordType || "Market", orderQtyRq: String(o.orderQtyRq),
+    timeInForce: o.timeInForce || "ImmediateOrCancel",
+    reduceOnly: false, text: o.text || "cipher-auto",
+  };
+  // ── A CLOSE MUST GO OUT AS A CLOSE (2026-10-26) ─────────────────────────────────────────────
+  // This builder used to hard-code reduceOnly:false and ALWAYS send stopLossRp: px(o.stopLossRp).
+  // A de-hedge or time-stop close carries no stop, so px(undefined) went to Phemex as the string
+  // "NaN" on an order that had been stripped of its reduceOnly flag. Every de-hedge since
+  // 2026-09-12 came back "phemex http 502" — a malformed body is exactly what a gateway answers
+  // that way. Pass the caller's reduceOnly/closeOnTrigger through, and only send a stop that is a
+  // real number. Opening orders are unchanged: directGuards() still refuses one with no stop.
+  if (o.reduceOnly === true) order.reduceOnly = true;
+  if (o.closeOnTrigger === true) order.closeOnTrigger = true;
+  if (Number(o.stopLossRp) > 0) Object.assign(order, { stopLossRp: px(o.stopLossRp), slTrigger: o.slTrigger || "ByMarkPrice" });
+  if (order.ordType === "Limit") order.priceRp = px(o.priceRp);
+  if (Number(o.takeProfitRp) > 0) { order.takeProfitRp = px(o.takeProfitRp); order.tpTrigger = o.tpTrigger || "ByLastPrice"; }
+
+  // Two independent brakes, because the relay's server-side DRY_RUN is no longer in the path:
+  // MODE must be armed AND DRY_RUN must not be set. Either one alone stops a real order.
+  if (CFG.mode() !== "armed" || String(env("DRY_RUN", "0")) === "1")
+    return { status: 200, data: { dryRun: true, wouldSend: order }, diag: { venue: "direct", dry: true } };
+
+  const r = await phemexCall("POST", "/g-orders", "", order);
+  const code = r.data && r.data.code;
+  if (r.status !== 200) return { status: r.status, data: { error: `phemex http ${r.status}`, sent: order, phemex: r.data }, diag: r.diag };
+  if (code !== 0 && code !== undefined) {
+    // A rejection is a DECISION, not a fault — 4xx so the coin stays burned instead of being
+    // re-sent every run. The relay returned 502 here, which is what taught the agent to retry
+    // orders the exchange had already refused on purpose.
+    return { status: 422, data: { error: `phemex ${code}: ${(r.data && r.data.msg) || "rejected"}`, sent: order, phemex: r.data }, diag: r.diag };
+  }
+  // Wrapped { httpStatus, data } exactly as the relay wrapped it, so the loop's orderID lookup
+  // (r.data.phemex.data.data.orderID) reads the same shape whichever route ran.
+  return { status: 200, data: { sent: order, phemex: { httpStatus: r.status, data: r.data } }, diag: r.diag };
+}
+
+// ── EXEC WRAPPERS: one switch, so nothing below has to know which route is live ──
+const EXEC = () => (CFG.direct() ? "direct" : "relay");
+
+async function execOrder(order) {
+  if (CFG.direct()) return await directOrder(order);
+  return await relay("/order", order);
+}
+
+// Phemex nests this two levels deep: { code, msg, data: { account, positions } }. The relay
+// wraps it again as { httpStatus, data: <that> } — so through the relay the positions live at
+// r.data.data.data.positions, and the old accessor stopped one level short and always returned
+// an empty list. That silently disabled "already holding this coin" AND the position half of
+// confirmPlaced. Found 2026-08-15. Dig for the array instead of trusting a fixed path.
+function findPositions(o, depth = 0) {
+  if (!o || typeof o !== "object" || depth > 5) return null;
+  if (Array.isArray(o.positions)) return o.positions;
+  for (const k of Object.keys(o)) { const hit = findPositions(o[k], depth + 1); if (hit) return hit; }
+  return null;
+}
+
+// The same accountPositions response carries the account object — balance, margin. Capturing it
+// here means the circuit breaker can watch real equity without a single extra API call.
+function findAccount(o, depth = 0) {
+  if (!o || typeof o !== "object" || depth > 5) return null;
+  if (o.accountBalanceRv != null || o.accountBalanceEv != null) return o;
+  for (const k of Object.keys(o)) { const hit = findAccount(o[k], depth + 1); if (hit) return hit; }
+  return null;
+}
+let LAST_ACCOUNT = null;
+function equityNow() {
+  if (!LAST_ACCOUNT) return null;
+  const v = Number(LAST_ACCOUNT.accountBalanceRv ?? NaN);
+  if (Number.isFinite(v) && v > 0) return v;
+  const e = Number(LAST_ACCOUNT.accountBalanceEv ?? NaN);          // scaled integer variant
+  return Number.isFinite(e) && e > 0 ? e / 1e8 : null;
+}
+
+// null = "I could not read the book". [] = "the book is genuinely empty". Never conflate them:
+// a non-200, or a 200 whose body contains no positions array at all, is a FAILED read, and the
+// caller must be able to tell. Returning [] on a 502 is what let opposing legs stack up.
+async function execPositions() {
+  const r = CFG.direct()
+    ? await phemexCall("GET", "/g-accounts/accountPositions", "currency=USDT", null)
+    : await relay("/positions");
+  if (r.status !== 200) { console.error("positions read: HTTP " + r.status); return null; }
+  try { LAST_ACCOUNT = findAccount(r.data); } catch { LAST_ACCOUNT = null; }
+  const pos = findPositions(r.data);
+  if (!Array.isArray(pos)) { console.error("positions read: no positions array in the response"); return null; }
+  return pos;
+}
+
+async function execOrdersFor(symbol) {
+  if (CFG.direct()) {
+    // activeList alone misses UNTRIGGERED conditionals — the same omission that produced the
+    // false "no stop on exchange" alarm in the relay. Ask for both and merge.
+    const out = [];
+    let anyOk = false;
+    for (const q of [`symbol=${symbol}`, `symbol=${symbol}&untriggered=true`]) {
+      try {
+        const r = await phemexCall("GET", "/g-orders/activeList", q, null);
+        const rows = (r.data && r.data.data && (r.data.data.rows || r.data.data)) || [];
+        if (r.status === 200 && Array.isArray(rows)) { out.push(...rows); anyOk = true; }
+      } catch { /* one view failing must not blind the other */ }
+    }
+    // ── BOTH READS FAILED: SAY SO, DON'T PRETEND THE BOOK IS EMPTY (2026-08-29) ─────────────────
+    // This used to fall through to `out` (still `[]` if every attempt failed) — indistinguishable
+    // from "genuinely no orders". expireStaleOrders() then read that empty array as "the order is
+    // gone" and quietly forgot real, still-resting orders without ever cancelling them: exactly the
+    // null-vs-[] conflation execPositions() already refuses to make. Throwing here lets every
+    // caller's existing try/catch (expireStaleOrders, confirmPlaced) treat this the same way a
+    // relay-mode failure already does — relay() throws on a bad read, so direct mode should too.
+    if (!anyOk) throw new Error(`execOrdersFor(${symbol}): could not read the order book (both attempts failed)`);
+    const seen = new Set();
+    return out.filter(o => o && o.orderID && !seen.has(o.orderID) && seen.add(o.orderID));
+  }
+  const r = await relay("/orders?symbol=" + encodeURIComponent(symbol));
+  return (r.data && r.data.orders) || [];
+}
+
+// Ask the relay what it will actually accept, and scan only those coins. The relay's whitelist
+// is the real gate — trading outside it just generates rejected orders and noise in the log.
+// Making it the single source of truth means the two can never disagree (2026-08-12).
+async function relayWhitelist() {
+  try {
+    // Direct mode: the relay is not in the path, so it cannot be the source of truth. Our own
+    // WHITELIST/MAX_NOTIONAL_USDT are — and they default to the relay's own values.
+    if (CFG.direct()) {
+      RELAY_CAP = CFG.maxNotional();
+      const wl = CFG.whitelist().split(",").map(s => s.trim()).filter(Boolean);
+      if (!wl.length || wl.includes("*")) return null;
+      return new Set(wl.map(x => x.toUpperCase().replace(/USDT$/, "")));
+    }
+    const url = CFG.relayUrl(); if (!url) return null;
+    const res = await fetch(url + "/status", { headers: { Authorization: "Bearer " + CFG.relayToken() } });
+    const raw = await res.text();
+    const j = JSON.parse(raw);
+    // Learn the venue's notional cap from the same call. Sizing has to respect it or the tightest
+    // stops are built, approved, sent and refused — see RELAY_CAP below.
+    if (j && Number.isFinite(+j.maxNotional) && +j.maxNotional > 0) RELAY_CAP = +j.maxNotional;
+    const wl = j && j.whitelist;
+    if (!Array.isArray(wl) || !wl.length) return null;
+    if (wl.includes("*")) return null;                       // open relay — scan everything
+    return new Set(wl.map(x => String(x).toUpperCase().replace(/USDT$/, "")));
+  } catch { return null; }                                    // unreachable → don't block the run
+}
+
+// Returns null — NOT [] — when the read fails. "I could not see the book" and "the book is empty"
+// are completely different facts, and collapsing them into [] is what let the bot open a second,
+// opposing leg on five different coins. A caller that cannot tell them apart cannot be safe.
+async function openPositions() {
+  try {
+    const pos = await execPositions();
+    return Array.isArray(pos) ? pos.filter(p => Number(p.size) > 0) : null;
+  } catch (e) { console.error("positions read failed:", e && e.message); return null; }
+}
+
+// ── Did that order actually land? ─────────────────────────────────────────────────────────────
+// The relay sits behind Cloudflare and returns a bare HTML 502 on roughly 45% of order POSTs
+// (measured 12–14 Aug 2026 across 47 attempts). It is not the coin, the direction, the size, the
+// stop width or the position in the run — all of those were checked and none correlate. It is
+// simply an unreliable hop, so the answer is not another diagnosis, it is resilience.
+//
+// NEVER retry an order blind: a 502 does not mean the order failed, only that we did not hear
+// back. The request may well have reached Phemex. So we ask the exchange what happened before
+// deciding — a resting order carrying our clOrdID, or a position that appeared on a coin we were
+// not holding at the start of the run, both mean it landed and must NOT be sent twice.
+async function confirmPlaced(symbol, clOrdID, coin) {
+  try {
+    const orders = await execOrdersFor(symbol);
+    const hit = orders.find(o => o && o.clOrdID === clOrdID);
+    if (hit) return { landed: true, how: "resting order", orderID: hit.orderID || "" };
+  } catch { /* fall through to the position check */ }
+  try {
+    // We only ever place when the coin is NOT already held, so any position here is ours.
+    const pos = await openPositions();
+    if (pos.some(p => String(p.symbol || "").replace(/USDT$/, "").toUpperCase() === coin)) {
+      return { landed: true, how: "filled into a position", orderID: "" };
+    }
+  } catch { /* unknown */ }
+  return { landed: false };
+}
+
+async function pushLog(entry) {
+  const log = await getJSON(KEY.log, []);
+  log.unshift({ at: new Date().toISOString(), ...entry });
+  await setJSON(KEY.log, log.slice(0, 300));
+}
+
+// ── THE LEDGER: WHAT ACTUALLY HAPPENED, KEPT (2026-08-21) ────────────────────────────────────
+// John: "why has the brain not been recording the trades, we have had a fair few now."
+// It had. They were then thrown away.
+//
+// cipher_log is a DEBUG FEED, not a record. It holds the last 300 decisions, and roughly 82% of
+// those are notes about trades the bot decided NOT to take — on 2026-08-21 the whole 300 covered
+// twenty-eight hours and contained seven results. Every real trade older than about a day had
+// already been binned. So the scoreboard could only ever count one day, and John could not find
+// out how his own bot was doing at any horizon that mattered.
+//
+// This is the other thing: an append-only ledger of events that actually occurred — orders sent,
+// orders refused, positions resolved — and nothing else. No "passed on this one" chatter, so it
+// fills roughly fifty times slower and a year of trading fits comfortably. It is written NEXT TO
+// the log rather than instead of it, because the log is genuinely useful for debugging the last
+// day and this is genuinely useful for judging the last year. They are different questions.
+const LEDGER_KEY = "cipher_ledger";
+const LEDGER_MAX = 5000;
+async function pushLedger(entry) {
+  try {
+    const led = await getJSON(LEDGER_KEY, []);
+    led.unshift({ at: new Date().toISOString(), ...entry });
+    await setJSON(LEDGER_KEY, led.slice(0, LEDGER_MAX));
+  } catch (e) {
+    // A ledger write must never be able to stop a trade being managed. Record the miss and move on.
+    console.error("ledger write failed (harmless to trading):", e && e.message);
+  }
+}
+
+// ── LIVE CONFIG from the relay (the app's control panel) ──────────────────────────────────────
+// Settings used to live only in the GitHub workflow, so changing the risk or stopping the bot
+// meant editing YAML and committing. Now the app writes them to the relay and we read them here.
+//
+// The rule that keeps this safe: a FAILED read changes nothing. We fall back to the workflow env,
+// which is the behaviour that existed before this feature. Silence is not an instruction — an
+// unreachable relay must not be able to arm the bot, and must not be able to disarm it either
+// (that is what KILL is for, and KILL is enforced on the relay's own order path).
+let LIVE = null;
+async function loadLiveConfig() {
+  const url = CFG.relayUrl(); if (!url) return null;
+  try {
+    // 8 seconds was too tight, proved on 2026-08-19: the Val Town relay cold-starts after a code
+    // change and answered GitHub's runner in more than that, so every run aborted the read and
+    // fell back to the workflow's MODE=off. A settings read that times out does not just lose the
+    // settings — it hands control to a stale default, which is a worse failure than waiting.
+    const ac = new AbortController();
+    const timer = setTimeout(() => ac.abort(), num("CONFIG_TIMEOUT_MS", 20000));
+    let res;
+    try {
+      res = await fetch(url + "/config", { headers: { Authorization: "Bearer " + CFG.relayToken() }, signal: ac.signal });
+    } finally { clearTimeout(timer); }
+    if (res.status !== 200) { console.log(`live config: HTTP ${res.status} — using workflow settings`); return null; }
+    const j = JSON.parse(await res.text());
+    const c = j && j.config;
+    if (!c || typeof c !== "object") return null;
+    return c;
+  } catch (e) { console.log("live config: unreachable (" + String(e && e.message || e).slice(0, 80) + ") — using workflow settings"); return null; }
+}
+// Applied through the same CFG accessors everything else already uses, so there is exactly one
+// place each setting is read from and no chance of half the code seeing the panel's value and
+// half seeing the workflow's.
+function applyLiveConfig(c) {
+  if (!c) return [];
+  const applied = [];
+  // Bounds are re-checked HERE as well as in the relay. The agent does not trust the relay to
+  // have validated — `+null` is 0, and a CORR_MAX of 0 would quietly block every trade while
+  // looking like a setting rather than a bug. Absent, null, empty and out-of-range all mean
+  // "leave the workflow value alone".
+  const setNum = (key, raw, lo, hi) => {
+    if (raw === undefined || raw === null || raw === "") return;
+    const v = Number(raw);
+    if (!Number.isFinite(v) || v < lo || v > hi) { console.log(`live config: ignoring ${key}=${raw} (out of range ${lo}–${hi})`); return; }
+    CFG[key] = () => v; applied.push(`${key}=${v}`);
+  };
+  if (["off", "dry", "armed"].includes(String(c.mode).toLowerCase())) {
+    const m = String(c.mode).toLowerCase(); CFG.mode = () => m; applied.push("mode=" + m);
+  } else if (c.mode !== undefined && c.mode !== null) {
+    console.log(`live config: ignoring mode=${c.mode}`);
+  }
+  setNum("risk", c.riskGbp, 1, 100);
+  setNum("corrMax", c.corrMax, 1, 12);
+  setNum("dayCap", c.dayCap, 1, 50);
+  setNum("maxNotional", c.maxNotional, 100, 5000);
+  // The accumulator's live timeframe. Validated AGAIN here even though the relay validates on the
+  // way in: this value decides which strategy holds real coins, and "the other end checked it" is
+  // not a thing worth betting a balance on. Anything unrecognised leaves the env value alone,
+  // which means the ladder — the conservative direction to fail in.
+  if (c.accumFlipTf !== undefined && c.accumFlipTf !== null && c.accumFlipTf !== "") {
+    const want = String(c.accumFlipTf).toLowerCase();
+    const hit = want === "off" ? "off" : want === "dotladder" ? "dotladder" : FLIP_TFS.find(t => t.toLowerCase() === want);
+    if (hit) { CFG.accumFlipTf = () => hit; applied.push("accumFlipTf=" + hit); }
+    else console.log(`live config: ignoring accumFlipTf=${c.accumFlipTf}`);
+  }
+  // The extra accumulator books. Re-parsed and re-validated on this side as well as in the
+  // relay, for the same reason accumFlipTf is: this string decides which coins a strategy is
+  // allowed to touch, and "the other end checked it" is not worth betting a wallet on. An
+  // unparseable entry is dropped by parseAccumBooks with a log line; an empty string leaves the
+  // env value alone, which means BTC only — the conservative direction to fail in.
+  if (c.accumBooks !== undefined && c.accumBooks !== null) {
+    const want = String(c.accumBooks).slice(0, 200);
+    if (/^[A-Za-z0-9:,\s]*$/.test(want)) { CFG.accumBooks = () => want; applied.push("accumBooks=" + (want || "(none)")); }
+    else console.log(`live config: ignoring accumBooks=${c.accumBooks}`);
+  }
+  // KILL from the panel stops the agent placing at all. The relay enforces it independently on
+  // the order path, so this is the polite half of the switch, not the whole of it.
+  if (c.kill === true) { CFG.mode = () => "off"; applied.push("KILL=on"); }
+  return applied;
+}
+
+// ═══════════ TARGET HIT → LOOK THE OTHER WAY (2026-08-16) ═══════════
+// John: "when the brain and bot see the TP long hit, surely we could rescan that coin for the
+// short and ping it — get in and out better both ways."
+//
+// The bot already knows enough to do this and never used it. It records every plan it placed
+// (entry, stop, target, book) and it reads open positions every run. A position that WAS there
+// and is now gone has resolved — and comparing the last price to the plan says which way.
+//
+// A target hit is the most informative moment a setup ever produces: the thesis paid in full and
+// the move is, by construction, extended. That is precisely when the reverse setup is worth a
+// look — so the coin jumps the rotation queue instead of waiting for the cursor to come round,
+// which on a 100-coin rotation can be hours.
+//
+// It does NOT auto-enter the reverse. It queues the coin to be scanned FIRST next run, and the
+// normal signal, plan and guards decide from there. Jumping the queue is a scheduling decision;
+// taking the trade is still a trading decision, and those should not be the same thing.
+const OPEN_KEY = "cipher_open", PRIORITY_KEY = "cipher_priority";
+
+// Snapshot what we are holding, with the plan that opened it, so the next run can tell what
+// happened to it. Keyed the same way as the book map.
+// 0 is Phemex's "unset", and an absent field must stay undefined so the caller can tell "no stop"
+// from "could not read one". Any other falsy or negative value is treated as unreadable too — a
+// stop of -1 is not a stop, and guessing at it is how this bug happened in the first place.
+function venuePx(v) {
+  if (v === undefined || v === null || v === "") return undefined;
+  const n = Number(v);
+  if (!Number.isFinite(n)) return undefined;
+  return n > 0 ? n : null;                      // null = definitely none, undefined = cannot tell
+}
+
+function snapshotOpen(positions, bookMap, prev) {
+  const out = {};
+  for (const p of positions) {
+    const coin = String(p.symbol || "").replace(/USDT$/, "").toUpperCase();
+    let d = String(p.posSide || p.side || "").toLowerCase();
+    if (d !== "long" && d !== "short") d = Number(p.size) < 0 ? "short" : "long";
+    const k = posKey(coin, d);
+    out[k] = { coin, dir: d, size: Math.abs(Number(p.size) || 0), book: bookMap[k] || null,
+               plan: (prev && prev[k] && prev[k].plan) || null, since: (prev && prev[k] && prev[k].since) || Date.now(),
+               // the exchange's own average entry, so an adopted position can be graded against
+               // the price it was really opened at rather than wherever price happens to be today
+               avgEntry: +(p.avgEntryPriceRp ?? p.avgEntryPrice) || (prev && prev[k] && prev[k].avgEntry) || undefined,
+               // ── WHAT THE VENUE ITSELF IS HOLDING (2026-08-25) ──────────────────────────────
+               // Dropped on the floor until now, which is why the unprotected warning was able to
+               // announce "no stop at the venue" about a position Phemex was showing with a stop
+               // and a target on it. Phemex uses 0 for "unset", and different API generations name
+               // these Rp / Ep / plain, so read them all and treat only a real positive number as
+               // a stop. undefined means COULD NOT READ, which is not the same as none.
+               venueStop: venuePx(p.stopLossRp ?? p.stopLoss ?? p.stopLossEp),
+               venueTarget: venuePx(p.takeProfitRp ?? p.takeProfit ?? p.takeProfitEp),
+               adopted: (prev && prev[k] && prev[k].adopted) || undefined,
+               // which setup opened it — carried run to run so the resolved record can say (2026-09-19)
+               setup: (prev && prev[k] && prev[k].setup) || undefined,
+               setupTf: (prev && prev[k] && prev[k].setupTf) || undefined,
+               quality: (prev && prev[k] && Number.isFinite(prev[k].quality)) ? prev[k].quality : undefined,
+               // what last closed it, when the bot itself did (e.g. a breached-stop close) —
+               // read by the resolution pass on the run after (2026-10-26)
+               closedBy: (prev && prev[k] && prev[k].closedBy) || undefined };
+  }
+  return out;
+}
+
+// ── ADOPT WHAT WE ARE ALREADY HOLDING (2026-08-19) ────────────────────────────────────────────
+// XRP|long and UNI|long predate the books feature: plan null, book null. Nothing could classify
+// their exit, no time stop can ever apply to them, and an unknown position is "protected in both
+// books" — so each orphan silently occupied a slot in BOTH books while nothing managed it.
+// Adoption is pure bookkeeping: build the plan the bot WOULD build today from current daily
+// structure (entry = the exchange's average entry price when it reports one), file the position
+// under the swing book. No order is placed and nothing on the exchange moves — the plan simply
+// gives the resolution pass, the correlation guard and any future time stop something to hold.
+async function adoptOrphans(nowOpen, bookMap) {
+  const adopted = [];
+  for (const [k, pos] of Object.entries(nowOpen || {})) {
+    if (pos.plan || !(pos.size > 0)) continue;
+    let bars = null;
+    try { bars = await fetchCandles(pos.coin, "1D", 260); } catch { }
+    if (!bars || !bars.length) continue;
+    // The stop and target are anchored to TODAY's price and structure — the position may have
+    // been opened far from here, and a stop hung off a stale entry can land on the wrong side of
+    // the market or fail the 3-ATR sanity check. The recorded entry stays the exchange's true
+    // average entry, so "closed in profit / at a loss" is judged against reality.
+    const cur = bars[bars.length - 1].c;
+    const plan = buildTradePlan(bars, pos.dir, cur);
+    // ── A FAILED ADOPTION MUST NOT BE SILENT (2026-08-20) ───────────────────────────────────
+    // Found by John: a SOL long appeared at 07:59 that this bot never opened, and sat for
+    // thirteen hours with no stop, no target and no book — because buildTradePlan returned null
+    // (structure wider than 3 ATR, most likely) and this line was a bare `continue`.
+    //
+    // The position was not idle while it waited. A plan-less position counts as belonging to
+    // BOTH books for the no-hedge rule, so it was silently blocking every SOL trade, while
+    // itself carrying no stop. Unmanaged AND obstructive, and nothing said a word.
+    //
+    // Refusing to invent a plan is still right — a stop pulled from thin air is worse than an
+    // honest "I cannot size this". Refusing QUIETLY is what was wrong.
+    if (!plan) {
+      const notional = (Number(pos.size) || 0) * (Number(pos.avgEntry) || cur);
+      const size = `Size ${pos.size} (~${notional.toFixed(0)} USDT).`;
+      const blocks = `It is not in any book, so it is blocking new ${pos.coin} trades in both books.`;
+      const why = "held with no plan and none could be built from today's structure — the stop it needs is more than 3 ATR away.";
+      // Three different situations, three different sentences. The old message asserted the worst
+      // of them regardless, about a position the venue was holding a stop on.
+      const s = pos.venueStop, t = pos.venueTarget;
+      if (s === undefined) {
+        await pushLog({ coin: pos.coin, dir: pos.dir, result: "NO PLAN",
+          skipped: `${why} ${blocks} I could not read a stop from the venue for it either way, so I am not going to tell you it has none — check the position on Phemex. ${size}` });
+        console.log(`no plan: ${pos.coin} ${pos.dir} — venue stop unreadable, not claiming either way`);
+        pos.unprotected = true;      // still unmanaged BY THE BOT, which is what this flag means
+      } else if (s === null) {
+        await pushLog({ coin: pos.coin, dir: pos.dir, result: "UNPROTECTED",
+          skipped: `${why} It has NO stop at the venue${t === null ? " and no target" : ""}, and ${blocks.charAt(0).toLowerCase() + blocks.slice(1)} ${size} This bot did not open it — close it by hand, or give it a stop yourself.` });
+        console.error(`UNPROTECTED: ${pos.coin} ${pos.dir} size ${pos.size} (~${notional.toFixed(0)} USDT) — no plan, and NO stop at the venue`);
+        pos.unprotected = true;
+      } else {
+        // The common case, and the one that was being reported as an emergency.
+        await pushLog({ coin: pos.coin, dir: pos.dir, result: "NO PLAN",
+          skipped: `${why} The venue IS holding a stop at ${formatPrice(s)}${t ? ` and a target at ${formatPrice(t)}` : ""}, so it is not naked — but the bot is not managing it and ${blocks.charAt(0).toLowerCase() + blocks.slice(1)} ${size} Nothing needs doing urgently; close it or leave it.` });
+        console.log(`no plan: ${pos.coin} ${pos.dir} — venue holds a stop at ${formatPrice(s)}, not flagged as unprotected`);
+        pos.unprotected = false;     // it has a stop; do not put it in the red box
+      }
+      continue;
+    }
+    const ref = Number.isFinite(pos.avgEntry) && pos.avgEntry > 0 ? pos.avgEntry : cur;
+    pos.plan = { entry: ref, stop: plan.stop, target: plan.targets[1] ?? plan.targets[0] };
+    pos.book = pos.book || "swing";
+    pos.adopted = Date.now();
+    bookMap[k] = pos.book;
+    adopted.push(pos);
+    await pushLog({ coin: pos.coin, dir: pos.dir, book: pos.book, result: "ADOPTED",
+      skipped: `held with no plan (predates the books feature) — given a ${plan.stopKind} stop ${formatPrice(pos.plan.stop)} and target ${formatPrice(pos.plan.target)} from today's daily structure, entry marked at ${formatPrice(ref)}, filed under the swing book. Bookkeeping only: no order placed.` });
+  }
+  return adopted;
+}
+
+// Anything in the previous snapshot that is no longer open has resolved. Classify it by where
+// price ended up relative to the plan — target side, stop side, or neither.
+// ═══════════ FOUR SEPARATE QUESTIONS, NOT ONE VERDICT (2026-08-20) ═══════════
+// Adopted from John and Codex's training pack, and it fixes a defect this bot has had all along.
+//
+// The old version asked one question — "how did it end?" — and answered it by comparing the
+// CURRENT price to the plan. Three things were wrong with that:
+//
+//   1. It graded a position the bot never closed. Every exit that was not a venue-side stop or
+//      target fill is somebody else's decision, and inferring "closed in profit / at a loss"
+//      from a price up to forty minutes stale is a guess wearing a fact's clothes. Those guesses
+//      then fed the circuit breaker: close a winner by hand, watch price dip under your entry
+//      before the bot woke, and it recorded a LOSS and moved you a third of the way to a
+//      twelve-hour trading pause.
+//   2. It used a snapshot, not a range. Price can touch the target and retrace before the bot
+//      looks; the old code would call that "closed" and throw away a real win.
+//   3. It blended the four things that have to stay apart. A rejected order, a late entry and a
+//      wrong thesis all arrived as one number. Today alone we had two execution failures — an
+//      INSUFFICIENT_BASE_BALANCE and a Cloudflare 502 — that say nothing whatever about whether
+//      the signal was right, and under the old scheme they were indistinguishable from being
+//      wrong about the market.
+//
+// So each resolution now carries four independent labels, and — the part that matters — a
+// `klass` of "strategy" or "execution_artifact". Only strategy outcomes are allowed to touch the
+// breaker or the shadow ledger. An artifact is recorded in full and counted in nothing.
+//
+// `rangeOf(coin)` gives the high/low since the position was last seen, so a target that was hit
+// and given back is still a target. Callers that cannot supply a range may omit it and fall back
+// to the snapshot, which is weaker but never silently pretends otherwise.
+const RESOLUTION_CLASSES = ["strategy", "execution_artifact"];
+
+// ═══════════ WHAT A VENUE REJECTION ACTUALLY MEANS (2026-08-20) ═══════════
+// Codex's testnet question: "are we collecting clean enough forward data that a later decision
+// rests on the strategy, not on execution artifacts?" The honest answer in this window was no,
+// and this is one of the reasons: 13 of 24 order attempts were rejected by Phemex and every one
+// of them landed in the record as a bare code — `ERR phemex 11048` — which is unreadable, and
+// worse, indistinguishable from the strategy being wrong.
+//
+// The 11048/11052 pair is the interesting one and it is OUR bug, not the venue's. We validate the
+// stop against the PLANNED ENTRY; Phemex validates it against the LIVE MARK (`slTrigger:
+// "ByMarkPrice"`). On a 30–40 minute cadence those diverge: price drifts past the stop between
+// the candle that produced the signal and the moment the order is sent, so a stop that is
+// correctly below our entry is already above the mark. That is not a bad setup. It is a stale
+// one, and calling it by its name turns a mystery into a measurable fact about cadence.
+//
+// Every value here classifies as an execution artifact: none of it is evidence about a signal.
+// ═══════════ ASK THE VENUE WHAT IT TRADES, RATHER THAN FINDING OUT ONE REFUSAL AT A TIME ═══════════
+// John, 2026-08-21: "can't we just get a list of all the futures traded coins from Phemex and put
+// them in the bot list, then forget about the rest." Yes — and that is plainly the right way round.
+//
+// The universe is built from the top ~100 coins by volume on Binance or OKX. Phemex does not list
+// all of them. So every run the bot was picking coins that could never be traded HERE, building a
+// plan, sizing it, sending it and being refused — and burning the coin for the day each time. The
+// bench added this morning stopped the SECOND refusal. This stops the first: a coin Phemex does
+// not carry never enters the list at all.
+//
+// Two safety rules, because a filter that goes wrong silently empties the bot's universe:
+//   · a parse that yields fewer than MIN_PERPS symbols is not believed, and nothing is filtered
+//   · what was dropped is always logged, never quietly removed
+// The bench stays as well. This list answers "does Phemex carry it"; the bench answers "is it
+// switched off right now" (20005), which is temporary and does not show up in a product listing.
+const PERP_MIN = 20;              // below this the list is not credible — fail open
+let _perpSymbols = null;
+
+// ── DO NOT GUESS WHICH KEY THE PERPS ARE UNDER (fixed 2026-08-21, same evening) ──────────────
+// The first version read body.products and filtered for symbols ending in USDT, and the live run
+// answered: "only 0 perpetuals parsed (need 20) — NOT filtering the universe this run". The guard
+// did its job and nothing broke, but the parse was wrong twice over:
+//   · Phemex keeps USDT-margined perpetuals in their OWN array (perpProductsV2 on this account),
+//     not in `products` — which holds the inverse contracts and the spot pairs.
+//   · and the spot test was `sym.startsWith("S")` AFTER uppercasing, which also throws away every
+//     genuine coin beginning with S: SOL, SUI, SAND. A filter that quietly drops SOL is worse
+//     than no filter at all.
+// So this stops guessing the key: it walks every array in the response and takes anything that
+// looks like a USDT perpetual, whichever bucket it arrived in. And when it still comes up short
+// it PRINTS THE KEYS IT SAW, so the next diagnosis is one log line rather than a browser trip.
+function collectPerps(body) {
+  const out = new Set();
+  const seenKeys = [];
+  const arrays = [];
+  const walk = (o, d) => {
+    if (!o || typeof o !== "object" || d > 3) return;
+    for (const [k, v] of Object.entries(o)) {
+      if (Array.isArray(v)) { seenKeys.push(`${k}[${v.length}]`); arrays.push(v); }
+      else if (v && typeof v === "object") walk(v, d + 1);
+    }
+  };
+  walk(body, 0);
+  for (const arr of arrays) {
+    for (const p of arr) {
+      const raw = p && typeof p.symbol === "string" ? p.symbol : null;
+      if (!raw) continue;
+      if (raw[0] === "s") continue;                       // sBTCUSDT etc are SPOT — lowercase s only
+      const sym = raw.toUpperCase();
+      if (!sym.endsWith("USDT")) continue;                // USDT-margined perps only
+      // Name what is BAD, not what is good. The first attempt at this said `!/list/.test(status)`
+      // — and "delisted" contains "list", so a delisted contract sailed straight through. Test it
+      // the other way round and an unrecognised status still passes, which is right: unknown is
+      // not the same as no.
+      const status = String(p.status || "").toLowerCase();
+      if (/delist|unlist|suspend|closed|halt/.test(status)) continue;
+      const type = String(p.type || "");
+      if (type && !/perp/i.test(type)) continue;
+      out.add(sym.slice(0, -4));
+    }
+  }
+  return { symbols: out, seenKeys };
+}
+
+async function perpSymbols() {
+  if (_perpSymbols) return _perpSymbols;
+  try {
+    const r = await phemexPublic("/public/products");
+    const body = (r && r.data && (r.data.data || r.data)) || {};
+    const { symbols, seenKeys } = collectPerps(body);
+    if (symbols.size < PERP_MIN) {
+      console.warn(`phemex products: only ${symbols.size} perpetuals parsed (need ${PERP_MIN}) — NOT filtering the universe this run. Arrays seen: ${seenKeys.join(", ") || "none"}`);
+      return null;
+    }
+    _perpSymbols = symbols;
+    return symbols;
+  } catch (e) {
+    console.error("phemex products read failed — universe unfiltered this run:", e && e.message);
+    return null;
+  }
+}
+
+// ═══════════ WHAT THE VENUE WILL NOT TRADE, REMEMBERED (2026-08-21) ═══════════
+// The rejection classifier told us WHY orders were dying. Counting them told us how badly:
+// nineteen of twenty order attempts in the 2026-08-20/21 window were refused, and eleven of
+// those nineteen were the same two answers repeated —
+//     20005  TE_SEQ_TURN_OFF   the venue has this symbol switched off   ×9
+//     39999  symbol not listed on this venue                            ×2
+// Nine times. The bot asked Phemex for a symbol it had already been told was off, every fifteen
+// minutes, and each refusal burned the coin for the day. Those are not near-misses; they are
+// trades the strategy wanted and never got, thrown away by asking a question already answered.
+//
+// So the answer is kept. A refusal puts the symbol in the sin bin for a while and the scan skips
+// it there — cheaply, before sizing, before the day's slot is spent — with a reason that names
+// the venue rather than the setup. The cooldown escalates for a symbol that keeps saying no and
+// clears the moment one order goes through, so a symbol switched back on returns on its own.
+//
+// The one thing it must never do is silently narrow the universe: every skip is logged, and
+// `venueBench` reports everything currently benched at the top of each run.
+const VENUE_KEY = "cipher_venue";
+const VENUE_RULES = {
+  "20005": { base: 6 * 3600e3,  max: 48 * 3600e3, why: "the venue has this symbol switched off (TE_SEQ_TURN_OFF)" },
+  "39999": { base: 7 * 864e5,   max: 7 * 864e5,   why: "the venue does not list this symbol at all" },
+};
+// PURE: memory + symbol + now → why it is benched, or null. No I/O, no clock.
+function venueBlock(mem, symbol, now) {
+  const e = mem && mem[String(symbol).toUpperCase()];
+  if (!e || !(e.until > now)) return null;
+  const mins = Math.round((e.until - now) / 60000);
+  return { code: e.code, why: e.why, until: e.until,
+           label: `${symbol} is benched — ${e.why}. Refused ${e.strikes}×; trying again in ${mins < 60 ? mins + " min" : Math.round(mins / 60) + "h"}.` };
+}
+// PURE: record a refusal and return the updated memory. Repeat offenders wait longer, up to a cap.
+function venueNote(mem, symbol, code, now) {
+  const rule = VENUE_RULES[String(code)];
+  if (!rule) return mem;                                   // only bench for reasons we understand
+  const k = String(symbol).toUpperCase();
+  const prev = (mem && mem[k]) || { strikes: 0 };
+  const strikes = (prev.strikes || 0) + 1;
+  const wait = Math.min(rule.max, rule.base * Math.pow(2, strikes - 1));
+  return { ...(mem || {}), [k]: { code: String(code), why: rule.why, strikes, lastAt: now, until: now + wait } };
+}
+// PURE: a symbol that traded is not benched, whatever it did last week.
+function venueClear(mem, symbol) {
+  const k = String(symbol).toUpperCase();
+  if (!mem || !mem[k]) return mem || {};
+  const out = { ...mem }; delete out[k]; return out;
+}
+function venueBench(mem, now) {
+  return Object.entries(mem || {}).filter(([, e]) => e.until > now)
+    .map(([sym, e]) => `${sym} (${e.code}, ${Math.round((e.until - now) / 60000)}m)`);
+}
+
+const PHEMEX_REJECTIONS = {
+  "11048": { label: "stale — price moved past the stop before the order was sent",
+             detail: "LONG stop must be below the live MARK price, not just below the planned entry. The signal aged out between the candle close and the send.",
+             klass: "execution_artifact", cause: "cadence" },
+  "11052": { label: "stale — price moved past the stop before the order was sent",
+             detail: "SHORT stop must be above the live MARK price, not just above the planned entry. The signal aged out between the candle close and the send.",
+             klass: "execution_artifact", cause: "cadence" },
+  "20005": { label: "the venue has this symbol switched off",
+             detail: "TE_SEQ_TURN_OFF — Phemex testnet disables symbols periodically. Nothing to do with the setup.",
+             klass: "execution_artifact", cause: "venue" },
+  "39999": { label: "symbol is not listed on this venue",
+             detail: "The universe includes a coin testnet does not carry. Nothing to do with the setup.",
+             klass: "execution_artifact", cause: "universe" },
+};
+// ── VALIDATE THE STOP AGAINST THE PRICE PHEMEX WILL ACTUALLY USE (2026-08-21) ────────────────
+// 11048/11052 were the other repeat offender. We check the stop against the price we PLANNED at;
+// Phemex checks it against the MARK — `slTrigger: "ByMarkPrice"`, our own choice, three lines up
+// in buildOrder. On testnet the two are not close relatives: the book is thin, last price wanders
+// off the index, and a stop sitting a legal 0.4% below LAST can be sitting above MARK. The order
+// is then built, approved by every one of our guards, sent, and refused — and the coin is burned
+// for the day on a trade nobody ever got a chance to be wrong about.
+//
+// So the mark is read once, immediately before sending, and the same question Phemex is about to
+// ask gets asked here first. It DECLINES rather than nudging the stop: the stop sits at a swing
+// level for a reason, and shuffling it to satisfy a validator would place a trade whose risk is
+// no longer where the thesis put it. Better to say "this one aged out" and mean it.
+//
+// If the mark cannot be read, this returns null and the order goes exactly as it does today. A
+// guard that cannot see must not be allowed to block.
+const MARK_BUFFER_PCT = 0.001;             // the stop must clear the mark by at least this much
+function markStopVerdict(order, mark) {
+  const m = Number(mark);
+  if (!(m > 0)) return null;                                    // no mark read — do not interfere
+  const sl = Number(order && order.stopLossRp);
+  if (!(sl > 0)) return null;                                   // no stop is a different guard's job
+  const isLong = order.side === "Buy";
+  const need = isLong ? m * (1 - MARK_BUFFER_PCT) : m * (1 + MARK_BUFFER_PCT);
+  const wrongSide = isLong ? sl >= need : sl <= need;
+  if (!wrongSide) return null;
+  const driftPct = Math.abs(sl - m) / m * 100;
+  return {
+    label: "aged out — the stop is on the wrong side of the live mark",
+    detail: `${isLong ? "LONG" : "SHORT"} stop ${sl} vs mark ${m} (${driftPct.toFixed(2)}% away, wrong side). `
+          + "Phemex validates the stop against the MARK price, not our planned entry, and would refuse this. "
+          + "Declined here instead so the coin is not burned on an order that was never going to be accepted.",
+    klass: "execution_artifact", cause: "cadence", mark: m, stop: sl,
+  };
+}
+// Read the mark defensively: shapes differ across Phemex's md versions, and a shape we do not
+// recognise must read as "unknown", never as zero.
+function markFrom(body) {
+  const seen = [];
+  const walk = (o, d) => {
+    if (!o || typeof o !== "object" || d > 5) return;
+    for (const [k, v] of Object.entries(o)) {
+      if (/^mark(Price)?(Rp|Ep)?$/i.test(k)) { const n = Number(v); if (n > 0) seen.push({ k, n }); }
+      else if (v && typeof v === "object") walk(v, d + 1);
+    }
+  };
+  walk(body, 0);
+  if (!seen.length) return null;
+  // Prefer the Rp (real-number) form; an Ep value is a scaled integer and we do not know its scale.
+  const rp = seen.find(x => /Rp$/i.test(x.k)) || seen.find(x => !/Ep$/i.test(x.k));
+  return rp ? rp.n : null;
+}
+async function markPriceFor(symbol) {
+  for (const [path, q] of [["/md/v3/ticker/24hr", "symbol=" + symbol], ["/md/ticker/24hr", "symbol=" + symbol]]) {
+    try {
+      const r = await phemexPublic(path, q);
+      const m = markFrom(r && r.data);
+      if (m) return m;
+    } catch (e) { /* try the next shape */ }
+  }
+  return null;
+}
+
+// ── THE VENUE'S OWN SPOT PRICE (2026-09-19) ────────────────────────────────────────────────
+// The buy-back has been refused with phemex 11053 TE_PRICE_TOO_LARGE on every attempt since
+// 2026-09-04. The 09-07 diagnostics came back clean: priceScale/baseVS/quoteVS/ratioScale are all 8,
+// priceEp is the reference price to the digit, quoteQtyEv is the wallet to the digit. So the
+// order is well-formed and the price formula is right (it is the same formula the working SELL
+// uses). What is left is the PRICE ITSELF: signals and this reference price come from Binance/OKX,
+// while the order goes to a TESTNET book that has been measured 38 days stale and −16% off
+// mainnet (see the venue-candles note). A buy limit far above the book's own ask is exactly what a
+// price band answers with "too large"; a sell above the book just rests, which is why sells pass.
+// This is a hypothesis, so the first job is to LOG the venue's bid/ask/last beside the price we
+// sent. The second is to cap a buy at just above the venue's ask (ACCUM_BUY_CLAMP_BPS, 0 = off),
+// which is still marketable, so it fills at the ask rather than being refused.
+function spotTickerFrom(body, priceScale) {
+  const r = body && (body.result || body.data || body);
+  if (!r || typeof r !== "object") return null;
+  const pick = (k) => {
+    const rp = Number(r[k + "Rp"]); if (rp > 0) return rp;
+    const ep = Number(r[k + "Ep"]);
+    return ep > 0 && Number.isFinite(priceScale) ? ep / 10 ** priceScale : null;
+  };
+  const out = { bid: pick("bid"), ask: pick("ask"), last: pick("last") };
+  return out.bid || out.ask || out.last ? out : null;
+}
+async function spotVenuePx(symbol, priceScale) {
+  try {
+    const r = await phemexPublic("/md/spot/ticker/24hr", "symbol=" + symbol);
+    return spotTickerFrom(r && r.data, priceScale);
+  } catch (e) { return null; }
+}
+// PURE. Cap a BUY limit at just above the venue's ask. Never raises a price, never touches a sell.
+function clampBuyPx(refPx, venue, bps) {
+  if (!(bps > 0) || !venue || !(venue.ask > 0) || !(refPx > 0)) return { px: refPx, clamped: false };
+  const cap = venue.ask * (1 + bps / 1e4);
+  return refPx > cap ? { px: cap, clamped: true } : { px: refPx, clamped: false };
+}
+
+function explainRejection(why) {
+  const m = /phemex (\d+)/.exec(String(why || ""));
+  const hit = m && PHEMEX_REJECTIONS[m[1]];
+  if (!hit) return { label: String(why || "rejected"), klass: "execution_artifact", cause: "unknown", detail: "" };
+  return { ...hit, code: m[1] };
+}
+
+// ═══════════ ASK THE VENUE HOW IT ENDED (2026-10-26) ═══════════
+// 100 of the first 162 resolutions were "closed at neither the stop nor the target" — graded by
+// comparing a price RANGE to the plan, and when the range missed both levels, written off as
+// unattributed. A range can say what price did; it cannot say what closed the position. The
+// venue's own trade history can: the closing fill's price, its order type and its clOrdID — and
+// every order this bot sends carries a clOrdID that says which part of the bot sent it.
+//
+// So when a position disappears we look up its closing fill and name the closer:
+//   cipherStop / cipherTarget  — the protective orders the sweep placed for THIS position
+//   cipherBreach               — the sweep closed it because price was already past its stop
+//   dehedge / timestop         — the bot's own de-hedge or time-stop close
+//   untagged Stop / IfTouched  — a stop/target bundled on the entry order
+//   liquidation                — the venue closed it
+//   anything else              — closed outside the bot (by hand, the app, another tool)
+// A stop that fired far from this position's own stop is an OLD stop left by an earlier position
+// (see the stacking note above protectOpenPositions) and is named as such, not graded.
+// Unknown response shapes are logged once per run so the next audit can read them.
+
+// PURE. Pull fill rows out of any of Phemex's response shapes.
+function fillRowsFrom(body, depth = 0) {
+  if (!body || typeof body !== "object" || depth > 5) return null;
+  if (Array.isArray(body)) {
+    return body.length && body.some(r => r && typeof r === "object" &&
+      (r.execPriceRp != null || r.execPrice != null || r.execPriceEp != null || r.priceRp != null)) ? body : (body.length ? null : []);
+  }
+  for (const k of ["rows", "data", "result", "trades"]) {
+    if (body[k] !== undefined) { const hit = fillRowsFrom(body[k], depth + 1); if (hit) return hit; }
+  }
+  return null;
+}
+
+// PURE. The most recent fill that CLOSED this side of the position, after it opened.
+function pickClosingFill(rows, posSide, sinceMs) {
+  const closing = posSide === "Long" ? "Sell" : "Buy";
+  const at = r => {
+    const ns = Number(r.transactTimeNs); if (ns > 0) return ns / 1e6;
+    const ms = Number(r.createdAt ?? r.execTime ?? r.transactTime ?? r.timestamp); if (ms > 0) return ms > 1e14 ? ms / 1e6 : ms;
+    return 0;
+  };
+  const cands = (rows || []).filter(r => r &&
+    (!r.posSide || String(r.posSide) === posSide) &&
+    String(r.side || "") === closing &&                 // must say it closed this side (audit, 3rd pass)
+    // A fill with no readable time cannot be shown to belong to THIS position (audit 2026-10-26):
+    // with a since to check against, it is left out rather than waved through.
+    (!sinceMs || (at(r) > 0 && at(r) >= sinceMs - 60e3)) &&
+    Number(r.execPriceRp ?? r.execPrice ?? r.priceRp) > 0);
+  if (!cands.length) return null;
+  cands.sort((a, b) => at(b) - at(a));
+  const r = cands[0];
+  return {
+    px: Number(r.execPriceRp ?? r.execPrice ?? r.priceRp),
+    qty: Math.abs(Number(r.execQtyRq ?? r.execQty ?? r.orderQtyRq) || 0) || undefined,
+    ordType: String(r.ordType || ""), clOrdID: String(r.clOrdID || ""), text: String(r.text || ""),
+    orderID: String(r.orderID || ""),
+    execStatus: String(r.execStatus || r.execType || ""),
+    closedPnl: Number.isFinite(Number(r.closedPnlRv)) ? Number(r.closedPnlRv) : undefined,
+    at: at(r) || undefined,
+  };
+}
+
+// PURE. Turn a fill into the four labels classifyResolution uses, plus closedBy and real R.
+function attributeClose(was, fill, reg) {
+  const plan = was && was.plan;
+  if (!plan || !fill || !(fill.px > 0)) return null;
+  const { entry, stop, target } = plan;
+  const isLong = was.dir !== "short";
+  const risk = Math.abs(entry - stop);
+  const realR = risk > 0 ? +(((isLong ? fill.px - entry : entry - fill.px)) / risk).toFixed(3) : undefined;
+  const near = (lvl) => Number.isFinite(lvl) && risk > 0 && Math.abs(fill.px - lvl) <= 0.35 * risk;
+  const tag = `${fill.clOrdID} ${fill.text}`;
+  const base = { exit: fill.px, R: realR, closeFill: fill, gradedOn: "venue_fill" };
+  const strat = (how, closedBy, why) => ({ ...base, how, closedBy, why,
+    outcome: realR > 0 ? "win" : "loss", klass: "strategy", execution: "filled",
+    countsForStreak: true, countsForStats: true });
+  const art = (how, closedBy, why) => ({ ...base, how, closedBy, why,
+    outcome: "unattributed", klass: "execution_artifact", execution: "closed_off_plan",
+    countsForStreak: false, countsForStats: false });
+
+  if (/liq|adl/i.test(fill.ordType + " " + fill.execStatus + " " + tag))
+    return strat("liquidation", "liquidation", `the venue liquidated it at ${formatPrice(fill.px)}`);
+  if (/^cipherBreach|cipher-stop-breach/i.test(tag))
+    return strat("stop", "stop_breach_close", `price was already past the stop; the bot closed it at market at ${formatPrice(fill.px)}`);
+  // ── WHICH ORDER, NOT HOW CLOSE (audit 2026-10-26) ─────────────────────────────────────────
+  // Judging "own stop or a stale one" by distance from the stop level dropped every GAPPED stop
+  // from the stats — a stop that filled 1.6R past its level because price jumped through it read
+  // as somebody else's order, so the worst losses quietly vanished and the record looked better
+  // than it was. The registry knows the exact orders placed for THIS position: match on those.
+  const same = (o) => o && ((fill.orderID && o.orderID && fill.orderID === String(o.orderID)) ||
+                            (fill.clOrdID && o.clOrdID && fill.clOrdID === String(o.clOrdID)));
+  const isReg = (leg) => !!(reg && (same(reg[leg]) || (reg.history || []).some(h => h.leg === leg && same(h))));
+  const gap = (lvl) => risk > 0 && Number.isFinite(lvl) ? Math.abs(fill.px - lvl) / risk : 0;
+  if (isReg("stop"))
+    return strat("stop", "cipher_stop", `its own stop filled at ${formatPrice(fill.px)}` + (gap(stop) > 0.1 ? ` — ${gap(stop).toFixed(2)}R past the level (price gapped through it)` : ""));
+  if (isReg("target"))
+    return strat("target", "cipher_target", `its own resting target filled at ${formatPrice(fill.px)}`);
+  if (/^cipherTarget|cipher-protective-target/i.test(tag))
+    return reg && reg.target ? art("closed_by_hand", "stale_target", `a target order from an EARLIER position filled at ${formatPrice(fill.px)}`)
+                             : strat("target", "cipher_target", `its own resting target filled at ${formatPrice(fill.px)}`);
+  if (/^cipherStop|cipher-protective-stop/i.test(tag)) {
+    // Registry has this position's stop and it is not the one that filled → genuinely an old one.
+    if (reg && reg.stop) return art("stale_stop", "stale_stop", `a protective stop that was NOT this position's fired at ${formatPrice(fill.px)} — an old stop left over from an earlier position on the same side`);
+    // No registry record (positions from before it existed): our own stop, gapped or not. Over-
+    // counting a stale stop as a loss is the honest direction to be wrong in; hiding a real loss is not.
+    return strat("stop", "cipher_stop", `a stop this bot placed filled at ${formatPrice(fill.px)}` + (gap(stop) > 0.35 ? ` (${gap(stop).toFixed(2)}R from the plan's level — gapped, or an older stop; no record to tell which)` : ""));
+  }
+  if (/dehedge/i.test(tag)) return art("dehedge", "dehedge", `the bot closed this leg to remove a hedge, at ${formatPrice(fill.px)}`);
+  if (/timestop/i.test(tag)) return strat("time_stop", "time_stop", `the time stop closed it at ${formatPrice(fill.px)}`);
+  // An untagged stop is the one bundled on this position's own entry order (or one set by hand on
+  // it). Either way it closed THIS position at a loss-side level — counted, gapped or not.
+  if (/stop/i.test(fill.ordType))
+    return strat("stop", "venue_stop", `the stop bundled on the entry order filled at ${formatPrice(fill.px)}` + (gap(stop) > 0.1 ? ` — ${gap(stop).toFixed(2)}R from the plan's level` : ""));
+  if (/iftouched|takeprofit|^bo/i.test(fill.ordType))
+    return near(target) ? strat("target", "venue_target", `a target order filled at ${formatPrice(fill.px)}`)
+                        : art("closed_by_hand", "venue_target_elsewhere", `a take-profit order filled at ${formatPrice(fill.px)}, not near this position's target ${formatPrice(target)}`);
+  return art("closed_by_hand", "outside_bot", `closed by an order this bot did not send (${fill.ordType || "unknown type"}${fill.clOrdID ? ", " + fill.clOrdID.slice(0, 20) : ""}) at ${formatPrice(fill.px)} — by hand, the app, or another tool`);
+}
+
+// PURE. How much of this side was CLOSED by fills at or after sinceMs. Rows without a readable time
+// are not counted — they cannot be shown to come after the position opened.
+function closedQtySince(rows, posSide, sinceMs) {
+  const closing = posSide === "Long" ? "Sell" : "Buy";
+  let q = 0;
+  for (const r of rows || []) {
+    // The row must SAY it closed this side (audit, 3rd pass): a row with no side could be the
+    // opening fill of the opposite leg, and counting it would record a reopen that never happened.
+    if (!r || String(r.side || "") !== closing || (r.posSide && String(r.posSide) !== posSide)) continue;
+    const ns = Number(r.transactTimeNs); const ms = ns > 0 ? ns / 1e6 : Number(r.createdAt ?? r.execTime ?? r.transactTime ?? 0);
+    const t = ms > 1e14 ? ms / 1e6 : ms;
+    if (!(t > 0) || t < sinceMs - 60e3) continue;
+    q += Math.abs(Number(r.execQtyRq ?? r.execQty ?? 0)) || 0;
+  }
+  return q;
+}
+
+let lastFillMiss = "";
+async function fetchFillRows(symbol, sinceMs) {
+  if (!CFG.direct()) return { rows: null, seen: ["relay mode"] };
+  const tries = [
+    ["/exchange/order/v2/tradingList", `symbol=${symbol}&currency=USDT&offset=0&limit=50&withCount=false`],
+    ["/api-data/g-futures/trades", `symbol=${symbol}&limit=50` + (sinceMs ? `&start=${Math.floor(sinceMs - 60e3)}` : "")],
+  ];
+  const seen = [];
+  for (const [path, q] of tries) {
+    try {
+      const r = await phemexCall("GET", path, q, null);
+      const rows = r.status === 200 ? fillRowsFrom(r.data) : null;
+      if (rows && rows.length) return { rows, seen, via: path };
+      seen.push(`${path} → http ${r.status} ${JSON.stringify(r.data || {}).slice(0, 160)}`);
+    } catch (e) { seen.push(`${path} → ${String((e && e.message) || e).slice(0, 100)}`); }
+  }
+  return { rows: null, seen };
+}
+
+async function fetchCloseFill(symbol, posSide, sinceMs) {
+  // A position with no recorded start still gets a window, never an open-ended one.
+  const since = Number(sinceMs) > 0 ? Number(sinceMs) : Date.now() - 7 * 864e5;
+  const { rows, seen, via } = await fetchFillRows(symbol, since);
+  if (rows) { const f = pickClosingFill(rows, posSide, since); if (f) return { ...f, via }; seen.push(`${via} → ${rows.length} fill(s), none closing ${posSide} since the position opened`); }
+  lastFillMiss = seen.join(" ;; ");
+  return null;
+}
+
+function resolvedSince(prev, now, priceOf, rangeOf) {
+  const out = [];
+  for (const k of Object.keys(prev || {})) {
+    if (now[k]) continue;                                   // still open
+    const was = prev[k], px = priceOf(was.coin);
+    const range = typeof rangeOf === "function" ? rangeOf(was.coin) : null;
+    out.push({ ...was, ...classifyResolution(was, px, range), exit: px });
+  }
+  return out;
+}
+
+// PURE. Position + last price + the range it traded through = the four labels.
+function classifyResolution(was, px, range) {
+  const isLong = was.dir !== "short";
+  const plan = was.plan;
+
+  // No plan at all: the bot was never managing this, so it can say nothing about it.
+  if (!plan) {
+    return { how: "closed", outcome: "unattributed", klass: "execution_artifact",
+             execution: was.unprotected ? "unprotected_no_plan" : "no_plan",
+             why: "held with no plan — nothing to grade it against",
+             countsForStreak: false, countsForStats: false };
+  }
+
+  const { entry, stop, target } = plan;
+  const haveRange = !!(range && Number.isFinite(range.hi) && Number.isFinite(range.lo));
+  // With a range we ask "did price TRADE THROUGH this level" — the honest question. Without one
+  // we fall back to the old snapshot comparison, which is weaker (it cannot see a target that was
+  // hit and given back) and is labelled as such rather than quietly passed off as equivalent.
+  const touched = haveRange
+    ? (lvl) => Number.isFinite(lvl) && lvl <= range.hi && lvl >= range.lo
+    : (lvl) => Number.isFinite(lvl) && Number.isFinite(px) && (isLong ? px >= lvl : px <= lvl);
+  const hitTarget = touched(target);
+  // On the snapshot path a long sitting below its stop also sits below its target, so test the
+  // stop the other way round or every stop-out would read as a target miss.
+  const hitStop = haveRange
+    ? (Number.isFinite(stop) && stop <= range.hi && stop >= range.lo)
+    : (Number.isFinite(stop) && Number.isFinite(px) && (isLong ? px <= stop : px >= stop));
+
+  // Both touched in the same window and we cannot know the order. Saying "win" or "loss" here
+  // would be a coin toss recorded as evidence, which is worse than admitting we do not know.
+  if (hitTarget && hitStop) {
+    return { how: "ambiguous", outcome: "unattributed", klass: "execution_artifact",
+             execution: "both_levels_touched",
+             why: "price traded through both the stop and the target between two runs — the order cannot be recovered",
+             countsForStreak: false, countsForStats: false };
+  }
+  // ── R, SO A RECORD CAN BE ADDED UP (2026-08-21) ─────────────────────────────────────────
+  // John asked the panel for "total trades, wins, total balance". It could not answer: a
+  // resolution was logged as a sentence of English and nothing else, so counting wins meant
+  // parsing prose, and there was no size to any win — three targets at 1.5R, 2R and 3R all
+  // read the same. R is the honest unit here: it is what the plan was worth when it was made,
+  // measured in the risk that was actually taken, so it adds up across coins and price levels.
+  //
+  // Deliberately the PLANNED R, not the exit price: the exit the bot can see is a snapshot from
+  // whenever it next woke, which is not the price the position left at. A number that pretends
+  // to a precision it does not have is the thing this whole codebase keeps having to undo.
+  const rr = (Number.isFinite(target) && Number.isFinite(entry) && Number.isFinite(stop) && Math.abs(entry - stop) > 0)
+    ? +Math.abs((target - entry) / (entry - stop)).toFixed(3) : null;
+  if (hitTarget) {
+    return { how: "target", outcome: "win", klass: "strategy", R: rr,
+             execution: haveRange ? "filled" : "filled_snapshot_only",
+             why: haveRange ? "price traded through the target" : "price was at or beyond the target when we looked",
+             countsForStreak: true, countsForStats: true };
+  }
+  if (hitStop) {
+    return { how: "stop", outcome: "loss", klass: "strategy", R: -1,
+             execution: haveRange ? "filled" : "filled_snapshot_only",
+             why: haveRange ? "price traded through the stop" : "price was at or beyond the stop when we looked",
+             countsForStreak: true, countsForStats: true };
+  }
+
+  // Gone, but at neither of its own levels. By elimination somebody closed it by hand (or the
+  // venue did). Direction is recorded for information; it counts toward nothing, because the
+  // exit price the bot can see is not the price it was closed at.
+  // ── NOT SEEING IS NOT THE SAME AS NOT HAPPENING (2026-08-21) ────────────────────────────
+  // With no range AND no price this function knows nothing whatsoever about the trade, and the
+  // old code still returned "closed_by_hand" — an assertion about what somebody DID. Five of
+  // seven trades on 2026-08-21 were written off that way while the real answer was "we did not
+  // look". They are both artifacts and neither counts, but they are different facts and the
+  // difference is the whole reason to keep a record: one says fix your exchange habits, the
+  // other says fix your bot.
+  if (!haveRange && !Number.isFinite(px)) {
+    return { how: "unseen", outcome: "unattributed", klass: "execution_artifact",
+             execution: "no_price_no_range",
+             why: "gone, and the bot had neither a price nor a range for this coin when it looked — "
+                + "so it cannot say whether the stop, the target, or something else closed it. "
+                + "This is a gap in OUR data, not a fact about the trade.",
+             countsForStreak: false, countsForStats: false };
+  }
+  const dir = Number.isFinite(entry) && Number.isFinite(px)
+    ? ((isLong ? px > entry : px < entry) ? "was in profit when we looked" : "was in loss when we looked")
+    : "no entry recorded";
+  return { how: "closed_by_hand", outcome: "unattributed", klass: "execution_artifact",
+           execution: "closed_off_plan",
+           why: `closed at neither the stop nor the target — ${dir}. Not the bot's exit, so it grades nothing.`,
+           countsForStreak: false, countsForStats: false };
+}
+
+// ═══════════════ TWO BOOKS: fast and swing (2026-08-16) ═══════════════
+// John: "quick turnover, long to TP, flip short on the signal, meanwhile a bigger swing trade on
+// BTC." That is two different businesses sharing one account, and the bot could only run one:
+// a single risk setting, one target rule, one correlation pool, one day cap.
+//
+// Worse, the no-hedge rule written last night would have BLOCKED exactly what he wants — a 4H
+// short while a weekly BTC long runs is not a hedge, it is a different trade on a different
+// horizon. The rule was right; it just could not tell the two apart.
+//
+// So a trade belongs to a BOOK, decided by the timeframe its signal came from. Each book gets its
+// own slots and day cap, and — the important part — the no-hedge rule applies WITHIN a book, not
+// across them. Then "scalp both ways while BTC runs" is simply two books doing their jobs.
+const FAST_TFS = ["15m", "30m", "1H", "4H"];
+function bookFor(tf) { return FAST_TFS.includes(String(tf)) ? "fast" : "swing"; }
+const BOOK_CFG = {
+  fast:  { corrMax: () => num("FAST_CORR_MAX", 4),  dayCap: () => num("FAST_DAY_CAP", 20) },
+  swing: { corrMax: () => num("SWING_CORR_MAX", 3), dayCap: () => num("SWING_DAY_CAP", 6) },
+};
+// Which book opened which position? The exchange does not know, so we remember. Positions opened
+// before books existed have no entry here — and those are treated as belonging to BOTH books, so
+// the no-hedge protection never quietly lapses while this rolls out.
+const BOOKMAP_KEY = "cipher_books";
+// Positions the bot holds but cannot manage: no plan, so no stop and no target, and no book —
+// which means the no-hedge rule treats them as belonging to BOTH books and they quietly block
+// every new trade in that coin. Written every run so the app can show them, cleared the moment
+// they are adopted or closed.
+const ORPHAN_KEY = "cipher_unprotected";
+const posKey = (coin, dir) => String(coin).toUpperCase() + "|" + dir;
+
+// ═══════════════ TIME STOP — make trades RESOLVE (2026-08-16) ═══════════════
+// John: "I don't believe we've hit a single TP or stop loss yet."
+//
+// He is right, and it is not impatience — it is a design hole. A trade has a stop and a 2.25R
+// target and nothing else, so a setup that simply goes nowhere sits open forever: capital held,
+// funding leaking, a correlation slot occupied, and — the part that bites hardest right now —
+// it never becomes a data point. A system that cannot resolve trades cannot learn from them.
+//
+// A time stop says: if the setup has not done its job within N bars, the thesis has expired.
+// Take the small win or loss and move on. Three things at once — a faster sample, less funding
+// bleed, and slots freed for better setups.
+//
+// N is what is being TESTED, so this runs as a shadow experiment first: baseline holds forever,
+// variants close at 20 / 40 / 60 bars. The variant that wins in R earns the job. Note the neat
+// part — this experiment MANUFACTURES the resolutions that every other experiment needs.
+const TIMESTOP_BARS = [20, 40, 60];
+const BAR_MS = { "15m": 9e5, "30m": 18e5, "1H": 36e5, "4H": 144e5, "1D": 864e5, "1W": 6048e5 };
+
+// How many bars has this position been open, on its own timeframe?
+function barsOpen(rec, now) {
+  const ms = BAR_MS[rec.tf || "1D"] || BAR_MS["1D"];
+  return Math.floor((now - rec.at) / ms);
+}
+
+// ── THE DECISION HAS TO BE INSIDE THE WINDOW (2026-09-12) ─────────────────────────────────────
+// Every grader in this file used to find its entry bar with `candles.findIndex(c => c.t >= rec.at)`
+// and treat the result as the moment of the decision. That is right whenever the fetched window
+// reaches back past `rec.at` — and silently, dangerously wrong when it does not, because then
+// EVERY candle is newer than the decision, findIndex returns 0, and the trade gets walked from
+// the START OF THE WINDOW instead: days or weeks after the signal was given.
+//
+// That is not harmless noise. In a trending market the first bar of a late window is already
+// beyond the target for a long (instant full win) or beyond the stop for a short (instant full
+// loss), so the error has a SIGN, and an arm fills up with 2.25s and −1s that no decision ever
+// earned. Its signature in the stored history is a whole bucket at exactly 2.25 or exactly −1
+// with identical halves — visible in the first entries of both the relative-strength and regime
+// arms, and the likeliest explanation for the maker arm reading +0.671R/decision over n=1501 on
+// 2026-09-12 while the realised book over the same rules ran at −0.071R/trade.
+//
+// The comment on gradeShadow asserting a decision "cannot age out of the window" is the
+// assumption that fails: 600 bars covers 100d at 4H but only 12.5d at 30m and 6.25d at 15m, and
+// the maker and time-stop arms retry records that never settle indefinitely, so records do age
+// past their window and were graded anyway. 382 of the maker arm's 600 remembered records were
+// older than a 30m window on the day this was found.
+//
+// Returning −1 makes the caller leave the record ungraded and try again on a later run. A record
+// that has aged out for good is simply retried until it falls off the end of the 600-record pool,
+// which costs a candle fetch and never a wrong number. Grading NOTHING is always recoverable;
+// grading a trade from the wrong week is not.
+function decisionBar(rec, candles) {
+  if (!candles || !candles.length) return -1;
+  if (candles[0].t > rec.at) return -1;      // window starts after the decision — cannot answer
+  return candles.findIndex(c => c.t >= rec.at);   // −1 when no bar has reached it yet
+}
+
+// What WOULD a time stop of N bars have scored on a decision we already have candles for?
+// Deliberately reuses gradeOne's walk so the two arms are scored by identical rules — the only
+// difference between them is when they give up.
+function gradeWithTimeStop(rec, candles, maxBars) {
+  const risk = Math.abs(rec.entry - rec.stop);
+  if (!(risk > 0) || !candles || !candles.length) return null;
+  const isLong = rec.dir !== "short";
+  const start = decisionBar(rec, candles);   // −1 if the window cannot reach the decision
+  if (start < 0) return null;
+  for (let i = start; i < candles.length; i++) {
+    const c = candles[i];
+    if (isLong ? c.l <= rec.stop : c.h >= rec.stop) return -1;                       // stop first
+    if (isLong ? c.h >= rec.target : c.l <= rec.target) return +Math.abs(rec.target - rec.entry) / risk;
+    if (i - start >= maxBars) return (isLong ? c.c - rec.entry : rec.entry - c.c) / risk;  // time is up
+  }
+  return null;                                   // still open and still inside its window
+}
+
+// ═══════════════ MAKER ENTRY (shadow, 2026-08-19) ═══════════════
+// The cost work said fees are the binding constraint — 2.2× gross profit, and the three-year
+// replay flips sign if both sides pay maker. The live entry is a marketable limit crossed 1%
+// through the market: a guaranteed fill, at taker. The candidate is a post-only limit AT the
+// signal price: it pays maker IF price trades back through the level inside the entry-expiry
+// window, and it MISSES the trades that run without a pullback — which the entry-mode note
+// (2026-08-15) warned are often the best ones. Whether the fee saved pays for the trades missed
+// is an empirical question, so it is measured here and decides nothing. Scored on the same
+// decisions every other experiment uses. Nothing in this path places or changes an order.
+const MAKER_FEE = num("MAKER_FEE", 0.0001);   // Phemex maker 0.01%
+const TAKER_FEE = num("TAKER_FEE", 0.0006);   // Phemex taker 0.06%
+
+// Pure candle walk from a given bar: −1 on stop, +R on target, marked to market at the cap.
+// Stop before target inside a candle — the same pessimism as gradeOne. Mutates nothing.
+function walkFromBar(rec, candles, from, fillPx) {
+  const risk = Math.abs(fillPx - rec.stop);
+  if (!(risk > 0)) return null;
+  const isLong = rec.dir !== "short";
+  for (let i = from; i < candles.length; i++) {
+    const c = candles[i];
+    if (isLong ? c.l <= rec.stop : c.h >= rec.stop) return -1;
+    if (isLong ? c.h >= rec.target : c.l <= rec.target) return +Math.abs(rec.target - fillPx) / risk;
+    if (i - from >= SHADOW_TIMEOUT_BARS * (rec.tfMult || 4))
+      return (isLong ? c.c - fillPx : fillPx - c.c) / risk;   // time is up — marked to market
+  }
+  return null;                                  // still open — grade it on a later run
+}
+
+// Score one decision both ways, net of fees, in R. Returns null until both arms can settle.
+//   taker — fills immediately at the signal price; pays taker in and (pessimistically) taker out.
+//   maker — post-only at the signal price; fills only when a later candle trades back through the
+//           level inside expiryH. Unfilled by expiry = the trade never happened: 0R, counted as
+//           missed, because a fee saved on no position earns nothing.
+// Cost in R is fee% ÷ stop% — the same arithmetic that set the 2.2% stop floor.
+function gradeMakerEntry(rec, candles, expiryH) {
+  const risk = Math.abs(rec.entry - rec.stop);
+  if (!(risk > 0) || !candles || !candles.length) return null;
+  const isLong = rec.dir !== "short";
+  const start = decisionBar(rec, candles);   // −1 if the window cannot reach the decision
+  if (start < 0) return null;
+  const stopPct = risk / rec.entry;
+  const takerGross = walkFromBar(rec, candles, start, rec.entry);
+  if (takerGross === null) return null;
+  const takerR = +(takerGross - (2 * TAKER_FEE) / stopPct).toFixed(3);
+  const cutoff = rec.at + expiryH * 3600e3;
+  let fill = -1;
+  for (let i = start; i < candles.length && candles[i].t <= cutoff; i++) {
+    if (isLong ? candles[i].l <= rec.entry : candles[i].h >= rec.entry) { fill = i; break; }
+  }
+  if (fill < 0) {
+    const windowOver = candles[candles.length - 1].t > cutoff;
+    return windowOver ? { takerR, makerR: 0, filled: false } : null;   // wait the window out
+  }
+  const makerGross = walkFromBar(rec, candles, fill, rec.entry);
+  if (makerGross === null) return null;
+  return { takerR, makerR: +(makerGross - (MAKER_FEE + TAKER_FEE) / stopPct).toFixed(3), filled: true };
+}
+
+// A live position the bot opened, still sitting there past its window. Closing is a REDUCE-ONLY
+// market order — it can only ever shrink a position, never open one, which is the property that
+// makes this safe to run automatically.
+function closeOrderFor(pos) {
+  const size = Math.abs(Number(pos.size) || 0);
+  if (!(size > 0)) return null;
+  const isLong = String(pos.posSide || pos.side || "").toLowerCase().startsWith("l");
+  return {
+    clOrdID: ("timestop" + String(pos.symbol || "").replace(/[^A-Z]/gi, "") + Date.now()).slice(0, 40),
+    symbol: String(pos.symbol).toUpperCase(),
+    side: isLong ? "Sell" : "Buy",               // the closing side
+    posSide: pos.posSide || "Merged",
+    ordType: "Market", orderQtyRq: String(size),
+    timeInForce: "ImmediateOrCancel",
+    reduceOnly: true, closeOnTrigger: true, text: "cipher-timestop",
+  };
+}
+
+// ── AN EXISTING HEDGE IS A STANDING COST (2026-08-18) ─────────────────────────────────────────
+// The no-hedge rule stopped the bot OPENING an opposing leg. It never did anything about one
+// already sitting there: the run printed "WARNING: ... already hold BOTH sides" and carried on.
+// John's exchange screenshot on 2026-08-18 showed BTCUSDT holding a Long AND a Short, quietly
+// paying funding and fees on both legs to hold a net position it could have held with one.
+//
+// So the smaller leg gets closed. Deliberately the smaller one: the two legs offset, so removing
+// the smaller leaves the same NET exposure and strictly reduces cost, margin and risk. This
+// cannot open a position, cannot increase one, and cannot flip a direction — the order is
+// reduceOnly. Set HEDGE_FIX=0 to go back to warning only.
+function hedgeCloseOrder(pos) {
+  const o = closeOrderFor(pos);
+  if (o) { o.clOrdID = ("dehedge" + String(pos.symbol || "").replace(/[^A-Z]/gi, "") + Date.now()).slice(0, 40);
+           o.text = "cipher-dehedge"; }
+  return o;
+}
+
+// What the venue has already refused to close, and how many times. Persisted, because the whole
+// point is to remember across runs — an in-memory counter would reset every fifteen minutes and
+// the loop would carry on exactly as before.
+const DEHEDGE_KEY = "cipher_dehedge_failed";
+const DEHEDGE_GIVE_UP = 3;
+
+// ── A FIX TO THE ORDER PATH MUST UN-LATCH WHAT THE BROKEN PATH GAVE UP ON (2026-09-12) ────────
+// The give-up counter below is deliberately sticky: three refusals and the leg is left alone until
+// its size changes, because re-asking a venue that will never accept a dust stub is pure noise.
+// That is right when the VENUE refused. It is exactly wrong when the refusal came from this file.
+//
+// Every latched entry on 2026-09-12 read `"refPx required to size-check the order"` — which was
+// never the venue at all. It was directGuards() rejecting the bot's own valid reduce-only close
+// (found and fixed 2026-09-08, finally deployed 2026-09-12). So the counters had recorded a defect
+// that no longer exists; worse, the give-up message had told John the legs were dust stubs he must
+// close by hand, when the bot could have closed them itself all along. Run #575 still reported
+// "3 given up on" with the WORKING code in place, because the latch outlived the bug it recorded.
+//
+// Bump DEHEDGE_CODE_REV whenever the order-building or de-hedge path changes. On the first run
+// after a bump every counter is zeroed — entries are kept, with prevN, so a genuine repeat failure
+// still reads as history rather than starting from nothing. Bounded by design: a bump buys at most
+// DEHEDGE_GIVE_UP fresh attempts per leg and then it latches again, so a real venue refusal costs
+// three more asks, once, and never a loop.
+const DEHEDGE_REV_KEY  = "cipher_dehedge_rev";
+const DEHEDGE_CODE_REV = "2026-10-26-close-not-nan";   // directOrder no longer sends stopLossRp "NaN" / reduceOnly:false on a close
+
+// Zero the give-up counters once, after the order path changes. Mutates `failed` in place and
+// returns how many legs were un-latched, so the caller can say so out loud rather than silently.
+function unlatchDehedge(failed, storedRev) {
+  if (storedRev === DEHEDGE_CODE_REV) return 0;
+  let n = 0;
+  for (const k of Object.keys(failed || {})) {
+    const e = failed[k];
+    if (!e || typeof e !== "object" || !(Number(e.n) > 0)) continue;
+    e.prevN = Number(e.n);
+    e.n = 0;
+    e.unlatchedBy = DEHEDGE_CODE_REV;
+    e.unlatchedAt = Date.now();
+    n++;
+  }
+  return n;
+}
+
+async function resolveHedges(positions) {
+  const out = { found: 0, closed: 0, failed: 0, givenUp: 0, closedLegs: [] };
+  if (String(env("HEDGE_FIX", "1")) !== "1") return out;
+  const failed = (await getJSON(DEHEDGE_KEY, {})) || {};
+  let failedDirty = false;
+  // ── un-latch first, so a leg the OLD code gave up on gets a fair try under the new one ──────
+  // The stamp is written whether or not anything needed clearing, or this would run every run.
+  const dehedgeRev = await getJSON(DEHEDGE_REV_KEY, null);
+  if (dehedgeRev !== DEHEDGE_CODE_REV) {
+    const unlatched = unlatchDehedge(failed, dehedgeRev);
+    if (unlatched) {
+      failedDirty = true;
+      console.log(`de-hedge: ${unlatched} leg(s) un-latched — they gave up under an order path `
+        + `that has since changed (now ${DEHEDGE_CODE_REV}), so they get ${DEHEDGE_GIVE_UP} fresh attempts`);
+    }
+    try { await setJSON(DEHEDGE_REV_KEY, DEHEDGE_CODE_REV); } catch { }
+  }
+  const bySym = new Map();
+  for (const p of positions) {
+    if (!(Math.abs(Number(p.size) || 0) > 0)) continue;
+    const sym = String(p.symbol || "").toUpperCase();
+    if (!bySym.has(sym)) bySym.set(sym, []);
+    bySym.get(sym).push(p);
+  }
+  for (const [sym, legs] of bySym) {
+    const longs = legs.filter(p => String(p.posSide || p.side || "").toLowerCase().startsWith("l"));
+    const shorts = legs.filter(p => !String(p.posSide || p.side || "").toLowerCase().startsWith("l"));
+    if (!longs.length || !shorts.length) continue;                 // not a hedge
+    out.found++;
+    const notional = p => Math.abs(Number(p.size) || 0) * (+(p.markPriceRp || p.markPrice || 0) || 1);
+    const biggestLong = longs.sort((a, b) => notional(b) - notional(a))[0];
+    const biggestShort = shorts.sort((a, b) => notional(b) - notional(a))[0];
+    const smaller = notional(biggestLong) <= notional(biggestShort) ? biggestLong : biggestShort;
+    // ── HAVE WE ALREADY BEEN TOLD NO? ────────────────────────────────────────────────────────
+    // Keyed on the leg AND its size: if the size has changed, something worked, and it deserves
+    // another go. If it has not, the venue has already answered this exact question.
+    const legKey = `${sym}|${String(smaller.posSide || "").toLowerCase()}`;
+    const legSize = String(Math.abs(Number(smaller.size) || 0));
+    const prevFail = failed[legKey];
+    if (prevFail && prevFail.size === legSize && (prevFail.n || 0) >= DEHEDGE_GIVE_UP) {
+      out.givenUp++;
+      continue;                                  // silent by design — it was said loudly once
+    }
+    if (prevFail && prevFail.size !== legSize) { delete failed[legKey]; failedDirty = true; }
+
+    const order = hedgeCloseOrder(smaller);
+    if (!order) { out.failed++; continue; }
+    // ── A FAILED CLOSE MUST NOT REPORT ITSELF AS A CLOSE (2026-08-21) ───────────────────────
+    // Both branches used to log the same sentence — "Closed the smaller leg … same net exposure"
+    // — and only the RESULT field said whether it had worked. On 2026-08-20 that produced five
+    // lines over two hours, all reading as if the hedge had been dealt with, while ADA sat there
+    // still holding both sides. The failures were also invisible in every count, because "ERR
+    // de-hedge" parses as an order rejection and got filed with the venue's refusals.
+    //
+    // A log line that describes what was ATTEMPTED as though it were what HAPPENED is the most
+    // expensive kind of wrong in this file: it costs you the chance to notice.
+    let ok = false, why = "";
+    try {
+      const r = await execOrder(order);
+      ok = r && r.status === 200 && r.data && !r.data.error;
+      if (!ok) why = String((r && r.data && (r.data.error || r.data.msg)) || ("http " + (r && r.status))).slice(0, 160);
+    } catch (e) { ok = false; why = String(e && e.message || e).slice(0, 160); }
+    if (ok) { out.closed++; out.closedLegs.push(smaller); } else out.failed++;
+    const coin = sym.replace(/USDT$/, "");
+    const leg = `${smaller.posSide}, ${Math.abs(Number(smaller.size))}`;
+
+    // ── KEEP SCORE, AND SAY SOMETHING USEFUL ON THE WAY OUT ──────────────────────────────────
+    if (ok) { if (failed[legKey]) { delete failed[legKey]; failedDirty = true; } }
+    else {
+      const n = ((prevFail && prevFail.size === legSize ? prevFail.n : 0) || 0) + 1;
+      failed[legKey] = { n, size: legSize, why, at: Date.now() };
+      failedDirty = true;
+      if (n >= DEHEDGE_GIVE_UP) {
+        out.givenUp++;
+        // ONE line, said once, naming the venue's own reason. The whole cost of this bug was that
+        // the same failure was reported every fifteen minutes and therefore read as background
+        // noise rather than as a thing needing a hand.
+        console.error(`DE-HEDGE GIVEN UP: ${sym} ${leg} — refused ${n} times. Venue says: ${why || "no reason given"}`);
+        await pushLog({ coin, dir: String(smaller.posSide || "").toLowerCase(),
+          result: "DE-HEDGE GIVEN UP", countsForStats: false,
+          skipped: `${sym} has both sides open and the venue has refused to close the smaller leg (${leg}) ${n} times. Its reason: ${why || "none given"}. `
+            + `This is almost certainly a stub left by a partial fill — too small for the venue to accept as an order, so the bot cannot clear it however many times it asks. `
+            + `It will NOT be retried again unless the size changes. Close it by hand on the exchange; it takes one click and stops both legs paying funding.` });
+      }
+    }
+    await pushLog({ coin, dir: String(smaller.posSide || "").toLowerCase(),
+      result: ok ? "DE-HEDGED" : "DE-HEDGE FAILED",
+      countsForStats: false,
+      skipped: ok
+        ? `${sym} was holding both sides. Closed the smaller leg (${leg}) — same net exposure, one set of fees and funding instead of two.`
+        : `${sym} is STILL holding both sides. Tried to close the smaller leg (${leg}) and the venue refused: ${why || "no reason given"}. `
+          + `It is paying funding and fees on both legs until this succeeds or you close one by hand. This will be retried next run.` });
+  }
+  // Written once per run, and only if something moved. A record that grows every fifteen minutes
+  // would bloat the state file the agent commits to the repo.
+  if (failedDirty) { try { await setJSON(DEHEDGE_KEY, failed); } catch { } }
+  return out;
+}
+
+// ═══════════════ CIRCUIT BREAKER (2026-08-19) ═══════════════
+// The one real gap every outside review agreed on: the bot had a manual KILL switch and
+// trade-COUNT caps, but nothing watched the MONEY. A bug, a regime the rules don't understand,
+// or plain variance can bleed an account one correctly-sized loss at a time, and every loss
+// individually looks fine. Three trips, all deterministic, none of them clever:
+//
+//   · the account drops DAY_DD_PCT from where the day started   → no new entries until tomorrow
+//   · it drops WEEK_DD_PCT from where the week started          → no new entries until next week
+//   · STREAK_N consecutive losing resolutions                   → pause STREAK_PAUSE_H hours;
+//     the market is doing something the rules don't understand — stop asking it the same question
+//
+// A tripped breaker blocks NEW entries only. Exits, stops, entry-expiry cancels and de-hedging
+// all keep running — everything that reduces risk stays on; only the thing that adds risk stops.
+// It never auto-reverses, never resizes, never touches an open position. Deliberately dumb.
+const BREAKER_KEY = "cipher_breaker";
+const DAY_MS = 864e5, WEEK_MS = 7 * 864e5;
+const dayKeyOf = (now) => new Date(now).toISOString().slice(0, 10);
+const weekKeyOf = (now) => Math.floor((now + 3 * DAY_MS) / WEEK_MS);   // epoch was a Thursday; +3d puts the boundary on Monday 00:00 UTC
+const nextDayStart = (now) => (Math.floor(now / DAY_MS) + 1) * DAY_MS;
+const nextWeekStart = (now) => (weekKeyOf(now) + 1) * WEEK_MS - 3 * DAY_MS;
+
+// Pure, so every trip condition is testable without a venue or a clock.
+//   st       — persisted state { dayKey, dayEq, weekKey, weekEq, streak, pausedUntil, pausedWhy }
+//   now      — ms
+//   equity   — current account balance, or null when the venue didn't show one (never trips blind)
+//   resolvedHows — "how" strings from this run's resolutions, for the streak
+function breakerStep(st, { now, equity, resolvedHows = [] }, cfg) {
+  st = st || {};
+  const c = cfg || {
+    dayDD: num("BREAKER_DAY_DD_PCT", 5) / 100,
+    weekDD: num("BREAKER_WEEK_DD_PCT", 10) / 100,
+    streakN: num("BREAKER_STREAK_N", 3),
+    streakPauseH: num("BREAKER_STREAK_PAUSE_H", 12),
+  };
+  const trips = [];
+  // anchors roll with the calendar — a new day/week starts a fresh measurement from HERE
+  const dk = dayKeyOf(now), wk = weekKeyOf(now);
+  if (st.dayKey !== dk) { st.dayKey = dk; st.dayEq = equity ?? st.dayEq ?? null; }
+  else if (st.dayEq == null && equity != null) st.dayEq = equity;
+  if (st.weekKey !== wk) { st.weekKey = wk; st.weekEq = equity ?? st.weekEq ?? null; }
+  else if (st.weekEq == null && equity != null) st.weekEq = equity;
+  // an expired pause clears itself
+  if (st.pausedUntil && now >= st.pausedUntil) { st.pausedUntil = 0; st.pausedWhy = ""; }
+  // consecutive losses — a win resets, a loss counts, "closed"/unknown changes nothing
+  for (const how of resolvedHows) {
+    if (how === "stop" || how === "closed at a loss") st.streak = (st.streak || 0) + 1;
+    else if (how === "target" || how === "closed in profit") st.streak = 0;
+    if ((st.streak || 0) >= c.streakN && !(st.pausedUntil > now)) {
+      st.pausedUntil = now + c.streakPauseH * 3600e3;
+      st.pausedWhy = `${c.streakN} consecutive losing trades — pausing new entries ${c.streakPauseH}h to stop re-asking a market that keeps saying no`;
+      st.streak = 0;
+      trips.push("streak");
+    }
+  }
+  // drawdown — only when the venue actually showed us a balance
+  if (equity != null) {
+    if (st.dayEq > 0 && (st.dayEq - equity) / st.dayEq >= c.dayDD && !(st.pausedUntil > now)) {
+      st.pausedUntil = nextDayStart(now);
+      st.pausedWhy = `down ${(((st.dayEq - equity) / st.dayEq) * 100).toFixed(1)}% today (${equity.toFixed(2)} from ${st.dayEq.toFixed(2)}) — no new entries until tomorrow`;
+      trips.push("dayDD");
+    }
+    if (st.weekEq > 0 && (st.weekEq - equity) / st.weekEq >= c.weekDD && !(trips.length && st.pausedUntil >= nextWeekStart(now))) {
+      st.pausedUntil = Math.max(st.pausedUntil || 0, nextWeekStart(now));
+      st.pausedWhy = `down ${(((st.weekEq - equity) / st.weekEq) * 100).toFixed(1)}% this week — no new entries until Monday`;
+      trips.push("weekDD");
+    }
+  }
+  return { st, trips, paused: (st.pausedUntil || 0) > now };
+}
+
+// ═══════════════ THE SHADOW FRAMEWORK (2026-08-16) ═══════════════
+// John's brief: "build something different… nothing gets control until it has earned it."
+//
+// The shadow gate already worked once — the brain's verdicts ran advisory, were graded against
+// real outcomes, and only took control when they beat the numeric path. That mechanism is the
+// most valuable thing in this system, and it was being used for exactly one purpose.
+//
+// So it becomes the architecture. Every new component — a different way of choosing trades, a
+// sizing multiplier, a veto — registers as an EXPERIMENT. Each run it records what it WOULD have
+// done, alongside what actually happened. Those decisions are graded on real forward candles.
+// When the variant beats the baseline over enough resolved trades, it promotes itself. If its
+// record later slips, it hands control back.
+//
+// Two consequences worth being explicit about:
+//   · we can build aggressively, because nothing new can touch a real order until it has won
+//   · the system improves without John deciding it has improved — the evidence decides
+//
+// Nothing here places an order. A shadow record is a DECISION, never an instruction.
+// ═══════════════════ UNFILLED ORDERS MUST NOT LIVE FOREVER (2026-08-18) ═══════════════════
+// `ENTRY_EXPIRY_H` has sat in CFG since the entry-mode work and was never read once, so every
+// unfilled limit was GoodTillCancel in the most literal sense: it rested until something touched
+// it, however long that took and however dead the idea had become. In a three-year replay of
+// these rules, 74 orders filled AFTER price had already traded through their own stop level —
+// opening a position the exchange then closed on the spot. The signal was hours or days old and
+// the stop and target had been computed from a bar that no longer meant anything.
+//
+// So: remember what was placed, and cancel anything still resting past the expiry. An order that
+// has already filled is simply forgotten — that position is real and its stop is on the exchange.
+const RESTING_KEY = "cipher_resting";
+const RESTING_FORGET_MS = 7 * 864e5;          // a record we could never resolve is dropped after a week
+
+// Pure, so it can be tested without a venue: which remembered orders are past their expiry.
+function staleIds(book, now, hours) {
+  const cutoff = now - hours * 3600e3;
+  return Object.keys(book || {}).filter(id => book[id] && book[id].at <= cutoff);
+}
+
+async function rememberResting(meta, order, coin, dir, orderID) {
+  if (!meta || !order || !order.clOrdID) return;
+  const book = await getJSON(RESTING_KEY, {});
+  book[order.clOrdID] = { symbol: meta.symbol, clOrdID: order.clOrdID, orderID: orderID || "",
+                          coin, dir, at: Date.now() };
+  await setJSON(RESTING_KEY, book);
+}
+
+// Returns { ok, why } instead of a bare bool (2026-08-29). The old check was
+// `r.status === 200 && r.data && !r.data.error` — but this calls phemexCall() directly, and a raw
+// Phemex response carries `code`/`msg`, never `.error` (that field only exists on the synthetic
+// shape directOrder() builds). `.error` is therefore always undefined here, so a failed cancel and
+// a successful one were indistinguishable from `ok` alone, and expireStaleOrders() had nothing to
+// log — ten orders sat unfilled for 40–100+ hours with zero visibility into why. `why` is what
+// makes the next failure diagnosable from the state file alone, without console access.
+async function cancelOrder(symbol, orderID, clOrdID, posSide) {
+  if (!CFG.direct()) return { ok: false, why: "no cancel route (relay mode)" };
+  try {
+    // ── posSide IS REQUIRED BY PHEMEX HEDGE-MODE CANCEL (2026-09-02) ───────────────────────────
+    // Every stale-order expiry for SOL/FIL/LTC/APT was failing with "phemex http 400 code 10500
+    // Missing required parameter, Required query parameter 'posSide' is not present" because this
+    // call never sent it. The caller already has it on the live order object read from
+    // activeList — it just wasn't being passed through.
+    const q = `symbol=${encodeURIComponent(symbol)}&` +
+              (orderID ? `orderID=${encodeURIComponent(orderID)}` : `clOrdID=${encodeURIComponent(clOrdID)}`) +
+              (posSide ? `&posSide=${encodeURIComponent(posSide)}` : "");
+    const r = await phemexCall("DELETE", "/g-orders/cancel", q, null);
+    const code = r.data && r.data.code;
+    const ok = r.status === 200 && (code === 0 || code === undefined);
+    const why = ok ? "" : `phemex http ${r.status}${code !== undefined ? ` code ${code}` : ""} ${(r.data && r.data.msg) || ""}`.trim();
+    return { ok, why };
+  } catch (e) { return { ok: false, why: "cancel call threw: " + String((e && e.message) || e).slice(0, 160) }; }
+}
+
+// ═══════════ CLOSE THE PROTECTION GAP — "PLACED" DOES NOT MEAN PROTECTED (2026-09-02) ═══════════
+// John: "why isn't there any TPs on it" about a SOL short and a FIL short sitting open with no
+// stop/target resting on the exchange. Two different causes, traced from the log and the state
+// file, not guessed from the symptom:
+//   SOL — adopted as a plan-less orphan. adoptOrphans() is deliberately bookkeeping only ("no
+//         order placed") — it was never even GIVEN a chance to be protected.
+//   FIL — a normal signal that WAS sent with stopLossRp/takeProfitRp bundled on the entry order
+//         and logged "PLACED" — but nothing is resting on the exchange for it. The bot only ever
+//         checked that the HTTP call succeeded, never that the resulting position actually carries
+//         what it asked for. A bracket field silently dropped by the venue was invisible.
+// The relay already had a belt-and-braces "/stop" endpoint for exactly this ("if the exchange
+// ever drops it the position is naked") — built for the APP's relay-mode execution path. The
+// agent moved its OWN orders to direct-mode execution (EXEC_DIRECT) and never got the same net.
+// This ports it: every armed run, for every open position with a plan, check the resting order
+// book (the same activeList+untriggered read expireStaleOrders already trusts) for a reduce-only
+// stop tied to that side; if it is missing, place one. Runs EVERY cycle, not once — self-healing
+// if a stop is ever cancelled, expires, or (like SOL and FIL) never existed.
+//
+// Take-profit is REPORTED but not auto-placed. A standalone conditional take-profit (ordType
+// MarketIfTouched here — Phemex's documented order-type set, not yet proven against a live fill
+// on THIS account) carries more unknowns than a Stop, whose exact shape the relay's own working
+// code already proves. Shipping the safety-critical half (a missing stop is unbounded downside)
+// and watching it before trusting the rest matches this project's own rule for every newly-armed
+// feature — see [[cipher-open-items]] "first live run of any newly-armed feature should be
+// watched" — 2026-08-30 note.
+
+// ═══════════ ONE STOP AND ONE TARGET PER POSITION — AND REMEMBER THEM (2026-10-26) ═══════════
+// The 09-02 sweep above had a hole that only showed once it ran for weeks. On 2026-10-26 the log
+// held 49 "STOP ATTACHED" lines in 36 hours — SOL, AVAX, ADA and UNI each re-attached 11-12 times —
+// and 95 "STOP ATTACH FAILED", most of them phemex 11031 TE_SO_NUM_EXCEEDS: the venue's cap on
+// conditional orders per symbol. Not one of 13 positions was ever "already ok".
+//
+// So the stops WERE landing, and this bot could not see them: the open-orders read does not return
+// the untriggered conditionals it had placed (or not in a shape findRestingStop recognised). Every
+// run it concluded "no stop" and added another, until the venue refused. Two consequences:
+//   1. Dozens of stale reduce-only stops per coin, some left over from positions that had already
+//      closed — at THEIR old levels. A new position on the same side can be closed by an old stop
+//      at a price that is neither its own stop nor its own target. That is a live candidate for
+//      the 98 "closed at neither the stop nor the target" records nobody could explain.
+//   2. "NO TARGET RESTING" on every position, every run — targets were never auto-placed at all.
+//
+// The fix has four parts:
+//   • A registry (PROTECT_KEY) of what THIS bot placed for each position: price, orderID, when.
+//     If we placed it and nothing says it is gone, we do not place it again. The book read is a
+//     second witness, not the only one.
+//   • A one-time reset (PROTECT_RESET_REV): cancel every untriggered conditional on each held
+//     symbol, then place exactly one stop and one target per position. Clears the stacks.
+//   • The take-profit is a resting reduce-only LIMIT at the plan target, not a conditional. A plain
+//     limit is the one order type this file has always been able to see in the open-orders read,
+//     it does not count toward the conditional-order cap, and when it fills it fills as a maker —
+//     the cheaper side of a fee bill that runs at ~2.2x gross profit.
+//   • When a position ends, its recorded orders are cancelled, so nothing is left lying in wait.
+const PROTECT_KEY = "cipher_protect";
+const PROTECT_REV_KEY = "cipher_protect_rev";
+const PROTECT_RESET_REV = "2026-10-26-unstack";
+
+const isClosingSide = (o, posSide) => !o.side || String(o.side) === (posSide === "Long" ? "Sell" : "Buy");
+const isOurs = (o, kind) => new RegExp("^cipher" + kind, "i").test(String(o.clOrdID || "")) ||
+  String(o.text || "") === "cipher-protective-" + kind.toLowerCase();
+const isConditional = o => /stop|iftouched|^bo/i.test(String(o.ordType || "")) ||
+  Number(o.stopPxRp ?? o.stopPx ?? 0) > 0;
+
+// A reduce-only (or close-on-trigger, or ours by tag) STOP for this side of the position.
+function findRestingStop(orders, posSide) {
+  return (orders || []).find(o => o && String(o.posSide) === posSide && isClosingSide(o, posSide) &&
+    (o.reduceOnly || o.closeOnTrigger || isOurs(o, "Stop")) &&
+    (/stop/i.test(String(o.ordType || "")) || isOurs(o, "Stop")));
+}
+// Any OTHER reduce-only order for this side: our resting limit target, an if-touched take-profit,
+// or a bracket leg. Deliberately broad so a target that IS there is never reported missing.
+function findRestingTarget(orders, posSide) {
+  return (orders || []).find(o => o && String(o.posSide) === posSide && isClosingSide(o, posSide) &&
+    (o.reduceOnly || o.closeOnTrigger || isOurs(o, "Target")) &&
+    !(/stop/i.test(String(o.ordType || "")) && !isOurs(o, "Target")));
+}
+// Every protective stop resting for this side, for the de-stacking count.
+function restingStops(orders, posSide) {
+  return (orders || []).filter(o => o && String(o.posSide) === posSide && isClosingSide(o, posSide) &&
+    (o.reduceOnly || o.closeOnTrigger || isOurs(o, "Stop")) && isConditional(o));
+}
+
+// PURE. Has the plan's level moved far enough from what we placed to warrant replacing it?
+// Half a basis point of the price: rounding differences never count, a trailed stop always does.
+function levelMoved(placedPx, planPx) {
+  const a = Number(placedPx), b = Number(planPx);
+  if (!(a > 0) || !(b > 0)) return true;
+  return Math.abs(a - b) / b > 0.00005;
+}
+
+// Places a reduce-only order that closes an EXISTING position — the direct-mode mirror of the
+// relay's POST /stop. kind "Stop" = conditional stop-market (the shape the relay already proves).
+// kind "Target" = a resting reduce-only Limit at the target (see the block comment above).
+async function directProtect({ symbol, posSide, kind, triggerPx, qty, refPx }) {
+  if (CFG.kill()) return { ok: false, why: "KILL switch is ON — no orders placed." };
+  if (!(qty > 0)) return { ok: false, why: "qty must be > 0" };
+  if (!(triggerPx > 0)) return { ok: false, why: "triggerPx must be > 0" };
+  const isLong = posSide === "Long";
+  // Protection on the wrong side of the market is not protection. A STOP already behind price is
+  // refused (the caller decides what a breached stop means). A TARGET already behind price is
+  // allowed: the limit fills at once, which is the plan's own exit being taken. Skipped when we
+  // have no reliable current price — the coin may not have been in this run's scan batch.
+  if (Number(refPx) > 0 && kind === "Stop") {
+    if (isLong && triggerPx >= refPx) return { ok: false, breached: true, why: `stop ${triggerPx} must be below market ${refPx} for a long` };
+    if (!isLong && triggerPx <= refPx) return { ok: false, breached: true, why: `stop ${triggerPx} must be above market ${refPx} for a short` };
+  }
+  // Decimals from the venue's own price when we have it (its ticker carries the real tick size),
+  // otherwise a size-based default — never from the plan, whose levels are raw floats.
+  // A ticker drops trailing zeros (105.20 arrives as "105.2"), so it can only RAISE the precision.
+  const dp = Math.max((Number(refPx) > 0 && (String(refPx).split(".")[1] || "").length) || 0, priceDp(triggerPx));
+  const px = v => String(Number(Number(v).toFixed(dp)));
+  const order = kind === "Stop" ? {
+    clOrdID: (`cipherStop${Date.now()}`).slice(0, 40),
+    symbol, side: isLong ? "Sell" : "Buy", posSide,
+    ordType: "Stop", stopPxRp: px(triggerPx), triggerType: "ByMarkPrice",
+    orderQtyRq: String(qty), timeInForce: "ImmediateOrCancel",
+    closeOnTrigger: true, reduceOnly: true, text: "cipher-protective-stop",
+  } : {
+    clOrdID: (`cipherTarget${Date.now()}`).slice(0, 40),
+    symbol, side: isLong ? "Sell" : "Buy", posSide,
+    ordType: "Limit", priceRp: px(triggerPx),
+    orderQtyRq: String(qty), timeInForce: "GoodTillCancel",
+    reduceOnly: true, text: "cipher-protective-target",
+  };
+  if (CFG.mode() !== "armed" || String(env("DRY_RUN", "0")) === "1")
+    return { ok: true, dry: true, wouldSend: order };
+  const r = await phemexCall("POST", "/g-orders", "", order);
+  const code = r.data && r.data.code;
+  if (r.status !== 200) return { ok: false, why: `phemex http ${r.status}`, sent: order, phemex: r.data };
+  if (code !== 0 && code !== undefined) return { ok: false, why: `phemex ${code}: ${(r.data && r.data.msg) || "rejected"}`, sent: order, phemex: r.data };
+  const orderID = (r.data && r.data.data && r.data.data.orderID) || undefined;
+  return { ok: true, sent: order, orderID, clOrdID: order.clOrdID, px: Number(px(triggerPx)), phemex: r.data };
+}
+
+// Decimal places for a price we have no reference for: enough that a sub-dollar coin keeps its
+// precision (the .toFixed(1) bug of 2026-08-10 broke every coin under ~$10).
+function priceDp(p) {
+  const v = Math.abs(Number(p));
+  if (!(v > 0)) return 2;
+  if (v >= 1000) return 1; if (v >= 100) return 2; if (v >= 10) return 3; if (v >= 1) return 4;
+  if (v >= 0.1) return 5; return 6;
+}
+
+// Close a position at market because its own stop is already behind price. Reduce-only, so it can
+// shrink the position and nothing else.
+async function directBreachClose({ symbol, posSide, qty }) {
+  if (CFG.kill()) return { ok: false, why: "KILL switch is ON — no orders placed." };
+  const order = { clOrdID: (`cipherBreach${Date.now()}`).slice(0, 40), symbol,
+    side: posSide === "Long" ? "Sell" : "Buy", posSide, ordType: "Market", orderQtyRq: String(qty),
+    timeInForce: "ImmediateOrCancel", reduceOnly: true, closeOnTrigger: true, text: "cipher-stop-breach" };
+  if (CFG.mode() !== "armed" || String(env("DRY_RUN", "0")) === "1") return { ok: true, dry: true, wouldSend: order };
+  const r = await phemexCall("POST", "/g-orders", "", order);
+  const code = r.data && r.data.code;
+  if (r.status !== 200) return { ok: false, why: `phemex http ${r.status}` };
+  if (code !== 0 && code !== undefined) return { ok: false, why: `phemex ${code}: ${(r.data && r.data.msg) || "rejected"}` };
+  return { ok: true };
+}
+
+// Cancel every UNTRIGGERED conditional order on a symbol (stops, if-touched). Leaves plain limit
+// orders — entries and our targets — alone.
+async function cancelAllConditionals(symbol) {
+  if (CFG.kill() || CFG.mode() !== "armed" || String(env("DRY_RUN", "0")) === "1") return { ok: false, why: "not armed" };
+  try {
+    const r = await phemexCall("DELETE", "/g-orders/all", `symbol=${encodeURIComponent(symbol)}&untriggered=true`, null);
+    const code = r.data && r.data.code;
+    const ok = r.status === 200 && (code === 0 || code === undefined);
+    return { ok, why: ok ? "" : `phemex http ${r.status}${code !== undefined ? ` code ${code}` : ""} ${(r.data && r.data.msg) || ""}`.trim() };
+  } catch (e) { return { ok: false, why: String((e && e.message) || e).slice(0, 160) }; }
+}
+
+// ── THE ONE-TIME RESET ───────────────────────────────────────────────────────────────────────
+// For every symbol we hold, cancel the stacked conditionals and forget what the registry thinks
+// it placed, so the sweep that follows puts back exactly one stop per position. Stamped per
+// revision; a symbol whose cancel fails is NOT stamped and is retried next run.
+async function resetStackedProtection(nowOpen, registry) {
+  const out = { symbols: 0, failed: [] };
+  if (!CFG.direct() || CFG.kill() || CFG.mode() !== "armed" || String(env("DRY_RUN", "0")) === "1") return out;
+  const stamp = (await getJSON(PROTECT_REV_KEY, null)) || {};
+  if (stamp.rev !== PROTECT_RESET_REV) { stamp.rev = PROTECT_RESET_REV; stamp.done = []; }
+  const symbols = [...new Set(Object.values(nowOpen || {}).filter(p => p && p.size > 0).map(p => `${p.coin}USDT`))]
+    .filter(s => !stamp.done.includes(s));
+  if (!symbols.length) return out;
+  for (const sym of symbols) {
+    const r = await cancelAllConditionals(sym);
+    if (r.ok) {
+      out.symbols++; stamp.done.push(sym);
+      for (const k of Object.keys(registry)) if (registry[k] && registry[k].symbol === sym) delete registry[k].stop;
+    } else out.failed.push(`${sym} (${r.why})`);
+  }
+  await setJSON(PROTECT_REV_KEY, stamp);
+  await pushLog({ result: "PROTECTION RESET",
+    skipped: `cleared stacked stop orders on ${out.symbols} symbol(s) — the old sweep could not see the stops it had placed and kept adding more until Phemex refused (TE_SO_NUM_EXCEEDS). Exactly one stop and one target per position go back on in this same run.` +
+      (out.failed.length ? ` Could not clear: ${out.failed.join(", ")} — will retry next run.` : "") });
+  return out;
+}
+
+// For every open, PLANNED position: exactly one stop and one target, both at the plan's own levels.
+async function protectOpenPositions(nowOpen, priceOf) {
+  const out = { checked: 0, placed: 0, targets: 0, alreadyOk: 0, failed: 0, blind: 0, breached: 0, noTarget: [], replaced: 0 };
+  if (!CFG.direct()) return out;               // the relay's own /stop endpoint covers relay mode
+  const registry = (await getJSON(PROTECT_KEY, {})) || {};
+  let dirty = false;
+  try {
+    const reset = await resetStackedProtection(nowOpen, registry);
+    if (reset.symbols) dirty = true;
+  } catch (e) { console.error("protection reset failed (harmless, retried next run):", e && e.message); }
+
+  let shapeLogged = false;
+  for (const [k, pos] of Object.entries(nowOpen || {})) {
+    if (!pos || !pos.plan || !(pos.size > 0)) continue;
+    const symbol = `${pos.coin}USDT`;
+    const posSide = pos.dir === "short" ? "Short" : "Long";
+    let orders;
+    try { orders = await execOrdersFor(symbol); } catch (e) { out.blind++; continue; }
+    out.checked++;
+    // A registry entry belongs to ONE position. A new position on the same key starts clean.
+    let reg = registry[k];
+    if (!reg || reg.since !== pos.since) {
+      // A new position on a reused key. Keep the old record under an archive slot so the resolution
+      // pass can still match the old trade's closing fill to its orders, and still cancel them.
+      if (reg && (reg.stop || reg.target)) registry[`${k}#${reg.since}`] = reg;
+      reg = registry[k] = { symbol, posSide, since: pos.since }; dirty = true;
+    }
+    // Pulled by the early pass (the position looked finished) but still open: those orders were
+    // CANCELLED, so the record must not go on claiming the position is covered (audit, 2nd pass).
+    if (reg.pulled) { delete reg.stop; delete reg.target; delete reg.pulled; dirty = true; }
+    // The market-side check must use a MARKET price. The old sweep fell back to the position's
+    // average entry when the coin was not in this run's scan batch, so a long whose stop had been
+    // set above entry to lock in profit (DOT, adopted 2026-10-22) was refused every run as "stop
+    // must be below market 1.101" — 1.101 being its entry, not the market. And the venue is a
+    // testnet book measured well off mainnet, so its own mark comes first; the scan price is only
+    // a fallback, and with neither the check is skipped rather than guessed.
+    let ref;
+    const venueRef = async () => {
+      if (ref !== undefined) return ref;
+      let m = null; try { m = await markPriceFor(symbol); } catch { }
+      // Venue mark ONLY (audit 2026-10-26). The scan price is Binance/OKX — mainnet — and the
+      // testnet book has been measured well off it, so a fallback here could read a healthy
+      // position as "past its stop" and close it at market. With no mark, the stop is simply sent:
+      // if price really is past it, Phemex answers 11042/11043 and THAT triggers the close.
+      ref = Number(m) > 0 ? Number(m) : null;
+      return ref;
+    };
+
+    // ── STOP ────────────────────────────────────────────────────────────────────────────────
+    const seenStop = findRestingStop(orders, posSide);
+    // Moved = the plan's level changed OR the position's size did (a partial close): either way the
+    // resting order no longer matches the position, so it is replaced.
+    const sizeMoved = (leg) => leg && Number(leg.qty) > 0 && Math.abs(Number(leg.qty) - Number(pos.size)) > 1e-9;
+    const stopMoved = reg.stop && (levelMoved(reg.stop.px, pos.plan.stop) || sizeMoved(reg.stop));
+    if (stopMoved && reg.stop.orderID) {
+      // The plan's stop has moved (trailed or rebuilt). Take the old one off before the new one
+      // goes on, or the stack starts again one level at a time.
+      const c = await cancelOrder(symbol, reg.stop.orderID, reg.stop.clOrdID, posSide);
+      if (c.ok) { delete reg.stop; dirty = true; out.replaced++; }
+    } else if (stopMoved) { delete reg.stop; dirty = true; }
+    if (seenStop && !reg.stop) {
+      // The book shows one we did not record (bundled with the entry, or placed before the
+      // registry existed). Adopt it rather than adding a second.
+      reg.stop = { px: pos.plan.stop, sentPx: Number(seenStop.stopPxRp ?? seenStop.stopPx) || undefined, orderID: seenStop.orderID, clOrdID: seenStop.clOrdID, at: Date.now(), source: "book" };
+      dirty = true;
+    }
+    if (reg.stop) out.alreadyOk++;
+    else {
+      const r = await directProtect({ symbol, posSide, kind: "Stop", triggerPx: pos.plan.stop, qty: pos.size, refPx: await venueRef() });
+      // ── THE VENUE CAN SAY "ALREADY PAST" TOO (2026-10-26, run #826) ─────────────────────────
+      // APT short: no mark price could be read, so the side check was skipped and the stop went
+      // out — and Phemex answered 11043 TE_RISING_TRIGGER_DIRECTLY: price is already above the
+      // trigger. That is the same fact as our own "breached" verdict, just learned from the venue,
+      // so it gets the same answer: the plan's exit, taken at market.
+      if (!r.ok && !r.breached && /TE_(RISING|FALLING)_TRIGGER_DIRECTLY|phemex 1104[23]\b/i.test(String(r.why || ""))) r.breached = true;
+      if (r.ok && !r.dry) {
+        out.placed++;
+        reg.stop = { px: pos.plan.stop, sentPx: r.px, qty: pos.size, orderID: r.orderID, clOrdID: r.clOrdID, at: Date.now(), source: "placed" }; dirty = true;
+        // Every order ever placed for this position, so a replaced stop that still fills (its cancel
+        // having failed or raced) is still recognised as THIS trade's stop (audit, 2nd pass).
+        (reg.history = reg.history || []).push({ leg: "stop", orderID: r.orderID, clOrdID: r.clOrdID });
+        await pushLog({ coin: pos.coin, dir: pos.dir, result: "STOP ATTACHED",
+          skipped: `attached the plan's stop at ${formatPrice(pos.plan.stop)}. Recorded, so it will not be attached again while this position lives.` });
+      } else if (!r.ok && r.breached && String(env("STOP_BREACH_CLOSE", "1")) === "1") {
+        // The market is already through the plan's own stop. Hanging a stop behind price is
+        // impossible, and leaving the position open contradicts the plan. Close it — the exit the
+        // plan asked for, a little late. (DOT 2026-10-26: refused every run for days instead.)
+        const c = await directBreachClose({ symbol, posSide, qty: pos.size });
+        if (c.ok && !c.dry) {
+          out.breached++;
+          pos.closedBy = "stop_breach_close";
+          await pushLog({ coin: pos.coin, dir: pos.dir, result: "STOP BREACHED — CLOSED",
+            skipped: `the venue's price ${formatPrice(ref)} is already past the plan's stop ${formatPrice(pos.plan.stop)}, so a stop could not be placed. Closed at market, which is what the plan's stop would have done.` });
+        } else if (!c.ok) {
+          out.failed++;
+          await pushLog({ coin: pos.coin, dir: pos.dir, result: "STOP ATTACH FAILED",
+            skipped: `price is past the plan's stop ${formatPrice(pos.plan.stop)} and the close at market was refused: ${c.why}. Will retry next run.` });
+        }
+        continue;
+      } else if (!r.ok) {
+        out.failed++;
+        await pushLog({ coin: pos.coin, dir: pos.dir, result: "STOP ATTACH FAILED",
+          skipped: `tried to attach the plan's stop at ${formatPrice(pos.plan.stop)} and the venue refused: ${r.why}. Will retry next run.` });
+      }
+    }
+
+    // ── TARGET ──────────────────────────────────────────────────────────────────────────────
+    const seenTarget = findRestingTarget(orders, posSide);
+    const tgtMoved = reg.target && (levelMoved(reg.target.px, pos.plan.target) || sizeMoved(reg.target));
+    // Our targets are plain limits, which the book read DOES show. So if we recorded one and the
+    // book is readable and it is not there, it has gone (filled, cancelled, expired): forget it.
+    // Run #826 showed the open-orders rows arrive WITHOUT ordType, posSide or reduceOnly — which
+    // is why the old sweep never once saw its own stops. So "not visible in the book" proves
+    // nothing about a target either: a recorded target is only forgotten when its position ends
+    // (cancelProtectionFor) or the plan's target moves (below). Never on invisibility, or targets
+    // would stack exactly the way the stops did.
+    if (tgtMoved && reg.target && reg.target.orderID) {
+      const c = await cancelOrder(symbol, reg.target.orderID, reg.target.clOrdID, posSide);
+      if (c.ok) { delete reg.target; dirty = true; }
+    } else if (tgtMoved) { delete reg.target; dirty = true; }
+    if (seenTarget && !reg.target) {
+      reg.target = { px: pos.plan.target, sentPx: Number(seenTarget.priceRp ?? seenTarget.stopPxRp) || undefined, orderID: seenTarget.orderID, clOrdID: seenTarget.clOrdID, at: Date.now(), source: "book" };
+      dirty = true;
+    }
+    if (!reg.target && Number(pos.plan.target) > 0) {
+      const r = await directProtect({ symbol, posSide, kind: "Target", triggerPx: pos.plan.target, qty: pos.size, refPx: await venueRef() });
+      if (r.ok && !r.dry) {
+        out.targets++;
+        reg.target = { px: pos.plan.target, sentPx: r.px, qty: pos.size, orderID: r.orderID, clOrdID: r.clOrdID, at: Date.now(), source: "placed" }; dirty = true;
+        (reg.history = reg.history || []).push({ leg: "target", orderID: r.orderID, clOrdID: r.clOrdID });
+        await pushLog({ coin: pos.coin, dir: pos.dir, result: "TARGET PLACED",
+          skipped: `resting reduce-only limit at the plan's target ${formatPrice(pos.plan.target)} — the trade can now end at its own target at the exchange, not only when the bot happens to look.` });
+      } else if (!r.ok) {
+        out.noTarget.push(`${pos.coin} ${pos.dir} (${r.why})`);
+      }
+    }
+
+    // ── WHAT DOES THE BOOK ACTUALLY RETURN? ───────────────────────────────────────────────
+    // One compact line per run, so the next audit can see whether the open-orders read shows
+    // conditional orders at all — the question the stacking bug turned on, answered from the
+    // venue rather than inferred.
+    if (!shapeLogged && Array.isArray(orders)) {
+      shapeLogged = true;
+      const shape = orders.slice(0, 6).map(o => [o.ordType, o.side, o.posSide, o.reduceOnly ? "RO" : "", o.closeOnTrigger ? "CoT" : "",
+        o.ordStatus || "", String(o.clOrdID || "").slice(0, 14)].filter(Boolean).join("/"));
+      console.log(`order book shape ${symbol}: ${orders.length} row(s) — ${shape.join(" | ") || "none"}`);
+      // and the field NAMES the venue actually sends, so the matcher can be fitted to reality
+      const keys = orders[0] ? Object.keys(orders[0]).sort().join(",").slice(0, 400) : "";
+      if (keys) console.log(`order row fields: ${keys}`);
+      pos.bookShape = { at: Date.now(), symbol, rows: orders.length, shape, keys };
+    }
+  }
+  // ── ARE THE ORDERS WE RECORDED STILL THERE? — LOG ONLY (audit 2026-10-26) ─────────────────
+  // The registry trusts what it placed, because the open-orders read cannot show it. That leaves
+  // one blind spot: a stop cancelled by hand would never be noticed. Ask the venue about a few
+  // recorded orders each run, by orderID, and RECORD the answers. Nothing acts on them yet: the
+  // endpoint has not been seen working on this account, and a wrong reading that triggered a
+  // re-place would restart the stacking this registry exists to stop. Once the log shows real
+  // statuses, "cancelled" can be wired to re-place.
+  try {
+    const checks = [];
+    const legs = [];
+    for (const [k, reg] of Object.entries(registry)) {
+      if (!reg || k.includes("#") || reg.pulled) continue;
+      for (const leg of ["stop", "target"]) if (reg[leg] && reg[leg].orderID) legs.push({ k, leg, reg, o: reg[leg] });
+    }
+    legs.sort((a, b) => (a.o.checkedAt || 0) - (b.o.checkedAt || 0));
+    for (const { k, leg, reg, o } of legs.slice(0, num("ORDER_CHECKS_PER_RUN", 4))) {
+      let status = "", why = "";
+      try {
+        const r = await phemexCall("GET", "/api-data/g-futures/orders/by-order-id", `symbol=${reg.symbol}&orderID=${encodeURIComponent(o.orderID)}`, null);
+        const rows = (r.data && r.data.data && (r.data.data.rows || r.data.data)) || [];
+        const row = Array.isArray(rows) ? rows[0] : rows;
+        status = (row && (row.ordStatus || row.orderStatus)) || "";
+        if (!status) why = `http ${r.status} ${JSON.stringify(r.data || {}).slice(0, 120)}`;
+      } catch (e) { why = String((e && e.message) || e).slice(0, 120); }
+      o.checkedAt = Date.now(); o.venueStatus = status || undefined; dirty = true;
+      checks.push(`${k} ${leg}: ${status || "unreadable (" + why + ")"}`);
+    }
+    if (checks.length) {
+      console.log(`order check (log only): ${checks.join(" · ")}`);
+      await setJSON("cipher_protect_check", { at: new Date().toISOString(), checks });
+    }
+  } catch (e) { console.error("order check failed (log only, harmless):", e && e.message); }
+
+  // Archived records of trades that never resolved (no fill found, coin left the book) would pile
+  // up for ever. Two weeks is far past any trade this bot holds on the fast book.
+  for (const k of Object.keys(registry)) {
+    const r = registry[k];
+    if (k.includes("#") && Date.now() - (Number(r && (r.pulled || r.since)) || 0) > 14 * 864e5) { delete registry[k]; dirty = true; }
+  }
+  if (dirty) await setJSON(PROTECT_KEY, registry);
+  if (out.noTarget.length)
+    await pushLog({ result: "NO TARGET RESTING",
+      skipped: `${out.noTarget.length} open position(s) could not be given a target: ${out.noTarget.join(", ")}. Retried next run.` });
+  return out;
+}
+
+// When a position is gone, take its recorded stop and target off the venue so neither can fire
+// on the NEXT position opened on the same coin and side. Errors are fine — a reduce-only order on
+// a closed position may already have been cancelled by the venue.
+async function cancelProtectionFor(posKeys, { keep = false } = {}) {
+  if (!posKeys.length || !CFG.direct()) return 0;
+  const registry = (await getJSON(PROTECT_KEY, {})) || {};
+  let n = 0;
+  for (const k of posKeys) {
+    const reg = registry[k];
+    if (!reg) continue;
+    if (!reg.pulled) {
+      for (const leg of ["stop", "target"]) {
+        const o = reg[leg];
+        if (o && (o.orderID || o.clOrdID)) { const c = await cancelOrder(reg.symbol, o.orderID, o.clOrdID, reg.posSide); if (c.ok) n++; }
+      }
+    }
+    // keep = pulled from the venue early, but the record stays until the resolution pass has used
+    // it to say which order closed the trade.
+    if (keep) reg.pulled = Date.now(); else delete registry[k];
+  }
+  await setJSON(PROTECT_KEY, registry);
+  return n;
+}
+
+// The registry record for a finished position: its own key, or the archive slot the sweep moved
+// it to when the same key was reused by a new position.
+function regKeyFor(k, since, registry) {
+  const r = registry && registry[k];
+  if (r && r.since === since) return k;
+  // Never fall back to the live key: that record belongs to whatever is open there NOW, and
+  // cancelling it would strip a live position of its stop.
+  return registry && registry[`${k}#${since}`] ? `${k}#${since}` : null;
+}
+
+async function expireStaleOrders() {
+  const hours = CFG.entryExpiryH();
+  const out = { checked: 0, cancelled: 0, cleared: 0, blind: 0, failed: 0 };
+  if (!(hours > 0)) return out;
+  const book = await getJSON(RESTING_KEY, {});
+  const stale = staleIds(book, Date.now(), hours);
+
+  const bySym = new Map();
+  for (const id of stale) {
+    const r = book[id];
+    if (!bySym.has(r.symbol)) bySym.set(r.symbol, []);
+    bySym.get(r.symbol).push({ id, ...r });
+  }
+  const failures = [];   // { coin, dir, ageH, why } — one summary line below, not one per order
+  for (const [symbol, recs] of bySym) {
+    out.checked += recs.length;
+    let live = null;
+    try { live = await execOrdersFor(symbol); } catch { live = null; }
+    // If we cannot see the book we do NOT guess. Cancelling blind and forgetting blind are both
+    // ways of losing track of a real order — the same reasoning as the no-hedge rule's refusal.
+    if (!Array.isArray(live)) { out.blind += recs.length; continue; }
+    for (const r of recs) {
+      const still = live.find(o => o && (o.clOrdID === r.clOrdID || (r.orderID && o.orderID === r.orderID)));
+      if (!still) { delete book[r.id]; out.cleared++; continue; }          // filled, or already gone
+      const res = await cancelOrder(symbol, still.orderID, r.clOrdID, still.posSide);
+      if (res.ok) {
+        delete book[r.id]; out.cancelled++;
+        await pushLog({ coin: r.coin, dir: r.dir, result: "EXPIRED",
+          skipped: `unfilled after ${hours}h — cancelled. The plan behind it is stale; a fresh signal can place a fresh order.` });
+      } else {
+        out.failed++;
+        failures.push({ coin: r.coin, dir: r.dir, ageH: Math.round((Date.now() - r.at) / 3600000), why: res.why });
+      }
+    }
+  }
+  // ── A CANCEL THAT NEVER HAPPENS MUST NOT BE SILENT (2026-08-29) ─────────────────────────────
+  // This is exactly the class of bug the 08-18 expiry fix was meant to close: an order sat past
+  // its expiry with nothing recording that anyone had even tried to deal with it. One summary
+  // line per run — not one per stale order — so a persistent failure is visible without eating
+  // the 300-entry log cap the way ten repeats every 15 minutes would.
+  if (failures.length) {
+    const names = failures.map(f => `${f.coin} ${f.dir} (${f.ageH}h)`).join(", ");
+    await pushLog({ result: "EXPIRE FAILED",
+      skipped: `${failures.length} order(s) past the ${hours}h expiry did not cancel: ${names}. Reason: ${failures[0].why || "unknown"}. Left resting; will retry next run.` });
+  }
+  const now = Date.now();
+  for (const id of Object.keys(book)) if (book[id].at < now - RESTING_FORGET_MS) delete book[id];
+  await setJSON(RESTING_KEY, book);
+  return out;
+}
+
+// ═══════════════════ RELATIVE STRENGTH (measurement only) ═══════════════════
+// The scanner scores every coin in isolation. It has never known whether the coin it is about to
+// buy is the strongest or the weakest thing on the board. Tested against the three-year replay on
+// 2026-08-18, that one number sorted the trades into a clean ladder:
+//
+//     trading the laggard against the field   −£1.47/trade   (gross −£0.96)
+//     ...                                       ...
+//     trading the leader with the field        +£0.98/trade   (gross +£1.53)
+//
+// A £2.49 swing in GROSS — the signal, not the costs — monotonic across four pre-specified
+// buckets, holding its sign in both halves of the sample, and NOT a restatement of distance from
+// the 200 EMA (within coins below their 200 EMA, leaders paid +£1.88 and laggards lost £1.42).
+//
+// It is still a backtest finding, so it decides nothing. Every recorded decision is stamped with
+// the coin's rank and the boxes are reported each run, exactly like the regime experiment.
+const RS_LOOKBACK_D = 7;                 // one week of return, the horizon the ladder was found on
+const RS_MIN_FIELD = 12;                 // fewer coins than this and a rank means very little
+
+let _rsCache = null;
+
+// Rank every coin in the whitelist by its 7-day return. Uses the same daily candles the scan
+// already fetches for its own timeframes, one extra call per coin at most, cached for the run.
+async function relativeStrength(symbols) {
+  if (_rsCache) return _rsCache;
+  const rows = [];
+  for (const sym of symbols) {
+    let c = null;
+    try { c = await fetchCandles(sym, "1D", 30); } catch { }
+    if (!c || c.length < RS_LOOKBACK_D + 1) continue;
+    const now = c[c.length - 1].c, then = c[c.length - 1 - RS_LOOKBACK_D].c;
+    if (!(now > 0 && then > 0)) continue;
+    rows.push({ coin: sym, ret: now / then - 1 });
+  }
+  if (rows.length < RS_MIN_FIELD) { _rsCache = { ok: false, n: rows.length, rank: () => null }; return _rsCache; }
+  rows.sort((a, b) => b.ret - a.ret);
+  const pos = new Map(rows.map((r, i) => [r.coin, i / (rows.length - 1)]));   // 0 = strongest
+  _rsCache = {
+    ok: true, n: rows.length,
+    leader: rows[0].coin, laggard: rows[rows.length - 1].coin,
+    // signed with the trade: 1 = you are trading the leader in your direction, 0 = the laggard
+    rank: (coin, dir) => {
+      const r = pos.get(coin);
+      if (r == null) return null;
+      return +(dir === "long" ? 1 - r : r).toFixed(3);
+    },
+  };
+  return _rsCache;
+}
+
+// Same shape as the regime boxes, and the same rule: a bucket is only believed once it has a real
+// sample AND agrees with itself across both halves of its own history.
+const RS_BANDS = [["a. fighting the field", 0.25], ["b. below middle", 0.5], ["c. above middle", 0.75], ["d. with the leader", 1.01]];
+function rsBand(v) { if (v == null) return null; for (const [name, hi] of RS_BANDS) if (v < hi) return name; return null; }
+
+function rsBoxes(records) {
+  const box = {};
+  for (const [name] of RS_BANDS) box[name] = [];
+  for (const r of records) {
+    if (r.arm !== "baseline" || r.R === null) continue;
+    const b = rsBand(r.rs);
+    if (b && box[b]) box[b].push(r);
+  }
+  const out = {};
+  for (const [k, rs] of Object.entries(box)) {
+    const sorted = [...rs].sort((a, b) => a.at - b.at);
+    const half = Math.floor(sorted.length / 2);
+    const meanOf = a => a.length ? +(a.reduce((x, r) => x + r.R, 0) / a.length).toFixed(3) : null;
+    out[k] = { n: sorted.length, spanH: spanHoursOf(sorted), meanR: meanOf(sorted), firstHalf: meanOf(sorted.slice(0, half)), secondHalf: meanOf(sorted.slice(half)) };
+  }
+  return out;
+}
+
+function rsVerdict(records) {
+  const boxes = rsBoxes(records);
+  const trustworthy = [];
+  for (const [k, b] of Object.entries(boxes)) {
+    if (b.n < REGIME_MIN_PER_BOX * 2) continue;
+    if (!boxSpansEnough(b)) continue;
+    if (b.firstHalf === null || b.secondHalf === null) continue;
+    if ((b.firstHalf > 0) === (b.secondHalf > 0)) trustworthy.push({ box: k, ...b, sign: b.meanR > 0 ? "pays" : "costs" });
+  }
+  return { boxes, trustworthy, ready: trustworthy.length > 0 };
+}
+
+// ═══════════════════════ MARKET REGIME (measurement only) ═══════════════════════
+// John's idea: "if you short in a bull market you'll get more losses, and vice versa — so define
+// bull vs bear and let the bot adjust."  Sound instinct, and testable. When it WAS tested against
+// three years of replay (2026-08-17) the four boxes looked decisive on the full sample and then
+// reversed: buying while BTC sat under its 200D average paid £8.14 a trade in the first half of
+// the data and lost money in the second, and the whole effect turned negative in 2026. A filter
+// built on that would have looked magnificent on every chart of the past and cost money from the
+// day it went in.
+//
+// So this does NOT filter anything. It tags every decision with the regime it was taken in and
+// waits for a forward sample. The promotion rule below is deliberately stricter than the other
+// experiments': a box has to win in BOTH halves of its own history before it may be believed,
+// because "wins on the full sample" is precisely the test the idea already passed and failed.
+//
+// NOTHING HERE PLACES, BLOCKS OR RESIZES AN ORDER.
+const REGIME_KEY = "cipher_regime";
+const REGIME_MA = 200;              // the standard long-term line; not tuned, deliberately
+const REGIME_MIN_PER_BOX = 30;      // resolved trades needed in a box before it means anything
+
+let _regimeCache = null;            // one BTC daily fetch per run, reused by every coin
+
+function smaAt(candles, n) {
+  if (!candles || candles.length < n) return null;
+  let s = 0;
+  for (let i = candles.length - n; i < candles.length; i++) s += candles[i].c;
+  return s / n;
+}
+
+// Bull or bear, from BTC against its own 200-day average. One number, no parameters to fit, and
+// the same definition every trader in the market can see — which is the point: a regime line only
+// anyone can compute is a regime line nobody else is reacting to.
+async function regimeSnapshot() {
+  if (_regimeCache) return _regimeCache;
+  let label = null, distPct = null;
+  try {
+    const d = await fetchCandles("BTC", "1D", 260);
+    const ma = smaAt(d, REGIME_MA);
+    if (ma && d.length) {
+      const px = d[d.length - 1].c;
+      label = px > ma ? "bull" : "bear";
+      distPct = +(((px - ma) / ma) * 100).toFixed(1);
+    }
+  } catch { /* no regime this run — records simply carry null and are excluded from the boxes */ }
+  _regimeCache = { label, distPct, breadth: null };
+  return _regimeCache;
+}
+
+// Breadth costs nothing: the scan already pulled every coin's daily candles, so count how many
+// closed above their own 200D line while we were there. A second opinion on the same question.
+function regimeBreadthTally(reg, dailyBars) {
+  if (!reg || !dailyBars) return;
+  const ma = smaAt(dailyBars, REGIME_MA);
+  if (!ma) return;
+  reg._bUp = (reg._bUp || 0) + (dailyBars[dailyBars.length - 1].c > ma ? 1 : 0);
+  reg._bN = (reg._bN || 0) + 1;
+  reg.breadth = +(reg._bUp / reg._bN).toFixed(2);
+}
+
+// ── the 2x2, and the stability test that decides whether to believe it ────────────────────────
+// ── BOTH HALVES OF ONE AFTERNOON ARE STILL ONE AFTERNOON (2026-08-21) ───────────────────────
+// Every experiment below guards itself the same way: a box is believed only if BOTH halves of its
+// own history agree on the sign. That was written after the 2026-08-17 lesson and it is a good
+// rule — but it has a blind spot, and on 2026-08-21 the blind spot was the whole result.
+//
+// The live book that day: 113 longs, 113 wins; 51 shorts, 51 losses; 35 hours, every decision.
+// So "a. fighting the field" showed firstHalf 2.25 and secondHalf 2.25 and sailed through the
+// stability check — because both halves were the same rally, cut down the middle. Splitting one
+// mood of market in two does not produce two independent samples; it produces the same evidence
+// twice, which is exactly the thing the gate believes it is protecting against.
+//
+// So every box now also has to SPAN something. A week, the same bar the promotion gate uses.
+// Reported alongside n so a box that fails on span says so rather than just going quiet.
+const BOX_MIN_SPAN_H = 168;
+function spanHoursOf(sorted) {
+  if (!sorted || sorted.length < 2) return 0;
+  const ts = sorted.map(r => Number(r.at)).filter(Number.isFinite);
+  return ts.length < 2 ? 0 : +((Math.max(...ts) - Math.min(...ts)) / 3.6e6).toFixed(1);
+}
+function boxSpansEnough(b) { return Number(b && b.spanH) >= BOX_MIN_SPAN_H; }
+
+function regimeBoxes(records) {
+  const box = {};
+  for (const key of ["long|bull", "long|bear", "short|bull", "short|bear"]) box[key] = [];
+  for (const r of records) {
+    if (r.arm !== "baseline" || r.R === null || !r.reg) continue;
+    const k = (r.dir === "short" ? "short" : "long") + "|" + r.reg;
+    if (box[k]) box[k].push(r);
+  }
+  const out = {};
+  for (const [k, rs] of Object.entries(box)) {
+    const sorted = [...rs].sort((a, b) => a.at - b.at);
+    const half = Math.floor(sorted.length / 2);
+    const meanOf = (a) => a.length ? +(a.reduce((x, r) => x + r.R, 0) / a.length).toFixed(3) : null;
+    out[k] = {
+      n: sorted.length,
+      spanH: spanHoursOf(sorted),
+      meanR: meanOf(sorted),
+      firstHalf: meanOf(sorted.slice(0, half)),
+      secondHalf: meanOf(sorted.slice(half)),
+    };
+  }
+  return out;
+}
+
+// A box is only "trustworthy" if it has a real sample AND both halves of that sample agree on the
+// sign. This is the whole lesson of 2026-08-17 written down as a gate: full-sample means lie.
+function regimeVerdict(records) {
+  const boxes = regimeBoxes(records);
+  const trustworthy = [];
+  for (const [k, b] of Object.entries(boxes)) {
+    if (b.n < REGIME_MIN_PER_BOX * 2) continue;                 // need enough to split in half
+    if (!boxSpansEnough(b)) continue;                           // …over more than one afternoon
+    if (b.firstHalf === null || b.secondHalf === null) continue;
+    const agree = (b.firstHalf > 0) === (b.secondHalf > 0);
+    if (agree) trustworthy.push({ box: k, ...b, sign: b.meanR > 0 ? "pays" : "costs" });
+  }
+  return { boxes, trustworthy, ready: trustworthy.length > 0 };
+}
+
+// ═══════════════ THE ACCUMULATOR (2026-08-19) ═══════════════
+// A SECOND, SEPARATE OBJECTIVE. Everything else in this file is trying to make £. This is trying
+// to end the year holding more BTC than it started with — units, not money. John's spec:
+//
+//   "sell on the daily red dot, then stagger buys back in as soon as price drops below the sell
+//    entry. We don't have to find tops and bottoms, just trade within ranges."
+//
+// Backtested first on 14.5 years of real BTC before a line of this was written. What that said:
+//   · the revisit tendency is REAL — a −1% level comes back 83% of the time within 5 days, −2%
+//     comes back 68%. Measured on BTC and TSLA; the numbers are nearly identical.
+//   · the VuManChu dot barely improves those odds (1–5 points on BTC, nothing on TSLA). The
+//     ladder works because of the market's revisit tendency, not because of the signal.
+//   · the arithmetic is brutal and exact: at a −2% rung you win ~1.8% of the slice 83% of the
+//     time and lose a MEDIAN 20% the other 17%. That is −1.9% per cycle in units.
+//   · so it GAINS units in ranges and falls, and LOSES them in sustained rallies. Full history
+//     −27.8%; since Jan 2024 +14.9%. Costs are irrelevant either way (zero fees moved TSLA by
+//     0.12 of a percentage point — stranding is 15× the total gains).
+//
+// Which is why this ships MEASURE-ONLY. It holds a virtual 1.0 BTC, records exactly what it would
+// have done, and reports units against the one baseline that cannot be argued with: buy-and-hold
+// is 1.0000 forever. If the live record beats that over a real sample it can be argued about then.
+// ACCUM=off disables it entirely. Nothing in this block can place, size, or cancel an order.
+const ACCUM_KEY = "cipher_accum";
+const ACCUM_COIN = () => env("ACCUM_COIN", "BTC");
+
+// The ladder, at real levels below the sell price — swing lows first (they paid best in the
+// replay: 27 fills / +0.080 BTC, ahead of FVGs and order blocks), then unfilled bullish zones.
+function accumLevels(daily, sellPx, maxRungs = 4, maxAwayPct = 0.12, minGapPct = 0.002) {
+  const cand = [];
+  const { lows } = pricePivots(daily);
+  for (const i of lows.slice(-12)) if (daily[i].l < sellPx) cand.push({ px: daily[i].l, src: "swingLow" });
+  for (const z of findOrderBlocks(daily)) if (z.kind === "bullish" && z.top < sellPx) cand.push({ px: z.top, src: "OB" });
+  for (const z of findFVGs(daily)) if (z.kind === "bullish" && z.top < sellPx) cand.push({ px: z.top, src: "FVG" });
+  const out = [];
+  for (const z of cand.filter(z => z.px > 0 && (sellPx - z.px) / sellPx <= maxAwayPct).sort((a, b) => b.px - a.px)) {
+    if (out.length >= maxRungs) break;
+    if (out.some(o => Math.abs(o.px - z.px) / sellPx < minGapPct)) continue;
+    out.push(z);
+  }
+  return out;
+}
+
+// ── FILLS RUN ON EVERY PASS, NOT ONCE A DAY (2026-08-19) ─────────────────────────────────────
+// The decision to SELL belongs to the closed daily bar — that is where the red dot lives. But a
+// buy-back rung is a resting order, and a resting order does not wait politely for 00:00 UTC. If
+// price wicks down through a level at 03:00 and bounces, that rung filled, and a once-a-day check
+// would either miss it or book it at the wrong moment. John: "it needs to work 24/7 to capture
+// all the moves." So fills are checked on every 15-minute run, against every intraday bar that
+// has closed since the last check — no bar is skipped and none is counted twice.
+// PURE: bars in, state + events out. No I/O, no clock.
+function accumFillPass(state, intraday, cfg = {}) {
+  const { feeBps = 10 } = cfg;
+  const st = { units: 1, cash: 0, open: [], sells: 0, fills: 0, lastFillT: 0, ...(state || {}) };
+  const events = [];
+  if (!intraday || !intraday.length || !st.open.length) return { st, events };
+  const fresh = intraday.filter(b => b.t > (st.lastFillT || 0)).sort((a, b) => a.t - b.t);
+  for (const b of fresh) {
+    for (let k = st.open.length - 1; k >= 0; k--) {
+      const r = st.open[k];
+      if (b.l <= r.px) {
+        const got = (r.usdt / r.px) * (1 - feeBps / 1e4);
+        st.units += got; st.cash -= r.usdt; st.fills++;
+        st.open.splice(k, 1);
+        events.push({ kind: "fill", px: r.px, src: r.src, at: b.t, units: +got.toFixed(8),
+                      usdt: +Number(r.usdt).toFixed(2),
+                      delta: +(got - r.soldUnits).toFixed(8) });
+      }
+    }
+    st.lastFillT = b.t;
+  }
+  return { st, events };
+}
+
+// PURE: one closed daily bar in, new state + a list of what happened out. No I/O, no clock, so
+// every rule here is testable without a venue — the same discipline as breakerStep.
+function accumStep(state, daily, cfg = {}) {
+  const {
+    slicePct = 0.20, feeBps = 10, maxConcurrent = 4, maxCashPct = 0.5, maxRungs = 4,
+    // ── THE CORE (2026-08-19) ───────────────────────────────────────────────────────────────
+    // The measured failure mode of this idea is not bad trades — every completed cycle GAINED
+    // units. It is STRANDING: a slice sold that never gets bought back, whose cash is then worth
+    // ever fewer coins. Over 14.5 years that cost 0.39 BTC against 0.11 BTC of total wins.
+    //
+    // A core changes the SHAPE of that loss. A fixed fraction of the stack is simply not for
+    // sale, so no sequence of signals, however wrong, can convert the position to cash. It turns
+    // an unbounded loss into a bounded one — the only honest way to let a strategy with a fat
+    // left tail run long enough to prove itself.
+    //
+    // The core also RATCHETS: when total units make a new high the core rises with them, so
+    // accumulated coins are progressively locked away rather than re-risked forever.
+    //
+    // ── SET TO 0 ON JOHN'S INSTRUCTION, 2026-08-19 ──────────────────────────────────────────
+    // "let's not save any of the acquired BTC, put that back in, risk it all every time."
+    // Chosen deliberately with the measured trade-off in front of him: on the 14.5-year replay
+    // no core gives 2025-26 +14.48% (vs +5.73% at a 60% core) but full-history −27.81% (vs
+    // −11.13%), and the stranding loss more than doubles, 0.156 → 0.389 of the stack. The core
+    // is a linear exposure dial, so this is the full dose in both directions — at a deliberately
+    // small stake, to prove the machinery before any bigger portfolio.
+    // Raise ACCUM_CORE_PCT above 0 to put the floor back at any time.
+    corePct = num("ACCUM_CORE_PCT", 0),
+    // cfg wins over env so the pure core stays testable without touching the environment
+    // ── THRESHOLD LOWERED 3% → 1%, 2026-08-19 ──────────────────────────────────────────────
+    // John: "why are we waiting for a 3% move, it should just be buying and selling all the time
+    // to begin with." He is right for the stage this is at. Measured frequency on 2025-26 BTC
+    // with the money-flow gate on: +3% fires ~15 times a YEAR, roughly one trade a month — far
+    // too slow to prove the machinery or to gather a sample worth reading. +1% fires ~48 times a
+    // year, about weekly.
+    //
+    // Stated plainly, this trades edge for evidence: the stretch measurement showed the pull-back
+    // hit rate RISES with the size of the pump (81.6% baseline → 85.4% after +3%), so a 1%
+    // trigger is a weaker signal than a 3% one. At a $500 stake that is the right way round —
+    // the job now is to prove orders place, fill and buy back, not to harvest a thin edge.
+    // Raise ACCUM_TRIGGER back to pump3 once the plumbing is proven.
+    trigger = env("ACCUM_TRIGGER", "pump1"),
+    pumpPct = null,
+    mfGate = String(env("ACCUM_MF_GATE", "1")) === "1",
+    minOrderUsdt = num("ACCUM_MIN_ORDER_USDT", 10),
+    // ── STOOD DOWN (2026-08-19) ─────────────────────────────────────────────────────────────
+    // Set when a dot-flip timeframe has been promoted to the real balance. The ladder places no
+    // NEW sells while that is true, but its existing rungs keep being filled — abandoning a
+    // resting rung would strand its cash, which is the exact failure this whole strategy is
+    // built to avoid. It stops starting things; it does not stop finishing them.
+    paused = false,
+    pausedWhy = "",
+  } = cfg;
+  const st = {
+    units: 1, cash: 0, open: [], sells: 0, fills: 0, lastDay: null, startedAt: null, lastFillT: 0,
+    startUnits: 1, coreUnits: null, highWater: null,
+    ...(state || {}),
+  };
+  const events = [];
+  if (!daily || daily.length < 60) return { st, events };
+  const bar = daily[daily.length - 1];
+  const day = new Date(bar.t).toISOString().slice(0, 10);
+  if (st.lastDay === day) return { st, events };            // one SELL decision per closed daily bar
+  st.lastDay = day;
+  if (!st.startedAt) { st.startedAt = day; st.startPx = bar.c; st.startUnits = st.units; }
+
+  // The core, and its ratchet. Total units counts cash at the current price, so a slice that is
+  // temporarily in cash cannot fake a new high while it waits to be bought back.
+  const totalNow = st.units + (st.cash || 0) / bar.c;
+  st.highWater = Math.max(st.highWater || st.startUnits || 1, totalNow);
+  st.coreUnits = Math.max(st.coreUnits || 0, (st.startUnits || 1) * corePct, st.highWater * corePct);
+
+  // 1) a safety net only: accumFillPass does the real work every 15 minutes, but if the intraday
+  //    fetch failed for a while the daily low still tells us a rung must have filled.
+  for (let k = st.open.length - 1; k >= 0; k--) {
+    const r = st.open[k];
+    if (bar.l <= r.px) {
+      const got = (r.usdt / r.px) * (1 - feeBps / 1e4);
+      st.units += got; st.cash -= r.usdt; st.fills++;
+      st.open.splice(k, 1);
+      events.push({ kind: "fill", px: r.px, src: r.src, units: +got.toFixed(8),
+                    usdt: +Number(r.usdt).toFixed(2),
+                    delta: +(got - r.soldUnits).toFixed(8), viaDaily: true });
+    }
+  }
+
+  // 1c) ── A RUNG THAT WILL NEVER FILL IS NOT A RUNG (2026-08-21) ─────────────────────────────
+  // Measured on the repo's own daily BTC data, 2023-09-30 → 2026-07-31, starting from 1.00 BTC:
+  // the ladder ended holding 0.769 BTC against 1.000 held. It did not lose that by trading badly.
+  // It STOPPED. Three ladders laid in October 2023 put rungs at $25,754–$26,360; BTC never went
+  // back; and because maxConcurrent counts a resting ladder whether or not it can ever fill, all
+  // four slots were occupied by the dead from 2024-09-08 onward. The trigger fired 113 more times
+  // and was refused every one. Nine sells in three years instead of sixty-six.
+  //
+  // So a rung gets a life. After ACCUM_RUNG_TTL_DAYS unfilled it is cancelled and the cash buys
+  // coins back at the market — which BOOKS A REAL LOSS in units, and is the point: the loss
+  // already happened the moment price left and did not come back. The rung was only hiding it,
+  // and hiding it cost the strategy the ability to trade at all. Replayed with a 30-day life the
+  // same three years end at 0.980 BTC over 66 sells — still short of holding, but ALIVE, and 27%
+  // better than what was running. Set to 0 to go back to rungs that wait forever.
+  //
+  // It runs BEFORE the paused check on purpose: a stood-down ladder still has cash out against
+  // coins it sold, and freeing that is finishing something, not starting one.
+  const ttlDays = num("ACCUM_RUNG_TTL_DAYS", 30);
+  if (ttlDays > 0 && st.open.length) {
+    const dayNo = d => Math.round(Date.parse(String(d) + "T00:00:00Z") / 864e5);
+    const today = dayNo(day);
+    for (let k = st.open.length - 1; k >= 0; k--) {
+      const r = st.open[k];
+      const age = today - dayNo(r.sinceDay || day);
+      if (!Number.isFinite(age) || age < ttlDays) continue;
+      const got = (r.usdt / bar.c) * (1 - feeBps / 1e4);
+      st.units += got; st.cash -= r.usdt; st.expired = (st.expired || 0) + 1;
+      st.open.splice(k, 1);
+      events.push({ kind: "expire", px: bar.c, src: r.src, rungPx: r.px, ageDays: age,
+                    usdt: +Number(r.usdt).toFixed(2), units: +got.toFixed(8),
+                    lost: +(r.soldUnits - got).toFixed(8) });
+    }
+  }
+
+  // 1b) …and if a dot-flip timeframe owns the coins, that is as far as the ladder goes today.
+  if (paused) {
+    events.push({ kind: "skip", why: pausedWhy || "the dot flip holds the coins" });
+    return { st, events };
+  }
+
+  // 2) THE SELL TRIGGER (2026-08-19) ─────────────────────────────────────────────────────────
+  // John: "if BTC jumps 3% or more in a candle, what chance it comes down? Probably quite high."
+  // Measured on 14.5 years, and he is right about the hit rate — it rises monotonically with the
+  // size of the pump: any day 81.6% comes back 2%, after a +2% day 84.3%, +3% 85.4%, +5% 87.6%.
+  //
+  // Tested end to end it also BEATS the red dot in the regimes where this strategy works at all
+  // (2025-26: +11.6% vs +5.7%; 2022: +12.2% vs +5.7%). Worth knowing why they differ: a red dot
+  // fires AFTER momentum has rolled over, while "just pumped" IS momentum surging — they are
+  // alternatives, not a stack, and stacking them produced one sell in fourteen years.
+  //
+  // Neither escapes the regime problem: both lose in sustained rallies. This is a better trigger,
+  // not a solved strategy.
+  const trig = trigger;
+  const { wt1, wt2 } = waveTrend(daily);
+  const mf = vmcMoneyFlow(daily);
+  const n = daily.length - 1;
+  let fired = false, how = "";
+  if (trig === "reddot") {
+    const d0 = wt1[n] - wt2[n], dPrev = wt1[n - 1] - wt2[n - 1];
+    fired = Number.isFinite(wt2[n]) && Number.isFinite(wt2[n - 1]) && dPrev >= 0 && d0 < 0;
+    how = "VuManChu red dot";
+  } else {
+    // "pumpN" means an N-percent day: pump3 = 3%, pump1 = 1%, pump0.5 = 0.5%. Parsed rather than
+    // enumerated so the threshold can be dialled without another code change.
+    const m = /^pump([\d.]+)$/.exec(String(trig));
+    const pct = pumpPct != null ? pumpPct
+              : m ? Number(m[1]) / 100
+              : num("ACCUM_PUMP_PCT", 0.01);
+    const move = daily[n].c / daily[n - 1].c - 1;
+    fired = move >= pct;
+    how = `day closed +${(move * 100).toFixed(1)}% (trigger ${(pct * 100).toFixed(0)}%)`;
+  }
+  if (!fired) return { st, events };
+  if (mfGate && !(Number.isFinite(mf[n]) && mf[n] < 0)) {
+    events.push({ kind: "skip", why: `${how}, but money flow is not negative` });
+    return { st, events };
+  }
+  st.lastTrigger = how;
+
+  const ladders = new Set(st.open.map(r => r.sinceDay)).size;
+  if (ladders >= maxConcurrent) { events.push({ kind: "skip", why: `${ladders} ladders already resting` }); return { st, events }; }
+  const portfolio = st.units * bar.c + st.cash;
+  if (portfolio > 0 && (st.cash + st.units * slicePct * bar.c) / portfolio > maxCashPct) {
+    events.push({ kind: "skip", why: "cash ceiling — too much of the stack would be waiting for a dip" }); return { st, events };
+  }
+  // Only inventory ABOVE the core may be traded. Whatever the signals say, the core is not for sale.
+  const tradeable = Math.max(0, st.units - st.coreUnits);
+  const sellUnits = tradeable * slicePct;
+  if (!(sellUnits > 0)) {
+    events.push({ kind: "skip", why: `core floor — ${st.coreUnits.toFixed(5)} of ${st.units.toFixed(5)} units is core and not for sale` });
+    return { st, events };
+  }
+
+  // ── FIT THE LADDER TO THE VENUE'S MINIMUM (2026-08-19) ─────────────────────────────────────
+  // A ladder is only a ladder if every rung is a placeable order. Phemex rejects spot orders under
+  // a minimum notional (typically ~10 USDT), and at John's funded size a 4-rung ladder came to
+  // $9.99 a rung — every one would have bounced. So the rung COUNT adapts to the money available
+  // rather than being a fixed 4, and if even a single rung cannot clear the minimum the trade is
+  // refused with a plain reason instead of being sent to be rejected.
+  const sliceValue = sellUnits * bar.c;
+  const minOrder = minOrderUsdt;
+  const affordable = Math.floor(sliceValue / minOrder);
+  if (affordable < 1) {
+    events.push({ kind: "skip", why: `slice is only ${sliceValue.toFixed(2)} USDT — below the ${minOrder} USDT minimum order, so there is nothing placeable` });
+    return { st, events };
+  }
+  const rungBudget = Math.min(maxRungs, affordable);
+  const levels = accumLevels(daily, bar.c, rungBudget);
+  if (!levels.length) { events.push({ kind: "skip", why: "no level below to buy back at" }); return { st, events }; }
+
+  const proceeds = sellUnits * bar.c * (1 - feeBps / 1e4);
+  st.units -= sellUnits; st.cash += proceeds; st.sells++;
+  const per = proceeds / levels.length, perUnits = sellUnits / levels.length;
+  for (const z of levels) st.open.push({ px: z.px, src: z.src, usdt: per, soldUnits: perUnits, sellPx: bar.c, sinceDay: day });
+  events.push({ kind: "sell", px: bar.c, units: +sellUnits.toFixed(8), how: st.lastTrigger || "",
+                rungs: levels.map(z => `${z.src}@${formatPrice(z.px)}`) });
+  return { st, events };
+}
+
+// ═══════════════ THE DOT FLIP (2026-08-19) ═══════════════
+// John: "5 min green sell, 5 min red buy — just run it and see."
+//
+// Run on real 1-minute BTC before writing it, because the answer was decisive:
+//
+//   timeframe   round trips   fees paid   end units   vs hold
+//   5m               16,730      3,346%     0.00000   -100.00%   <- zeroes the account
+//   15m               5,592      1,118%     0.00001   -100.00%
+//   1H                1,394        279%     0.08486    -91.51%
+//
+// And the part that matters — the SAME strategy with fees removed:
+//
+//   5m  +10.90%   ·   15m +2.86%   ·   1H +38.22%
+//
+// So the dots carry genuine signal at every timeframe. What destroys it is paying 0.2% a
+// round trip sixteen thousand times. At MAKER fees (1bp a side) the 1H version survives at
+// +4.58% — 1,394 trips paying 28% instead of 279%.
+//
+// Hence: this runs on 1H, not 5m, and it is MEASURE-ONLY until its fills are proven, because
+// +4.58% assumes every post-only order fills at its price, and a post-only order that never
+// fills is a slice left in cash — the exact failure mode that costs this whole idea its units.
+// It places nothing. It exists so John can watch a busy version accumulate evidence beside the
+// live one, and arm it on a record rather than on a hope.
+const FLIP_TF = () => env("FLIP_TF", "1H");
+// Every timeframe John asked to be able to switch between. 3H is assembled from 1H bars because
+// no exchange serves it natively.
+const FLIP_TFS = ["5m", "15m", "30m", "1H", "2H", "3H", "4H", "1D"];
+
+function aggregateBars(bars, factor) {
+  const out = [];
+  for (let i = 0; i + factor <= bars.length; i += factor) {
+    const slice = bars.slice(i, i + factor);
+    out.push({ t: slice[0].t, o: slice[0].o, c: slice[slice.length - 1].c,
+               h: Math.max(...slice.map(b => b.h)), l: Math.min(...slice.map(b => b.l)),
+               v: slice.reduce((a, b) => a + (b.v || 0), 0) });
+  }
+  return out;
+}
+
+// PURE: bars in, state + events out. Sells the whole tradeable amount on a red dot, buys it all
+// back on a green one. No ladder, no levels — a straight flip, which is what was asked for.
+function accumFlipStep(state, bars, cfg = {}) {
+  const { feeBps = num("FLIP_FEE_BPS", 1), slicePct = num("FLIP_SLICE", 1) } = cfg;
+  const st = { units: 1, cash: 0, trips: 0, sells: 0, lastT: 0, startUnits: 1, ...(state || {}) };
+  const events = [];
+  if (!bars || bars.length < 60) return { st, events };
+  const { wt1, wt2 } = waveTrend(bars);
+  const fresh = [];
+  for (let i = 1; i < bars.length; i++) if (bars[i].t > (st.lastT || 0)) fresh.push(i);
+  for (const i of fresh) {
+    if (!Number.isFinite(wt2[i]) || !Number.isFinite(wt2[i - 1])) continue;
+    const d0 = wt1[i] - wt2[i], dPrev = wt1[i - 1] - wt2[i - 1];
+    const red = dPrev >= 0 && d0 < 0, green = dPrev <= 0 && d0 > 0;
+    const px = bars[i].c;
+    if (red && st.units > 0) {
+      const sell = st.units * slicePct;
+      const proceeds = sell * px * (1 - feeBps / 1e4);
+      st.cash += proceeds; st.units -= sell; st.sells++;
+      // `cash` rides along because the live arm sizes a real order from it: a spot BUY is sized
+      // in the money, not the coin, so the proceeds of the sell are what the buy-back spends.
+      events.push({ kind: "flip-sell", at: bars[i].t, px, units: sell, cash: proceeds });
+    } else if (green && st.cash > 0) {
+      const spent = st.cash;
+      const got = (spent / px) * (1 - feeBps / 1e4);
+      st.units += got; st.cash = 0; st.trips++;
+      events.push({ kind: "flip-buy", at: bars[i].t, px, units: got, cash: spent });
+    }
+    st.lastT = bars[i].t;
+  }
+  return { st, events };
+}
+
+// ═══════════ SELL THE RED DOT, LADDER BACK IN (2026-08-25) ═══════════
+// The flip's exit with a different re-entry. Pure, same shape as accumFlipStep, same units-based
+// bookkeeping, so the two are directly comparable and neither can flatter the other.
+//
+// A rung fills when the bar's LOW trades through it, at the rung price — the normal assumption for
+// a resting limit order, and mildly generous. It is applied identically to every arm that uses
+// rungs, so the comparison between spacings is sound even if the level is optimistic.
+//
+// The green dot sweeps leftover cash. Without that backstop the arm can sit in cash indefinitely
+// on a coin that never comes back down: measured across 12 coins, dropping it took the median from
+// +53% to +5% and blew the spread out to −63%…+660%. The ladder is the engine; the backstop is
+// what stops the engine running away.
+const LADDER_ARMS = [
+  { id: "L3x4", rungs: 3, stepPct: 4 },
+  { id: "L2x5", rungs: 2, stepPct: 5 },
+  { id: "L5x2", rungs: 5, stepPct: 2 },
+];
+
+function accumLadderStep(state, bars, cfg = {}) {
+  const { feeBps = num("FLIP_FEE_BPS", 1), rungs = 3, stepPct = 4 } = cfg;
+  const st = { units: 1, cash: 0, trips: 0, sells: 0, fills: 0, lastT: 0, startUnits: 1,
+               open: [], ...(state || {}) };
+  const events = [];
+  if (!bars || bars.length < 60) return { st, events };
+  const { wt1, wt2 } = waveTrend(bars);
+  const f = 1 - feeBps / 1e4;
+  const fresh = [];
+  for (let i = 1; i < bars.length; i++) if (bars[i].t > (st.lastT || 0)) fresh.push(i);
+  for (const i of fresh) {
+    if (!Number.isFinite(wt2[i]) || !Number.isFinite(wt2[i - 1])) continue;
+    const d0 = wt1[i] - wt2[i], dPrev = wt1[i - 1] - wt2[i - 1];
+    const red = dPrev >= 0 && d0 < 0, green = dPrev <= 0 && d0 > 0;
+    const px = bars[i].c;
+
+    // Rungs are checked BEFORE the dots on the same bar. A bar that dips into a rung and also
+    // prints a green dot filled the cheaper rung first in reality; the other order would hand the
+    // ladder's whole advantage to the backstop and hide the effect being measured.
+    if (Array.isArray(st.open) && st.open.length) {
+      const still = [];
+      for (const r of st.open) {
+        if (bars[i].l <= r.px && st.cash >= r.usdt - 1e-9) {
+          st.units += (r.usdt / r.px) * f; st.cash -= r.usdt; st.fills++;
+          events.push({ kind: "ladder-fill", at: bars[i].t, px: r.px, usdt: r.usdt });
+        } else still.push(r);
+      }
+      st.open = still;
+    }
+
+    if (red && st.units > 0) {
+      const proceeds = st.units * px * f;
+      st.cash += proceeds; st.units = 0; st.sells++;
+      // Replace any stale bids: this is a fresh exit at a fresh price, and leaving the last
+      // cycle's rungs out would have it bidding against a level it no longer believes in.
+      const slice = st.cash / rungs;
+      st.open = [];
+      for (let k = 1; k <= rungs; k++) st.open.push({ px: px * (1 - stepPct * k / 100), usdt: slice });
+      events.push({ kind: "ladder-sell", at: bars[i].t, px, cash: proceeds, rungs: st.open.length });
+    } else if (green && st.cash > 0) {
+      const spent = st.cash;
+      st.units += (spent / px) * f; st.cash = 0; st.open = []; st.trips++;
+      events.push({ kind: "ladder-sweep", at: bars[i].t, px, cash: spent });
+    }
+    st.lastT = bars[i].t;
+  }
+  return { st, events };
+}
+
+// ═══════════ THE LIVE FLIP ARM (2026-08-19) ═══════════
+// John, having seen the eight paper arms: "I want toggles to switch to those timeframes."
+//
+// So one arm — and only ever one — may be promoted from paper to the real spot balance. This is
+// the promotion, and everything difficult about it is in the seams rather than the strategy:
+//
+//  1. NO REPLAY. accumFlipStep acts on every bar newer than `lastT`. A freshly armed timeframe
+//     has no lastT, and the bar fetch is 500 deep — so an unguarded arm would replay two months
+//     of dots as live orders inside one run. Arming therefore plants the cursor on the newest
+//     closed bar and places NOTHING; the first real order waits for the first dot after that.
+//  2. SWITCHING IS ALSO ARMING. Moving 1H → 4H is not a continuation, it is a new strategy on
+//     the same coins, so it resets the cursor and the record the same way a fresh arm does.
+//  3. ONE BOOK OWNS THE COINS. The ladder and the flip cannot both hold the stack. The caller
+//     stands the ladder down before this runs, and refuses to arm at all while ladder rungs are
+//     still resting — two books claiming one balance is how you sell the same coin twice.
+//
+// The bookkeeping fee is the REAL one (10bps taker), not the 1bp the paper arms assume. Those
+// arms exist to rank timeframes under an optimistic assumption; this one has to be honest, and
+// its record is the only one that gets to claim anything about live performance.
+const LIVE_FLIP_KEY = "cipher_accum_liveflip";
+
+// ── POSITION TARGET, NOT DOT REPLAY ──────────────────────────────────────────────────────────
+// The paper arms replay every dot as if each could be acted on the instant it printed. A bot that
+// wakes every 30–40 minutes cannot do that, and pretending otherwise is not a small inaccuracy —
+// it would place a LIMIT order at the close of a bar that may be half an hour old, which either
+// never fills (the slice strands in cash: the exact failure this strategy exists to avoid) or
+// fills at a price nothing like the one the book recorded.
+//
+// So the live arm asks a different, answerable question: given the newest closed bar, SHOULD this
+// be holding coins or holding cash? A red dot is wt1 crossing below wt2 and a green dot is the
+// cross back, so "hold coins while wt1 is above wt2" is the same position the dots describe —
+// just sampled when the bot is actually awake, and transacted at a price that is actually current.
+//
+// The consequence is worth stating plainly rather than burying: on fast timeframes this arm will
+// MISS moves the paper arm catches, because dots that open and close between two runs are
+// invisible to it. That gap is real and it grows as the timeframe shortens. It is also honest —
+// the paper 5m number was never achievable by this bot at any fee.
+function liveFlipStep(state, bars, tf, cfg = {}) {
+  // ── DUST IS NOT A POSITION (2026-08-19) ─────────────────────────────────────────────────────
+  // The first live arm came up holding 0.00767931 BTC and 1.2 CENTS of leftover USDT. Treating
+  // any non-zero cash as "in cash" would have reported the arm as sold when it holds the whole
+  // stack, and — far worse — the next green reading would have tried to BUY with $0.012, which
+  // is under the venue's $10 minimum. That order gets refused, the refusal trips the rollback,
+  // and the arm retries the same thing every run forever. So both sides ignore anything too
+  // small to be an order.
+  const { feeBps = num("ACCUM_FEE_BPS", 10), seedUnits = null, seedCash = 0,
+          minOrderUsdt = num("ACCUM_MIN_ORDER_USDT", 10) } = cfg;
+  const st = {
+    tf: null, units: 0, cash: 0, trips: 0, sells: 0, lastT: 0,
+    startUnits: 0, startedAt: null, armedAt: null, want: null,
+    ...(state || {}),
+  };
+  const events = [];
+  if (!bars || bars.length < 60) return { st, events, why: "not enough bars to arm" };
+  const last = bars[bars.length - 1];
+  const { wt1, wt2 } = waveTrend(bars);
+  const n = bars.length - 1;
+  if (!Number.isFinite(wt1[n]) || !Number.isFinite(wt2[n])) return { st, events, why: "indicator not ready" };
+  const wantCoins = wt1[n] > wt2[n];
+
+  if (st.tf !== tf) {
+    const prev = st.tf;
+    st.tf = tf;
+    st.lastT = last.t;                 // ← the whole no-replay guarantee is this line
+    st.trips = 0; st.sells = 0;
+    st.want = wantCoins;
+    st.armedAt = new Date().toISOString();
+    st.startedAt = st.armedAt;
+    if (seedUnits != null) { st.units = seedUnits; st.cash = seedCash || 0; }
+    // The benchmark this arm is judged against: what it started with, held and never traded.
+    st.startUnits = st.units + (st.cash || 0) / last.c;
+    events.push({ kind: "flip-armed", tf, prev, at: last.t, px: last.c,
+                  units: st.units, cash: st.cash, want: wantCoins ? "coins" : "cash" });
+    return { st, events };
+  }
+
+  if (!(last.t > (st.lastT || 0))) return { st, events };     // no new bar has closed
+  st.lastT = last.t;
+  st.want = wantCoins;
+  const px = last.c;
+
+  // At most ONE order per run, for the whole position, at the newest price we have.
+  if (!wantCoins && st.units * px >= minOrderUsdt) {
+    const sell = st.units;
+    const proceeds = sell * px * (1 - feeBps / 1e4);
+    st.cash += proceeds; st.units = 0; st.sells++;
+    events.push({ kind: "flip-sell", at: last.t, px, units: sell, cash: proceeds });
+  } else if (wantCoins && st.cash >= minOrderUsdt) {
+    const spent = st.cash;
+    const got = (spent / px) * (1 - feeBps / 1e4);
+    st.units += got; st.cash = 0; st.trips++;
+    events.push({ kind: "flip-buy", at: last.t, px, units: got, cash: spent });
+  }
+  return { st, events };
+}
+
+// ═══════════ THE LIVE DOT-LADDER (2026-08-30) ═══════════
+// Backtested against 3 years of real BTC history at four fee levels: 2 rungs, 5% apart (L2x5)
+// beat the currently-live flip robustly at every fee tested. This is that arm promoted to the
+// real spot balance, same promotion liveFlipStep got on 2026-08-19 and the same three rules:
+//  1. NO REPLAY — arming plants the cursor on the newest closed daily bar and places nothing.
+//  2. ONE BOOK OWNS THE COINS — the caller stands the pump ladder and the dot flip down before
+//     this runs, the same way switching between those two already does.
+//  3. RUNGS FILL ON THE WAKE-TO-WAKE LOW — Phemex is not asked to rest true limit orders here
+//     (untracked ones would drift out of the book's view); a rung is treated as filled the
+//     moment a 15m bar closed since the last run traded through it, same rule the backtest used.
+// The fee is the REAL one (ACCUM_FEE_BPS, taker) — this arm's record is the only one allowed to
+// claim anything about live performance.
+const LIVE_LADDER_KEY = "cipher_accum_liveladder";
+
+function liveLadderStep(state, dailyBars, fineBars, cfg = {}) {
+  const { feeBps = num("ACCUM_FEE_BPS", 10), rungs = 2, stepPct = 5,
+          seedUnits = null, seedCash = 0, minOrderUsdt = num("ACCUM_MIN_ORDER_USDT", 10) } = cfg;
+  const st = {
+    tf: null, units: 0, cash: 0, trips: 0, sells: 0, fills: 0, lastT: 0, lastFineT: 0,
+    startUnits: 0, startedAt: null, armedAt: null, open: [],
+    ...(state || {}),
+  };
+  const events = [];
+  if (!dailyBars || dailyBars.length < 60) return { st, events, why: "not enough daily bars to arm" };
+  const lastDaily = dailyBars[dailyBars.length - 1];
+  const { wt1, wt2 } = waveTrend(dailyBars);
+  const n = dailyBars.length - 1;
+  if (!Number.isFinite(wt1[n]) || !Number.isFinite(wt2[n])) return { st, events, why: "indicator not ready" };
+  const d0 = wt1[n] - wt2[n], dPrev = wt1[n - 1] - wt2[n - 1];
+
+  if (st.tf !== "1D") {
+    const prev = st.tf;
+    st.tf = "1D";
+    st.lastT = lastDaily.t;                 // ← the no-replay guarantee, same line as liveFlipStep
+    st.lastFineT = (fineBars && fineBars.length) ? fineBars[fineBars.length - 1].t : 0;
+    st.trips = 0; st.sells = 0; st.fills = 0; st.open = [];
+    st.armedAt = new Date().toISOString();
+    st.startedAt = st.armedAt;
+    if (seedUnits != null) { st.units = seedUnits; st.cash = seedCash || 0; }
+    st.startUnits = st.units + (st.cash || 0) / lastDaily.c;
+    events.push({ kind: "ladder-armed", prev, at: lastDaily.t, px: lastDaily.c,
+                  units: st.units, cash: st.cash, rungs, stepPct });
+    return { st, events };
+  }
+
+  const f = 1 - feeBps / 1e4;
+
+  // Rungs first, against every FRESH 15m bar since the last check — skipping this would let
+  // price cross a rung between two runs and never notice, stranding cash in an unfilled level.
+  if (Array.isArray(st.open) && st.open.length && fineBars && fineBars.length) {
+    const freshFine = fineBars.filter(b => b.t > (st.lastFineT || 0));
+    for (const b of freshFine) {
+      if (!st.open.length) break;
+      const still = [];
+      for (const r of st.open) {
+        if (b.l <= r.px && st.cash >= r.usdt - 1e-9 && r.usdt >= minOrderUsdt) {
+          const got = (r.usdt / r.px) * f;
+          st.units += got; st.cash -= r.usdt; st.fills++;
+          events.push({ kind: "ladder-fill", at: b.t, px: r.px, usdt: r.usdt, units: got });
+        } else still.push(r);
+      }
+      st.open = still;
+    }
+    if (freshFine.length) st.lastFineT = freshFine[freshFine.length - 1].t;
+  }
+
+  // The daily decision — at most one sell or one sweep per run: a dot that opens and closes
+  // between two runs is missed, not retroactively acted on. Same honesty rule as liveFlipStep.
+  if (lastDaily.t > (st.lastT || 0)) {
+    st.lastT = lastDaily.t;
+    const red = dPrev >= 0 && d0 < 0, green = dPrev <= 0 && d0 > 0;
+    const px = lastDaily.c;
+    if (red && st.units * px >= minOrderUsdt) {
+      const sell = st.units;
+      const proceeds = sell * px * f;
+      st.cash += proceeds; st.units = 0; st.sells++;
+      const slice = proceeds / rungs;
+      st.open = [];
+      for (let k = 1; k <= rungs; k++) st.open.push({ px: px * (1 - stepPct * k / 100), usdt: slice });
+      events.push({ kind: "ladder-sell", at: lastDaily.t, px, units: sell, cash: proceeds, rungs: st.open.length });
+    } else if (green && st.cash >= minOrderUsdt) {
+      const spent = st.cash;
+      const got = (spent / px) * f;
+      st.units += got; st.cash = 0; st.open = []; st.trips++;
+      events.push({ kind: "ladder-sweep", at: lastDaily.t, px, units: got, cash: spent });
+    }
+  }
+  return { st, events };
+}
+
+// ═══════════════ SPOT RAILS (2026-08-19) ═══════════════
+// John: "it also has to be done on spot, not futures." He is right, and it is not a preference —
+// it is the whole objective. On a USDT-M perpetual you never own a coin: you hold a position,
+// you pay funding to keep it, and "more BTC" is not a thing that can happen. Accumulating UNITS
+// only means anything on spot, where the coin is actually yours.
+//
+// Everything else in this file talks to /g-orders (USDT-M). Spot is a different product on the
+// same venue: symbols carry an "s" prefix (sBTCUSDT), and prices and quantities go over the wire
+// as SCALED INTEGERS whose scale factors come from /public/products. Getting a scale wrong sends
+// an order a thousand times too big, so nothing here guesses: if the scales have not been read
+// from the venue, the order is refused.
+//
+// IMPORTANT, stated plainly: this code has NOT been exercised against the live venue — Phemex is
+// unreachable from the machine it was written on.
+//
+// ── CORRECTED 2026-08-20, after Codex's review ──────────────────────────────────────────────
+// This comment used to claim "It is DRY by default (ACCUM_EXEC=dry)". That was false, and had
+// been false since the accumulator was armed. The default below is now genuinely "dry", and the
+// arming lives in ONE auditable place: ACCUM_EXEC in .github/workflows/cipher-agent.yml.
+// A safety note that lies is worse than no safety note — anyone auditing this file would have
+// concluded the spot path could not place an order, and been wrong.
+const SPOT_KEY = "cipher_spot_products";
+let _spotProducts = null;
+
+// Read the product table once and remember the scales. Public endpoint, no key needed.
+async function spotProducts() {
+  if (_spotProducts) return _spotProducts;
+  try {
+    const r = await phemexPublic("/public/products");
+    const body = (r && r.data && (r.data.data || r.data)) || {};
+    const list = body.products || [];
+    // ── WHERE THE SCALES ACTUALLY LIVE (found 2026-08-19 by running the preflight) ────────────
+    // The first version looked for baseValueScale on the PRODUCT and never found it, so every
+    // symbol failed the readiness check even though the market plainly exists. Phemex keeps
+    // value scales on the CURRENCY, not the product: /public/products returns a `currencies`
+    // array where each entry carries its own valueScale. A spot pair therefore needs two
+    // lookups — one for the coin, one for the money.
+    const cur = {};
+    for (const c of (body.currencies || [])) {
+      if (c && c.currency) cur[String(c.currency).toUpperCase()] = Number(c.valueScale);
+    }
+    const map = {};
+    for (const p of list) {
+      if (!p || !p.symbol || !String(p.symbol).startsWith("s")) continue;   // spot symbols only
+      const base = String(p.baseCurrency || "").toUpperCase();
+      const quote = String(p.quoteCurrency || "").toUpperCase();
+      map[p.symbol] = {
+        baseCurrency: base, quoteCurrency: quote,
+        priceScale: Number(p.priceScale ?? p.pricePrecision ?? 8),
+        ratioScale: Number(p.ratioScale),
+        baseTickSize: p.baseTickSize, quoteTickSize: p.quoteTickSize,
+        baseValueScale: Number.isFinite(cur[base]) ? cur[base] : Number(p.baseValueScale),
+        quoteValueScale: Number.isFinite(cur[quote]) ? cur[quote] : Number(p.quoteValueScale),
+      };
+    }
+    if (Object.keys(map).length) _spotProducts = map;
+    return _spotProducts;
+  } catch (e) { console.error("spot products read failed:", e && e.message); return null; }
+}
+
+// Build a spot order. Returns { order, debug } or { err } — never a half-built order.
+//   side "Sell": we are selling BASE (BTC), so baseQtyEv carries the size
+//   side "Buy" : we are spending QUOTE (USDT), so quoteQtyEv carries the spend
+//
+// ── DIAGNOSTIC FIELDS ADDED 2026-09-07 ─────────────────────────────────────────────────────
+// Every live BUY since 2026-09-04T15:07 has been refused with `phemex 11053: TE_PRICE_TOO_LARGE`
+// — ~22 attempts in a row, at different real BTC prices, all rejected identically — while SELLs
+// on the same symbol, using the same priceEp formula, have gone through. That asymmetry rules out
+// "priceScale is just wrong" (a wrong scale would break both sides the same way) and points at
+// something that only matters for a ByQuote BUY specifically. `ratioScale` is read off the
+// product table (below) and has never been used anywhere in this function — a strong candidate
+// for "the field ByQuote actually needs and Sell/ByBase doesn't." Rather than guess at a fix with
+// no way to test it against the live venue (Phemex is unreachable from every machine this was
+// investigated on), this now returns `debug` alongside `order` — never sent to the venue, since
+// only `order` is ever passed to sendSpotOrder — so the NEXT few failures put real numbers in the
+// log instead of the same unexplained error on repeat.
+function buildSpotOrder(sym, side, { price, baseQty, quoteQty }, products) {
+  const symbol = "s" + String(sym).toUpperCase().replace(/^S/, "") + "USDT";
+  const p = products && products[symbol];
+  if (!p) return { err: `no spot product data for ${symbol} — refusing to guess the scales` };
+  if (!(Number.isFinite(p.baseValueScale) && Number.isFinite(p.quoteValueScale) && Number.isFinite(p.priceScale)))
+    return { err: `incomplete scales for ${symbol} — refusing to send` };
+  if (side !== "Buy" && side !== "Sell") return { err: "side must be Buy or Sell" };
+  if (!(price > 0)) return { err: "spot order needs a price" };
+  const priceEp = Math.round(price * 10 ** p.priceScale);
+  const order = {
+    symbol, side, ordType: "Limit", timeInForce: "GoodTillCancel",
+    priceEp,
+    clOrdID: ("accum" + sym + Date.now()).replace(/[^a-zA-Z0-9]/g, "").slice(0, 30),
+  };
+  const debug = {
+    priceScale: p.priceScale, baseValueScale: p.baseValueScale, quoteValueScale: p.quoteValueScale,
+    ratioScale: p.ratioScale, baseTickSize: p.baseTickSize, quoteTickSize: p.quoteTickSize,
+    priceEp,
+  };
+  // qtyType is REQUIRED and tells the venue which of the two quantity fields to read. Missing it
+  // was a real defect, caught 2026-08-19 by reading Phemex's own spot docs rather than trusting
+  // the shape I had inferred. A sell is sized in the coin; a buy is sized in the money.
+  // ── FLOOR, NEVER ROUND (2026-08-19) ────────────────────────────────────────────────────────
+  // Math.round can round a quantity UP, which asks the venue to sell coins that are not there or
+  // spend money that is not there. Phemex answers that with
+  // TE_PLACE_ORDER_INSUFFICIENT_BASE_BALANCE — which is exactly what killed the first live flip
+  // sell, an order for the entire wallet balance where the last scaled digit went the wrong way.
+  // Flooring can only ever leave a sub-tick crumb behind; rounding can lose the whole order.
+  if (side === "Sell") {
+    if (!(baseQty > 0)) return { err: "sell needs a base quantity" };
+    order.qtyType = "ByBase";
+    order.baseQtyEv = Math.floor(baseQty * 10 ** p.baseValueScale);
+    debug.baseQtyEv = order.baseQtyEv;
+    if (!(order.baseQtyEv > 0)) return { err: "base quantity rounds to zero at this scale" };
+  } else {
+    if (!(quoteQty > 0)) return { err: "buy needs a quote amount" };
+    order.qtyType = "ByQuote";
+    order.quoteQtyEv = Math.floor(quoteQty * 10 ** p.quoteValueScale);
+    debug.quoteQtyEv = order.quoteQtyEv;
+    if (!(order.quoteQtyEv > 0)) return { err: "quote amount rounds to zero at this scale" };
+  }
+  return { order, debug };
+}
+
+// Render a buildSpotOrder debug object as a short, log-friendly string. Never touches `order`.
+function fmtSpotDebug(debug) {
+  if (!debug) return "";
+  return ` [priceScale=${debug.priceScale} baseVS=${debug.baseValueScale} quoteVS=${debug.quoteValueScale}` +
+         ` ratioScale=${debug.ratioScale} priceEp=${debug.priceEp}` +
+         (debug.baseQtyEv != null ? ` baseQtyEv=${debug.baseQtyEv}` : "") +
+         (debug.quoteQtyEv != null ? ` quoteQtyEv=${debug.quoteQtyEv}` : "") +
+         (debug.baseTickSize != null ? ` baseTick=${debug.baseTickSize}` : "") +
+         (debug.quoteTickSize != null ? ` quoteTick=${debug.quoteTickSize}` : "") + "]";
+}
+
+// PREFLIGHT — read-only, answers "can this actually trade spot here?" from the runner itself.
+// Written because the machine this code was authored on cannot reach Phemex at all, so the only
+// honest way to find out is to have the bot look and report back. Three questions, in order:
+//   1. does the venue expose a spot market for this coin, and what are its scales?
+//   2. is there a spot wallet, and does it hold anything?
+//   3. what would the very next order look like, byte for byte?
+// It places nothing. Run it, read the log, and only then decide whether to arm.
+async function spotPreflight(coin) {
+  const out = { symbol: "s" + String(coin).toUpperCase() + "USDT" };
+  try {
+    const prods = await spotProducts();
+    out.productsRead = !!prods;
+    out.product = prods && prods[out.symbol] ? prods[out.symbol] : null;
+    out.spotSymbolCount = prods ? Object.keys(prods).length : 0;
+  } catch (e) { out.productsErr = String(e && e.message || e).slice(0, 120); }
+  try {
+    // /spot/wallets takes a currency parameter; ask for the two that matter to this strategy.
+    const w = await phemexCall("GET", "/spot/wallets", "currency=USDT", null);
+    let w2 = null;
+    try { w2 = await phemexCall("GET", "/spot/wallets", `currency=${String(coin).toUpperCase()}`, null); } catch {}
+    if (w2 && w2.status === 200 && w2.data) out.baseWallet = JSON.stringify(w2.data).slice(0, 200);
+    out.walletStatus = w.status;
+    const rows = (w.data && (w.data.data || w.data.result)) || [];
+    const all = Array.isArray(rows) ? [...rows] : [];
+    if (w2 && w2.status === 200) {
+      const r2 = (w2.data && (w2.data.data || w2.data.result)) || [];
+      if (Array.isArray(r2)) all.push(...r2);
+    }
+    if (all.length) {
+      out.balances = all
+        .filter(r => r && (Number(r.balanceEv) > 0 || Number(r.balance) > 0))
+        .map(r => `${r.currency || r.currencyCode || "?"}:${r.balanceEv ?? r.balance}`)
+        .slice(0, 8);
+      out.walletRows = all.length;
+      // The real, human-readable balance of the coin we trade. Wallet balances come back as
+      // scaled integers (balanceEv) using the SAME per-currency valueScale as orders do, so the
+      // scale has to be read, never assumed — the identical trap that broke the first preflight.
+      const want = String(coin).toUpperCase();
+      const row = all.find(r => String(r.currency || r.currencyCode || "").toUpperCase() === want);
+      const scale = out.product ? out.product.baseValueScale : NaN;
+      if (row && Number.isFinite(scale)) {
+        const ev = Number(row.balanceEv ?? row.balance);
+        if (Number.isFinite(ev)) out.baseBalance = ev / 10 ** scale;
+        // AVAILABLE is not the same as BALANCE. Anything locked in a resting order is still in
+        // `balanceEv` but cannot be sold, and the venue answers the difference with
+        // INSUFFICIENT_BASE_BALANCE rather than telling you which part was unavailable. Record
+        // both, and prefer the available figure when the venue reports one.
+        const lockedEv = Number(row.lockedTradingBalanceEv ?? row.lockedBalanceEv ?? row.lockedEv);
+        if (Number.isFinite(lockedEv)) {
+          out.baseLocked = lockedEv / 10 ** scale;
+          out.baseAvailable = (ev - lockedEv) / 10 ** scale;
+          if (out.baseAvailable >= 0) out.baseBalance = out.baseAvailable;
+        }
+        out.baseRow = JSON.stringify(row).slice(0, 300);   // so a refusal can be diagnosed once
+      }
+      const qrow = all.find(r => String(r.currency || r.currencyCode || "").toUpperCase() === "USDT");
+      const qscale = out.product ? out.product.quoteValueScale : NaN;
+      if (qrow && Number.isFinite(qscale)) {
+        const ev = Number(qrow.balanceEv ?? qrow.balance);
+        if (Number.isFinite(ev)) out.quoteBalance = ev / 10 ** qscale;
+      }
+    } else out.walletShape = typeof rows;
+  } catch (e) { out.walletErr = String(e && e.message || e).slice(0, 120); }
+  return out;
+}
+
+// The only function that can put a spot order on the wire. Three independent brakes, all of which
+// must be off: ACCUM_EXEC must be "armed", the global KILL must be clear, and the notional must
+// sit under ACCUM_MAX_USDT. Anything else returns a dry-run result that says what it would have done.
+async function sendSpotOrder(order, notionalUsdt, opts = {}) {
+  // ── ARMED ON JOHN'S INSTRUCTION, 2026-08-19 ────────────────────────────────────────────────
+  // Default flipped from "dry" to "armed" after he funded the spot wallet with 0.007682 BTC and
+  // asked for it live. Note WHY the default had to change rather than the workflow file: the
+  // deployed .github/workflows/cipher-agent.yml carries no ACCUM_* variables at all, so every
+  // accumulator setting comes from these code defaults. Editing the yml alone would have looked
+  // like arming it and changed nothing.
+  //
+  // The cap is raised 100 → 200 USDT for a real reason, not a round number: with no core a slice
+  // is 20% of the whole stack, which is ~$100 at $65k BTC and ~$123 at $80k. A $100 cap would
+  // have silently blocked the first trade the moment BTC rose. $200 still bounds any single
+  // order to well under half the account.
+  //
+  // Three brakes remain and all still apply: the app's KILL switch, this cap, and the fact that
+  // PHEMEX_BASE is hard-locked to testnet. Set ACCUM_EXEC=dry to stand it down.
+  // ── TWO CAPS, BECAUSE THERE ARE TWO STRATEGIES (2026-08-19) ────────────────────────────────
+  // The ladder sells a 20% slice, so 200 bounds it to comfortably under half the account and is
+  // a real brake. The dot flip sells the WHOLE stack by construction — capping it below the
+  // stack does not make it smaller, it makes it BROKEN: the order is silently skipped while the
+  // strategy's book records a sell that never happened. A cap that turns a live strategy into a
+  // fiction is worse than no cap, so the flip gets its own, set above the stack on purpose.
+  // DEFAULT IS DRY (2026-08-20). It was "armed", which meant any deploy of this file anywhere
+  // started able to place real spot orders with nothing stating that intent. Arming is now an
+  // explicit ACCUM_EXEC=armed in the workflow — one place, auditable, greppable.
+  // ── ARMING IS PER BOOK (2026-08-22) ────────────────────────────────────────────────────────
+  // This used to read the global ACCUM_EXEC and nothing else. That was correct while there was
+  // exactly one accumulator. The moment a second book exists on a second coin it is actively
+  // dangerous: the BTC book is armed, so a newly added XRP book would inherit permission to place
+  // real orders without anyone arming it. opts.exec lets each book carry its own answer, and a
+  // book that does not supply one still falls back to the global, so every existing caller is
+  // unchanged. Absent opts.exec the behaviour is identical to before this line was touched.
+  const armed = String(opts.exec != null ? opts.exec : env("ACCUM_EXEC", "dry")) === "armed";
+  const cap = opts.cap != null ? opts.cap : num("ACCUM_MAX_USDT", 200);
+  if (CFG.kill()) return { dry: true, why: "KILL switch is on", order };
+  if (!(notionalUsdt <= cap)) return { dry: true, why: `notional ${notionalUsdt.toFixed(2)} over the ACCUM_MAX_USDT cap ${cap}`, order };
+  if (!armed) return { dry: true, why: "ACCUM_EXEC is not armed", order };
+  // ── A TRANSPORT BLIP MUST NOT COST A WHOLE CYCLE (2026-08-19) ─────────────────────────────
+  // The second live flip sell died on a bare `spot http 502` — Cloudflare, not Phemex, and not a
+  // rejection of anything. On a bot that wakes every 30–40 minutes that one blip cost the entire
+  // trade: by the next run the signal had flipped back and the move was over. A 5xx says nothing
+  // about the order, so retry it; a 4xx or a Phemex error code is a real answer, so never do.
+  //
+  // What makes the retry safe is that it re-sends the SAME order object, and that object carries
+  // a clOrdID minted once in buildSpotOrder. If the first attempt actually reached the venue and
+  // only the response was lost, the retry arrives with an ID the venue has already seen and is
+  // rejected as a duplicate rather than filled twice. Retrying a POST without a stable client ID
+  // would be the dangerous version of this.
+  let r = await phemexCall("POST", "/spot/orders", "", order);
+  for (let attempt = 1; attempt <= num("SPOT_RETRIES", 2) && r.status >= 500; attempt++) {
+    console.log(`spot order http ${r.status} — retry ${attempt}`);
+    await new Promise(res => setTimeout(res, 1200 * attempt));
+    r = await phemexCall("POST", "/spot/orders", "", order);
+  }
+  const code = r.data && r.data.code;
+  if (r.status !== 200) return { ok: false, status: r.status, error: `spot http ${r.status}`, sent: order, phemex: r.data };
+  if (code !== 0 && code !== undefined) return { ok: false, status: 422, error: `phemex ${code}: ${(r.data && r.data.msg) || "rejected"}`, sent: order, phemex: r.data };
+  return { ok: true, sent: order, phemex: r.data };
+}
+
+// Units held right now, counting cash at the current price — the only number that matters, and
+// the only one comparable to buy-and-hold's flat 1.0000.
+function accumUnits(st, px) {
+  if (!st || !(px > 0)) return null;
+  return st.units + (st.cash || 0) / px;
+}
+
+// ═══════════════ INSIGHT SCANNER (2026-08-19) ═══════════════
+// John: "I want the brain to really see the market, really scan and learn and check for new
+// insight from the indicators." The honest version of that is not more oscillators — it is
+// sweeping every feature the bot ALREADY stamps on its decisions and asking, continuously, which
+// of them actually separates winners from losers in live forward history.
+//
+// The features are PRE-REGISTERED here, in code — fixed buckets, chosen before looking. That is
+// the whole defence against fishing: ~20 buckets are watched every run, so at a 1-in-20 false
+// positive rate roughly one will look good by chance, and the both-halves gate exists precisely
+// to kill those. A bucket is reported as an INSIGHT only when it has a real sample AND holds the
+// same sign in both halves of its own history — the same bar the regime and rank boxes must clear.
+// It measures. It filters nothing. Anything that looks real graduates to a proper shadow arm.
+const INSIGHT_MIN_N = 30;
+const INSIGHT_FEATURES = [
+  ["direction",  r => r.dir === "short" ? "short" : "long"],
+  ["timeframe",  r => r.tf || "1D"],
+  ["detector",   r => (r.note || "?").split(" ")[0].toLowerCase()],
+  ["quality",    r => r.quality == null ? null : r.quality < 5 ? "q<5" : r.quality < 6 ? "q5-6" : "q6+"],
+  ["breadth",    r => r.breadth == null ? null : r.breadth < 0.4 ? "few above 200D" : r.breadth <= 0.6 ? "mixed field" : "most above 200D"],
+  ["btc-extension", r => r.regDist == null ? null : r.regDist < -10 ? "btc <-10% of 200D" : r.regDist < 0 ? "btc -10..0%" : r.regDist <= 10 ? "btc 0..+10%" : "btc >+10%"],
+];
+
+function insightScan(records) {
+  const done = records.filter(r => r.arm === "baseline" && r.R !== null);
+  const meanOf = a => a.length ? +(a.reduce((x, r) => x + r.R, 0) / a.length).toFixed(3) : null;
+  const rows = [];
+  for (const [feature, of] of INSIGHT_FEATURES) {
+    const buckets = new Map();
+    for (const r of done) {
+      const b = of(r);
+      if (b == null) continue;
+      if (!buckets.has(b)) buckets.set(b, []);
+      buckets.get(b).push(r);
+    }
+    for (const [bucket, rs] of buckets) {
+      const sorted = [...rs].sort((a, b) => a.at - b.at);
+      const half = Math.floor(sorted.length / 2);
+      const first = meanOf(sorted.slice(0, half)), second = meanOf(sorted.slice(half));
+      const m = meanOf(sorted);
+      const spanH = spanHoursOf(sorted);
+      const stable = sorted.length >= INSIGHT_MIN_N && spanH >= BOX_MIN_SPAN_H &&
+                     first !== null && second !== null &&
+                     Math.sign(first) === Math.sign(second) && Math.sign(first) !== 0;
+      rows.push({ feature, bucket, n: sorted.length, spanH, meanR: m, firstHalf: first, secondHalf: second, stable });
+    }
+  }
+  return rows.sort((a, b) => b.n - a.n);
+}
+
+// ═══════════════ THE SERVER-SIDE BRAIN: LOSER AUTOPSY (2026-08-19) ═══════════════
+// John: "give it eyes so it learns" — and give it the server, so it works while the laptop is
+// closed. This is the LLM doing the one thing it is actually good at in a trading system: reading
+// the messy context of a trade that FAILED and naming what happened. It never predicts price,
+// never sizes, never places, never blocks. Its output is a label on a record.
+//
+// The learning loop, held to the same evidence bar as everything else:
+//   1. every newly graded LOSING decision is sent (in ONE batched call) to a small cheap model
+//   2. the model must pick a cause from a PRE-REGISTERED taxonomy — free text can't be clustered,
+//      and an unclusterable excuse is not learning
+//   3. causes accumulate on the records; when one cause has a real sample AND its trades lose in
+//      both halves of history, it is reported as a VETO CANDIDATE
+//   4. a candidate stays advisory. Gating real orders would need its own shadow arm and a
+//      deliberate flag — nothing here touches the order path, and the tests assert that.
+//
+// Cost is engineered down before it is capped: one call per run at most, only when there are new
+// graded losses, batch of AUTOPSY_BATCH, compact JSON in and out, small model. Then capped anyway:
+// BRAIN_DAILY_USD (default $0.25/day) is a hard stop, tracked in the state file where John can
+// see it. No ANTHROPIC_API_KEY secret = the whole feature is silently off.
+const AUTOPSY_CAUSES = [
+  "chased-extended",   // entered far into a move that had already paid
+  "against-field",     // fought the cross-sectional leader/laggard read
+  "quiet-market",      // ATR too small for the costs — the known killer
+  "vol-collapse",      // volatility died right after entry; the move never came
+  "crowded-level",     // obvious level, stop where everyone's stop was
+  "signal-noise",      // low-timeframe signal that was never more than wiggle
+  "late-fill",         // the idea was right, the entry was stale by fill time
+  "regime-turn",       // BTC/the field turned over right after entry
+  "unknown",
+];
+const AUTOPSY_MAX_R = () => num("AUTOPSY_MAX_R", -0.4);   // what counts as a loss worth reading
+const AUTOPSY_BATCH = () => Math.max(1, num("AUTOPSY_BATCH", 8));
+const VETO_MIN_N = () => Math.max(4, num("VETO_MIN_N", 10));
+
+// Compact, deterministic prompt. Everything the model sees is data the record already carries.
+function buildAutopsyPrompt(losses) {
+  const rows = losses.map((r, i) => ({
+    i, coin: r.coin, dir: r.dir, tf: r.tf || "1D", det: (r.note || "?").split(" ")[0],
+    q: r.quality ?? null, rs: r.rs ?? null, reg: r.reg ?? null, dist: r.regDist ?? null,
+    br: r.breadth ?? null, stopPct: r.entry ? +((Math.abs(r.entry - r.stop) / r.entry) * 100).toFixed(2) : null,
+    R: r.R,
+  }));
+  return [
+    "You are the post-trade analyst for a rules-based crypto bot. Every trade below LOST.",
+    "For each, pick the SINGLE most likely cause from this fixed list (reply with the id):",
+    AUTOPSY_CAUSES.join(" | "),
+    "Field key: det=detector, q=setup quality, rs=field rank signed with the trade (0 laggard..1 leader),",
+    "reg=BTC regime, dist=BTC % from its 200D, br=share of coins above their 200D, R=result in R.",
+    'Reply ONLY a JSON array, no prose: [{"i":<index>,"c":"<cause-id>","w":"<why, max 12 words>"}]',
+    "TRADES:", JSON.stringify(rows),
+  ].join("\n");
+}
+
+// Tolerant of everything a model can do to JSON: prose around it, fences, bad ids.
+function parseAutopsy(text, count) {
+  if (!text) return [];
+  const m = String(text).match(/\[[\s\S]*\]/);
+  if (!m) return [];
+  let arr;
+  try { arr = JSON.parse(m[0]); } catch { return []; }
+  if (!Array.isArray(arr)) return [];
+  const out = [];
+  for (const x of arr) {
+    if (!x || typeof x !== "object") continue;
+    const i = Number(x.i);
+    if (!Number.isInteger(i) || i < 0 || i >= count) continue;
+    const c = AUTOPSY_CAUSES.includes(x.c) ? x.c : "unknown";
+    out.push({ i, c, w: String(x.w || "").slice(0, 90) });
+  }
+  return out;
+}
+
+// The spend meter is the contract: the brain can never cost more than the cap says, and what it
+// did cost is committed to the repo in the state file where it can be audited like everything else.
+function brainBudget(slot, now, usage) {
+  const day = new Date(now).toISOString().slice(0, 10);
+  if (slot.spendDay !== day) { slot.spendDay = day; slot.spendUsd = 0; slot.calls = 0; }
+  if (usage) {
+    const inUsd = (usage.input_tokens || 0) / 1e6 * num("BRAIN_IN_USD_PER_M", 1);
+    const outUsd = (usage.output_tokens || 0) / 1e6 * num("BRAIN_OUT_USD_PER_M", 5);
+    slot.spendUsd = +((slot.spendUsd || 0) + inUsd + outUsd).toFixed(4);
+    slot.calls = (slot.calls || 0) + 1;
+  }
+  return (slot.spendUsd || 0) < num("BRAIN_DAILY_USD", 0.25);
+}
+
+// Which provider, and therefore which wire format. Set BRAIN_BASE_URL to anything OpenAI-shaped
+// (DeepSeek, OpenRouter, Groq, Together, a local server) and the brain speaks that instead. Leave
+// it unset and this behaves exactly as it did before — same host, same headers, same body.
+function brainProvider() {
+  const base = String(env("BRAIN_BASE_URL", "")).replace(/\/+$/, "");
+  const key = env("BRAIN_API_KEY", "") || env("ANTHROPIC_API_KEY", "");
+  if (!key) return null;
+  if (!base) return { kind: "anthropic", url: "https://api.anthropic.com/v1/messages", key,
+                      model: env("BRAIN_MODEL", "claude-haiku-4-5") };
+  return { kind: "openai", url: base + "/chat/completions", key,
+           model: env("BRAIN_MODEL", "deepseek-chat") };
+}
+
+async function brainCall(prompt) {
+  const p = brainProvider();
+  if (!p) return null;
+  const ctrl = new AbortController();
+  const to = setTimeout(() => ctrl.abort(), 30000);
+  try {
+    const anth = p.kind === "anthropic";
+    const r = await fetch(p.url, {
+      method: "POST", signal: ctrl.signal,
+      headers: anth
+        ? { "x-api-key": p.key, "anthropic-version": "2023-06-01", "content-type": "application/json" }
+        : { "authorization": "Bearer " + p.key, "content-type": "application/json" },
+      body: JSON.stringify({
+        model: p.model, max_tokens: 700,
+        messages: [{ role: "user", content: prompt }],
+      }),
+    });
+    const j = await r.json();
+    // The error field sits in a different place in each shape; report whichever is there rather
+    // than a bare status code, because "refused" without a reason costs an hour to diagnose.
+    if (!r.ok) {
+      const msg = (j && j.error && (j.error.message || j.error)) || (j && j.message) || r.status;
+      console.error(`brain call refused (${p.kind}): ${msg}`);
+      return null;
+    }
+    const text = anth
+      ? (j.content && j.content[0] && j.content[0].text) || ""
+      : (j.choices && j.choices[0] && j.choices[0].message && j.choices[0].message.content) || "";
+    // Normalise usage HERE, at the boundary. The spend cap counts input_tokens/output_tokens; an
+    // OpenAI-shaped reply calls them prompt_tokens/completion_tokens, and left untranslated the
+    // meter would read zero forever and the daily cap would never engage. A budget that has
+    // quietly stopped counting still looks like protection, which is what makes it dangerous.
+    const u = j.usage || {};
+    const usage = anth ? u : { input_tokens: u.prompt_tokens || 0, output_tokens: u.completion_tokens || 0 };
+    return { text, usage };
+  } catch (e) { console.error("brain call failed (harmless, labels only):", e && e.message); return null; }
+  finally { clearTimeout(to); }
+}
+
+// ── THE BRAIN OVERSEEING THE ACCUMULATOR (2026-08-19) ────────────────────────────────────────
+// John: "the brain needs to be able to oversee it, see it and tweak it if it sees obvious
+// improvements." The first half is easy and safe — show it the record and let it name what it
+// sees. The second half is where every trading system quietly destroys itself, so the rule here
+// is explicit and enforced by the code: THE BRAIN CANNOT CHANGE A SETTING. It returns a written
+// observation and, at most, a NAMED suggestion. A suggestion is logged for John and would have to
+// win a shadow arm before it could ever alter behaviour — the same bar every other idea in this
+// system has had to clear. Anything else is a language model tuning a live strategy on a sample
+// of a dozen trades, which is precisely how you overfit an account to zero.
+function buildAccumReviewPrompt(st, px, backtest) {
+  const rungs = (st.open || []).map(r => `${r.src}@${r.px}`).join(", ") || "none";
+  const units = (st.units || 0) + (st.cash || 0) / (px || 1);
+  return [
+    "You are reviewing a BTC accumulation strategy. Its ONLY goal is to end up holding more BTC.",
+    "Buy-and-hold always ends with exactly 1.0000 units — that is the benchmark it must beat.",
+    "",
+    "How it works: on a daily VuManChu red dot with negative money flow it sells 20% of the stack,",
+    "then places buy-back orders at real levels below (swing lows, order blocks, fair value gaps).",
+    "It gains units when a rung fills lower; it LOSES units when price runs away and cash is left",
+    "stranded — that is the known failure mode and it dwarfs the wins.",
+    "",
+    `Backtest on 14.5 years: ${backtest}`,
+    "",
+    "LIVE RECORD SO FAR:",
+    `  units now ${units.toFixed(5)} vs benchmark 1.00000`,
+    `  sells ${st.sells || 0} · rung fills ${st.fills || 0} · rungs still resting: ${rungs}`,
+    `  cash waiting to be redeployed: ${(st.cash || 0).toFixed(2)} USDT · BTC price ${px}`,
+    `  running since ${st.startedAt || "just started"}`,
+    "",
+    "Reply ONLY this JSON, no prose:",
+    '{"read":"<what the record shows, max 25 words>",',
+    ' "concern":"<the single biggest risk RIGHT NOW, max 20 words>",',
+    ' "suggestion":"<one specific testable change, or null if the sample is too small>",',
+    ' "sampleTooSmall":true|false}',
+  ].join("\n");
+}
+
+function parseAccumReview(text) {
+  if (!text) return null;
+  const m = String(text).match(/\{[\s\S]*\}/);
+  if (!m) return null;
+  try {
+    const o = JSON.parse(m[0]);
+    return {
+      read: String(o.read || "").slice(0, 200),
+      concern: String(o.concern || "").slice(0, 200),
+      suggestion: o.suggestion == null ? null : String(o.suggestion).slice(0, 240),
+      sampleTooSmall: !!o.sampleTooSmall,
+    };
+  } catch { return null; }
+}
+
+// Cause → veto candidate. IMPORTANT: only losses are autopsied, so "this cause's trades lose"
+// is true by construction and proves nothing. What a label CAN prove is persistence: a failure
+// mode that keeps recurring across time is structural; one that clustered in a single bad week
+// was weather. So the bar is: a real sample overall, AND the cause appears in BOTH halves of the
+// autopsied timeline. A candidate is a NAMED, RECURRING failure mode — the veto itself must then
+// be written as a mechanical rule and earn its place through a shadow arm like everything else.
+// Advisory output only — the order path is not in this function's reach.
+function vetoCandidates(records) {
+  const done = records.filter(r => r.arm === "baseline" && r.R !== null && r.autopsy).sort((a, b) => a.at - b.at);
+  if (!done.length) return [];
+  const midAt = done[Math.floor(done.length / 2)].at;        // the autopsied timeline's midpoint
+  const byCause = new Map();
+  for (const r of done) {
+    if (!byCause.has(r.autopsy)) byCause.set(r.autopsy, []);
+    byCause.get(r.autopsy).push(r);
+  }
+  const meanOf = a => a.length ? +(a.reduce((x, r) => x + r.R, 0) / a.length).toFixed(3) : null;
+  const minEach = Math.max(2, Math.floor(VETO_MIN_N() / 3));
+  const out = [];
+  for (const [cause, rs] of byCause) {
+    if (cause === "unknown") continue;                       // "I don't know" is never a rule
+    const early = rs.filter(r => r.at < midAt).length, late = rs.length - early;
+    const candidate = rs.length >= VETO_MIN_N() && early >= minEach && late >= minEach;
+    out.push({ cause, n: rs.length, early, late, meanR: meanOf(rs), candidate });
+  }
+  return out.sort((a, b) => b.n - a.n);
+}
+
+// ═══════════════ THE ENTRY LAB (2026-08-20) ═══════════════
+// From John and Codex's pack, cut from eight arms to three for a reason that is arithmetic
+// rather than taste: this bot resolves about 10.7 trades a day, and the pack's own promotion
+// rule wants 60 resolved per arm. Three arms is 17 days to a verdict. Eight would be 45, and the
+// full eight-by-six entry/exit grid would be 268 days — longer than the strategy will stay
+// unchanged, which makes it not an experiment but a wish.
+//
+// The three are chosen to answer ONE question, the one the record cannot currently answer:
+//
+//     Are the losses because the SIGNALS are bad, or because the ENTRIES are late?
+//
+// That question is John's own weakness stated mechanically — "I panic and buy back higher" — and
+// until it is answered, every other tuning decision is guesswork.
+//
+//   immediate_marketable  the live behaviour, and therefore the baseline. Not a shadow.
+//   structure_retest      rest at the zone the move came from; EXPIRES rather than waiting for
+//                         ever, because an entry that never fills is not a better entry, it is
+//                         no trade — and pretending otherwise is how a retest arm flatters itself.
+//   no_chase_filter       skip when price has already travelled more than N ATR from the signal.
+//                         It RECORDS the skip. An arm that makes trades disappear cannot be
+//                         compared with one that takes them.
+//
+// Everything here is measurement. No arm but the live one places anything, nothing here filters,
+// scores, promotes, demotes or sizes, and the pattern taxonomy is deliberately absent: patterns
+// stay reference-only until one of them earns a hypothesis of its own.
+const ENTRY_LAB_KEY = "cipher_entry_lab";
+const ENTRY_ARMS = ["immediate_marketable", "structure_retest", "no_chase_filter"];
+
+// PURE. A signal in, the three arms' intents out. No venue, no clock, no I/O.
+function entryArmPlan(sig, bars, cfg = {}) {
+  const {
+    chaseAtr = num("LAB_CHASE_ATR", 1.0),      // "already travelled too far" in ATR from the trigger
+    expireBars = num("LAB_EXPIRE_BARS", 12),   // a retest that has not filled by then is no trade
+  } = cfg;
+  const { coin, dir, entry, stop, target, tf, at } = sig;
+  const isLong = dir !== "short";
+  const risk = Math.abs(entry - stop);
+  if (!(risk > 0) || !Number.isFinite(entry)) return null;
+
+  const atr = atrArr(bars, 14);
+  const a = atr[atr.length - 1];
+  const trigger = Number.isFinite(sig.triggerPx) ? sig.triggerPx : entry;
+  // How far price has ALREADY run from the bar that produced the signal, in ATR. This is the
+  // number "chased" actually means, and it is why the filter is expressed in ATR rather than
+  // percent: the same 1% is a shrug on DOGE and a lot on BTC.
+  const travelled = Number.isFinite(a) && a > 0 ? Math.abs(entry - trigger) / a : 0;
+
+  const zone = nearestZone(bars, dir);
+  const retestPx = zone ? (isLong ? zone.top : zone.bottom) : null;
+
+  return {
+    coin, dir, tf, at, risk, atr: a,
+    arms: [
+      { arm: "immediate_marketable", live: true, wants: entry, stop, target,
+        note: "what the bot actually does" },
+      { arm: "structure_retest", live: false,
+        wants: Number.isFinite(retestPx) ? retestPx : null, stop, target,
+        expireBars, zone: zone ? zone.src : null,
+        note: Number.isFinite(retestPx) ? "rest at the zone the move came from"
+                                        : "no zone within reach — this arm sits out and says so" },
+      { arm: "no_chase_filter", live: false,
+        wants: travelled <= chaseAtr ? entry : null, stop, target,
+        travelledAtr: +travelled.toFixed(3), chaseAtr,
+        skipped: travelled > chaseAtr,
+        note: travelled > chaseAtr
+          ? `skipped — price had already run ${travelled.toFixed(2)} ATR from the trigger`
+          : "took it, same price as live" },
+    ],
+  };
+}
+
+// PURE. Walk an arm's intent forward over bars and say what happened to it. Grades ONLY the
+// entry model — whether the venue would have taken the order is a different question, kept in a
+// different column, because blending them is exactly what the four-way split exists to prevent.
+function entryArmResolve(intent, forward) {
+  const isLong = intent.dir !== "short";
+  const { wants, stop, target } = intent;
+  const out = { arm: intent.arm, wouldFill: false, fillBar: null, fillPx: null,
+                mfeR: 0, maeR: 0, hitTarget: false, hitStop: false, expired: false,
+                skipped: !!intent.skipped, note: intent.note };
+  if (intent.skipped) { out.note = intent.note; return out; }          // recorded, not vanished
+  if (!Number.isFinite(wants)) { out.note = intent.note; out.noZone = true; return out; }
+
+  const limit = intent.expireBars || Infinity;
+  for (let i = 0; i < forward.length; i++) {
+    const b = forward[i];
+    if (!out.wouldFill) {
+      if (i >= limit) { out.expired = true; break; }                    // a retest that never came
+      const filled = isLong ? b.l <= wants : b.h >= wants;
+      if (filled) { out.wouldFill = true; out.fillBar = i; out.fillPx = wants; }
+      continue;
+    }
+    const risk = Math.abs(wants - stop) || 1;
+    const fav = isLong ? (b.h - wants) / risk : (wants - b.l) / risk;
+    const adv = isLong ? (wants - b.l) / risk : (b.h - wants) / risk;
+    out.mfeR = Math.max(out.mfeR, fav);
+    out.maeR = Math.max(out.maeR, adv);
+    if (Number.isFinite(target) && (isLong ? b.h >= target : b.l <= target)) { out.hitTarget = true; break; }
+    if (Number.isFinite(stop) && (isLong ? b.l <= stop : b.h >= stop)) { out.hitStop = true; break; }
+  }
+  out.mfeR = +out.mfeR.toFixed(3); out.maeR = +out.maeR.toFixed(3);
+  return out;
+}
+
+// ── DISCOVERED SETUPS (2026-08-24) ────────────────────────────────────────────────────────────
+// Rules found by the setup lab and stored in the repo. Loaded once per run, evaluated against bars
+// the scan has already fetched, and recorded as shadow decisions. Nothing here can place an order:
+// the only function it calls is shadowRecord, which writes to the experiment ledger.
+let _setupLab = undefined;          // undefined = not tried yet, null = unavailable
+async function setupLab() {
+  if (_setupLab !== undefined) return _setupLab;
+  _setupLab = null;
+  try {
+    // Dynamic, so the agent stays a single file that runs with or without the lab beside it.
+    // TWO LAYOUTS, because uploading a folder through a web UI does not always produce a folder:
+    // the lab may sit in setup-lab/, or its files may have landed loose in the repo root. A hard-
+    // coded path would have failed silently here — the import throws, the catch swallows it, and
+    // the whole arm stays dark with nothing in the log to say why. So try both and say which won.
+    let eng = null, from = null;
+    for (const dir of ["./setup-lab/", "./"]) {
+      try { eng = await import(dir + "engine.mjs"); from = dir; break; } catch {}
+    }
+    if (!eng) { console.log("setup lab: engine.mjs not found in setup-lab/ or the repo root — arm is off"); return _setupLab; }
+    let raw = null;
+    for (const f of ["setup-lab/survivors.json", "survivors.json"]) {
+      try { raw = JSON.parse(fs.readFileSync(f, "utf8")); break; } catch {}
+    }
+    console.log(`setup lab: loaded from ${from}`);
+    if (!Array.isArray(raw) || !raw.length) { console.log("setup lab: no survivors stored yet"); return _setupLab; }
+    // A rule using a condition this engine cannot compute would evaluate to false everywhere,
+    // which reads as "never fired" and is indistinguishable from a setup that simply does not
+    // trigger. Bench it by name instead — an unusable rule must never look like a quiet one.
+    const known = new Set(Object.keys(eng.CONDITION_NAMES || {}));
+    const usable = [], benched = [];
+    for (const r of raw.slice(0, num("SETUPS_MAX", 20))) {
+      const bad = (r.when || []).map(w => w.fn).filter(f => known.size && !known.has(f));
+      if (bad.length) benched.push(`${r.name} (${bad.join(", ")})`); else usable.push(r);
+    }
+    if (benched.length) console.log(`setup lab: benched ${benched.length} — ${benched.join(" · ")}`);
+    _setupLab = { eng, rules: usable };
+    console.log(`setup lab: ${usable.length} discovered setup(s) running in SHADOW — they place nothing`);
+  } catch (e) {
+    // Missing folder is the normal case, not an error worth shouting about.
+    if (!/Cannot find module|ENOENT/.test(String(e && e.message))) console.error("setup lab: unavailable —", e && e.message);
+  }
+  return _setupLab;
+}
+
+// Evaluate every stored setup on one coin's bars and record whatever fires. Pure bookkeeping.
+function shadowDiscovered(lab, SHADOW, coin, bars, meta) {
+  if (!lab) return 0;
+  let fired = 0;
+  for (const rule of lab.rules) {
+    const c = bars[rule.timeframe];
+    if (!c || c.length < 120) continue;
+    try {
+      const trades = lab.eng.runRule(c, rule);
+      if (!trades.length) continue;
+      const last = trades[trades.length - 1];
+      // Only a signal on the NEWEST closed bar is a live decision. An older one already happened
+      // and grading it now would be recording a trade we did not make at a price that has gone.
+      if (last.i < c.length - 2) continue;
+      shadowRecord(SHADOW, "discovered_setups", "variant",
+        { coin, dir: rule.dir, entry: last.entry, sl: last.stop, tp2: last.target, planTf: rule.timeframe },
+        { note: rule.name, ...meta });
+      fired++;
+    } catch { /* one bad rule must never stop the others, or the whole arm goes dark */ }
+  }
+  return fired;
+}
+
+const SHADOW_KEY = "cipher_shadow";
+const SHADOW_MIN_RESOLVED = 30;    // per arm, before a comparison means anything
+const SHADOW_MARGIN_R     = 0.05;  // variant must beat baseline by this much in mean R
+const SHADOW_MAX_RECORDS  = 600;   // keep the state file sane
+const SHADOW_GRADE_AFTER_H = 4;    // don't try to resolve a trade that has had no time to move
+const SHADOW_TIMEOUT_BARS = 40;    // same time cap the app's backtester uses
+
+// Bump this whenever a change alters what a grade MEANS. maker_entry and time_stop keep running
+// totals forever (sum / n / seen), so a guard that stops new bad gradings cannot repair the bad
+// ones already inside those sums — on 2026-09-12 the taker arm read +0.671R/decision over n=1501,
+// roughly ten times anything the realised book has ever produced. The stamp lives on each arm's
+// own slot, so the wipe happens once per arm and the arms then refill under current rules only.
+const SHADOW_GRADER_REV = "2026-09-12-window-guard";
+
+// True exactly once per slot per revision, and only when there is something to throw away.
+function staleArms(slot) {
+  if (slot.graderRev === SHADOW_GRADER_REV) return false;
+  const had = !!(slot.arms && Object.keys(slot.arms).length);
+  slot.graderRev = SHADOW_GRADER_REV;
+  return had;
+}
+
+async function loadShadow() { return (await getJSON(SHADOW_KEY, {})) || {}; }
+async function saveShadow(sh) { await setJSON(SHADOW_KEY, sh); }
+
+function shadowSlot(sh, id) {
+  if (!sh[id]) sh[id] = { records: [], promoted: false, history: [] };
+  return sh[id];
+}
+
+// A decision, with everything needed to grade it later. `arm` is "baseline" or "variant".
+// Duplicate offers refused this run — reported on the rank_vs_threshold summary line.
+let SHADOW_DUPS_THIS_RUN = 0;
+
+function shadowRecord(sh, id, arm, t, meta) {
+  const slot = shadowSlot(sh, id);
+  const rtf = t.planTf || t.tf || "1D";
+  const rentry = +t.entry, rstop = +t.sl;
+  // ── ONE RECORD PER DECISION, NOT ONE PER RUN (2026-09-12) ────────────────────────────────────
+  // The scanner re-offers the same candidate every run for as long as the structure holds, and
+  // every offer used to become its own record. Measured on 2026-09-12: a single ADA 1D short was
+  // on file FOURTEEN times across 23 hours, every copy scored −1, and the 322 graded records in
+  // the state file were only **183 distinct setups** — the 91 records on 1D were just 19.
+  //
+  // Duplicates are not extra evidence. An identical entry and stop resolve identically, so they
+  // inflate every n, and because the copies are perfectly correlated they also shrink every
+  // confidence interval towards a precision the data does not contain. The promotion gate reads
+  // exactly those counts (n ≥ SHADOW_MIN_RESOLVED, both halves the same sign), so thirty
+  // "records" could be six setups seen five times each — which is how a lever gets promoted on
+  // evidence that was never there. It is also the likeliest reason the relative-strength ladder
+  // looked monotonic on record counts and then inverted.
+  //
+  // An exact repeat of arm+coin+dir+tf+entry+stop is the same idea being re-offered, never a
+  // second independent one: these levels come off live structure as floats and do not recur by
+  // coincidence. So it is counted ONCE for as long as it stays on file. The arm is part of the
+  // identity on purpose — baseline and variant are meant to score the same decision, and
+  // dropping the variant's copy would break the comparison the experiment exists to make.
+  const dup = slot.records.find(r => r.arm === arm && r.coin === t.coin && r.dir === t.dir
+                                  && (r.tf || "1D") === rtf && r.entry === rentry && r.stop === rstop);
+  if (dup) { SHADOW_DUPS_THIS_RUN++; return; }
+  slot.records.push({
+    at: Date.now(), arm, coin: t.coin, dir: t.dir, tf: rtf,
+    entry: rentry, stop: rstop, target: +(t.tp2 ?? t.tp1),
+    quality: meta && meta.quality, note: meta && meta.note,
+    reg: (meta && meta.reg) || null,            // "bull" | "bear" at the moment of the decision
+    rs: (meta && meta.rs) != null ? meta.rs : null,  // 1 = trading the field's leader in your direction
+    regDist: (meta && meta.regDist) ?? null,    // how far BTC was from its 200D line, in %
+    breadth: (meta && meta.breadth) ?? null,    // share of scanned coins above their own 200D
+    R: null,                                    // filled in by grading, later
+  });
+  if (slot.records.length > SHADOW_MAX_RECORDS) slot.records = slot.records.slice(-SHADOW_MAX_RECORDS);
+}
+
+// Walk real candles forward from the decision and score it in R. Stop is checked BEFORE target
+// within a candle — the pessimistic reading, same as the app's backtester. Anything still open
+// after the time cap is marked to market.
+// The single candle walk every grader in this file uses. Returns { R, how, ambiguous } — `how` is
+// "stop" | "target" | "timeout" — or null while the decision is still open. One implementation on
+// purpose: two arms compared by two different walks are not compared at all.
+// `capBars` overrides the time cap, in bars OF THE CANDLES PASSED IN, so the same decision can be
+// re-walked at a finer resolution over the same wall-clock horizon.
+function walkDecision(rec, candles, capBars) {
+  const risk = Math.abs(rec.entry - rec.stop);
+  if (!(risk > 0) || !candles || !candles.length) return null;
+  const isLong = rec.dir !== "short";
+  const start = decisionBar(rec, candles);   // −1 if the window cannot reach the decision
+  if (start < 0) return null;
+  const cap = capBars || SHADOW_TIMEOUT_BARS * (rec.tfMult || 4);
+  for (let i = start; i < candles.length; i++) {
+    const c = candles[i];
+    const hitStop = isLong ? c.l <= rec.stop : c.h >= rec.stop;
+    const hitTgt  = isLong ? c.h >= rec.target : c.l <= rec.target;
+    if (hitStop && hitTgt) rec.ambiguous = (rec.ambiguous || 0) + 1;   // counted, never hidden
+    // Stop before target inside one bar — the pessimistic reading. Correct at a resolution where
+    // a single bar cannot hold both; a lie at one where it can. That is what SECOND_OPINION_TF
+    // exists to measure rather than assume.
+    if (hitStop) return { R: -1, how: "stop", ambiguous: hitTgt };
+    if (hitTgt) return { R: +Math.abs(rec.target - rec.entry) / risk, how: "target", ambiguous: false };
+    // The cap is 40 bars OF THE SIGNAL'S timeframe. Graded on a finer one, that is 4x as many
+    // bars — otherwise a 4H idea would be marked to market after less than a day.
+    if (i - start >= cap) {
+      return { R: (isLong ? c.c - rec.entry : rec.entry - c.c) / risk, how: "timeout", ambiguous: false };
+    }
+  }
+  return null;                                  // not enough candles yet — leave it open
+}
+
+function gradeOne(rec, candles) {
+  const g = walkDecision(rec, candles);
+  return g ? g.R : null;
+}
+
+// ── GRADE ON A FINER TIMEFRAME THAN THE SIGNAL (2026-08-18) ──────────────────────────────────
+// gradeOne checks the stop BEFORE the target inside each candle, which is the right pessimism —
+// but applied to the SIGNAL's own timeframe it is ruinous. A 4H candle is wide enough to contain
+// both a 1R stop and a 2.25R target most of the time, so every such bar scored as a loss. The
+// live evidence on 2026-08-18: of 43 graded 4H records, **43 were losses**. Not a market fact,
+// an artefact of the resolution it was measured at — and this grader is what decides which rules
+// get promoted, so it was quietly corrupting every conclusion the shadow framework reached.
+//
+// Walking the timeframe BELOW the signal cuts the candles that can contain both levels by 4x.
+// The same reasoning the confirmation watcher already uses.
+const GRADE_TF_BELOW = { "1D": "4H", "4H": "1H", "1H": "30m", "30m": "15m", "15m": "15m" };
+
+// ── SECOND OPINION ON THE WIDEST SIGNALS (2026-09-12) ────────────────────────────────────────
+// The 2026-08-18 fix above moved grading one timeframe DOWN because a bar wide enough to contain
+// both the stop and the target always scores as a loss (the stop is checked first). It was
+// verified on 4H signals — and never checked on 1D ones, whose stops are roughly twice as wide:
+// median 6.6% against 3.6%, with the target out at 14.8%. A 4H crypto bar spans that often.
+//
+// The live evidence on 2026-09-12: every one of the 19 distinct 1D setups on file had scored
+// EXACTLY −1. Nineteen for nineteen, zero variance. Strip them out and the whole graded book
+// moves from −0.130R to −0.030R and the "shorts are the problem" reading loses most of its
+// weight — so whether that block is the market or the measurement decides what gets changed next.
+//
+// This re-walks each already-graded 1D decision on 1H bars under identical rules and an equal
+// wall-clock cap, then logs how often the finer resolution disagrees. It is advisory: `R` is
+// never touched, nothing is filtered, no gate reads `R2`. If 1H keeps saying "stop", 1D shorts
+// are a real finding and can be acted on. If it says "target" where 4H said "stop", the 4H grade
+// is an artefact and every conclusion drawn from those records has to go.
+const SECOND_OPINION_TF   = { "1D": "1H" };   // signal timeframe → finer timeframe to re-check on
+const SECOND_OPINION_MULT = { "1D": 24 };     // finer bars per signal bar, to keep the cap equal
+
+async function gradeShadow(sh) {
+  const cutoff = Date.now() - SHADOW_GRADE_AFTER_H * 3600e3;
+  const need = new Map();                        // coin|tf → the records waiting on it
+  for (const id of Object.keys(sh)) {
+    const slot = sh[id];
+    if (!slot || !Array.isArray(slot.records)) continue;   // not a grading slot — skip, never throw
+    for (const rec of slot.records) {
+      if (rec.R !== null || rec.at > cutoff) continue;
+      const gtf = GRADE_TF_BELOW[rec.tf || "1D"] || "1H";
+      const k = rec.coin + "|" + gtf;
+      if (!need.has(k)) need.set(k, []);
+      need.get(k).push(rec);
+    }
+  }
+  let graded = 0;
+  for (const [k, recs] of need) {
+    const [coin, gtf] = k.split("|");
+    let candles = null;
+    // 600 bars of the finer timeframe covers a longer stretch of history than 300 of the coarser
+    // one did, so a decision cannot age out of the window before it resolves.
+    try { candles = await fetchCandles(coin, gtf, 600); } catch {}
+    if (!candles) continue;
+    for (const rec of recs) {
+      const R = gradeOne(rec, candles);
+      if (R !== null) { rec.R = +R.toFixed(3); rec.gtf = gtf; graded++; }
+    }
+  }
+  await secondOpinion(sh);
+  return graded;
+}
+
+// Re-walk graded decisions whose timeframe has a SECOND_OPINION_TF, at that finer resolution.
+// Measures the grader against itself; changes nothing it reads.
+async function secondOpinion(sh) {
+  const need = new Map();
+  for (const id of Object.keys(sh)) {
+    const slot = sh[id];
+    if (!slot || !Array.isArray(slot.records)) continue;
+    for (const rec of slot.records) {
+      const ftf = SECOND_OPINION_TF[rec.tf || ""];
+      if (!ftf || rec.R === null || rec.R === undefined || rec.R2 !== undefined) continue;
+      const k = rec.coin + "|" + ftf;
+      if (!need.has(k)) need.set(k, []);
+      need.get(k).push(rec);
+    }
+  }
+  if (!need.size) return;
+  const cmp = { n: 0, agree: 0, flip: 0, sum: 0, sum2: 0, stop2: 0, tgt2: 0, to2: 0 };
+  for (const [k, recs] of need) {
+    const [coin, ftf] = k.split("|");
+    let candles = null;
+    try { candles = await fetchCandles(coin, ftf, 600); } catch { }
+    if (!candles) continue;
+    for (const rec of recs) {
+      const cap = SHADOW_TIMEOUT_BARS * (SECOND_OPINION_MULT[rec.tf] || 24);
+      const g = walkDecision(rec, candles, cap);
+      if (!g) continue;                          // finer window can't reach it — try a later run
+      rec.R2 = +g.R.toFixed(3); rec.how2 = g.how; rec.gtf2 = ftf;
+      cmp.n++; cmp.sum += rec.R; cmp.sum2 += rec.R2;
+      if ((rec.R > 0) === (rec.R2 > 0)) cmp.agree++;
+      else if (rec.R <= 0 && rec.R2 > 0) cmp.flip++;      // graded a loss, finer says a win
+      if (g.how === "stop") cmp.stop2++; else if (g.how === "target") cmp.tgt2++; else cmp.to2++;
+    }
+  }
+  if (cmp.n) console.log(`shadow second opinion: ${cmp.n} re-walked finer · graded mean `
+    + `${(cmp.sum / cmp.n).toFixed(3)}R · finer mean ${(cmp.sum2 / cmp.n).toFixed(3)}R · agree `
+    + `${cmp.agree}/${cmp.n} · graded-loss-but-finer-win ${cmp.flip} · finer outcomes: `
+    + `${cmp.stop2} stop / ${cmp.tgt2} target / ${cmp.to2} timeout`);
+}
+
+function armStats(records, arm) {
+  const done = records.filter(r => r.arm === arm && r.R !== null);
+  if (!done.length) return { n: 0, meanR: 0, wins: 0, longs: 0, shorts: 0, spanH: 0 };
+  const sum = done.reduce((a, r) => a + r.R, 0);
+  const ts = done.map(r => r.at).filter(Number.isFinite);
+  // Direction and span are recorded because a count on its own cannot tell the difference between
+  // fifty-seven tests and one test run fifty-seven times. See the gate below.
+  return { n: done.length, meanR: +(sum / done.length).toFixed(3), wins: done.filter(r => r.R > 0).length,
+           longs: done.filter(r => r.dir !== "short").length,
+           shorts: done.filter(r => r.dir === "short").length,
+           spanH: ts.length ? +((Math.max(...ts) - Math.min(...ts)) / 3.6e6).toFixed(1) : 0 };
+}
+
+// Promotion and demotion, on evidence only. Both arms need a real sample: a variant that beats a
+// baseline of four trades has proved nothing, and this is exactly where a system talks itself
+// into a change it likes the look of.
+// ── A SAMPLE IS NOT EVIDENCE UNTIL IT HAS BEEN TESTED BOTH WAYS (2026-08-21) ─────────────────
+// Caught on 2026-08-21, and it is the most expensive kind of wrong this file can be: a rule that
+// was promoted for being right, when it had only ever been asked an easy question.
+//
+// The record at the moment of the audit:
+//     every LONG   113 trades, 113 wins, 100%
+//     every SHORT   51 trades,   0 wins,   0%
+// Across thirty-five hours in which Bitcoin went up and did not stop. The variant arm — the one
+// the gate promoted, on a flawless 57 from 57 — contained NOT ONE SHORT. It scored perfectly
+// because it happened to hold only longs during a rally, and the gate had no way to notice: it
+// checked the count, the edge, and that the winner made money, all of which were true.
+//
+// Counting trades measures how long you looked. It does not measure how much you saw. So the
+// gate now also asks whether the sample contains both directions and spans more than one mood
+// of market. A variant that has never been short has not been tested; it has been flattered.
+const SHADOW_MIN_SIDE   = 10;   // at least this many LONGS and this many SHORTS, in each arm
+const SHADOW_MIN_SPAN_H = 168;  // and the decisions must span at least a week, not a good afternoon
+function armTested(a) {
+  return a.longs >= SHADOW_MIN_SIDE && a.shorts >= SHADOW_MIN_SIDE && a.spanH >= SHADOW_MIN_SPAN_H;
+}
+function whyNotTested(a) {
+  const gaps = [];
+  if (a.longs < SHADOW_MIN_SIDE) gaps.push(`only ${a.longs} longs`);
+  if (a.shorts < SHADOW_MIN_SIDE) gaps.push(a.shorts === 0 ? "not one short" : `only ${a.shorts} shorts`);
+  if (a.spanH < SHADOW_MIN_SPAN_H) gaps.push(`only ${Math.round(a.spanH)}h of decisions`);
+  return gaps.join(", ");
+}
+
+function shadowJudge(sh, id) {
+  const slot = shadowSlot(sh, id);
+  const base = armStats(slot.records, "baseline"), varr = armStats(slot.records, "variant");
+  const counted = base.n >= SHADOW_MIN_RESOLVED && varr.n >= SHADOW_MIN_RESOLVED;
+  const tested = armTested(base) && armTested(varr);
+  const ready = counted && tested;
+  const edge = +(varr.meanR - base.meanR).toFixed(3);
+  let changed = null, why = null;
+
+  // Unwind anything promoted before this bar existed. A promotion granted on evidence that would
+  // not be accepted today is not grandfathered — it is exactly the thing being corrected.
+  if (slot.promoted && !tested) {
+    slot.promoted = false; changed = "demoted";
+    why = `promoted on a sample that was never really tested — ${whyNotTested(varr) || whyNotTested(base)}. Back to the baseline rule until the evidence covers both directions over at least a week.`;
+    slot.history.push({ at: Date.now(), changed, why, base, varr, edge });
+    return { ready, tested, base, varr, edge, promoted: false, changed, why };
+  }
+  // ── BEATING A LOSER IS NOT WINNING (2026-08-18) ──────────────────────────────────────────────
+  // On 2026-08-18 this gate promoted rank_vs_threshold on an edge of +0.084R — while the variant
+  // was losing 0.705R a trade and the baseline 0.789R. "Better than the incumbent" was the only
+  // test, so the system handed control to a rule that loses money, because it lost slightly less.
+  // A relative test needs an absolute floor underneath it or it will always find a winner.
+  const variantPays = varr.meanR > 0;
+  if (ready && !slot.promoted && edge >= SHADOW_MARGIN_R && variantPays) {
+    slot.promoted = true; changed = "promoted";
+  } else if (ready && slot.promoted && (edge < 0 || varr.meanR <= 0)) {
+    // Demoted either for falling behind the baseline OR for simply not making money. The second
+    // clause also unwinds any promotion granted before the floor existed.
+    slot.promoted = false; changed = "demoted";
+  }
+  if (changed) slot.history.push({ at: Date.now(), changed, why, base, varr, edge });
+  return { ready, tested, base, varr, edge, promoted: slot.promoted, changed, why };
+}
+
+// ═══════════ THE ACCUMULATOR, RUN INDEPENDENTLY OF THE FUTURES BOT (2026-08-19) ═══════════
+// Pulled out of the scan loop for a reason found the hard way. The accumulator used to sit below
+// the `MODE=off — agent idle` return, so the SPOT strategy was silently governed by the FUTURES
+// bot's mode. On 2026-08-19 the relay's /config read timed out, the agent fell back to the
+// workflow's MODE=off, went idle, and the accumulator never ran at all — John sat watching dots
+// print on a chart while the thing meant to act on them had already returned.
+//
+// These are two different strategies on two different products. The futures scanner is governed
+// by MODE; the accumulator is governed by ACCUM and ACCUM_EXEC. KILL still stops both, because
+// sendSpotOrder checks it on the order path where it cannot be missed.
+
+// ═══════════════ ACCUMULATOR BOOKS (2026-08-22) ═══════════════
+// John: "the rails work really well with the spot so we just make a button for it and test it."
+//
+// The rails are the good part — buildSpotOrder's scale handling, sendSpotOrder's three brakes,
+// the book-follows-the-wallet rollback. None of that is coin-specific. What WAS coin-specific was
+// everything around it: one storage key, one coin from env, one arming flag. So the accumulator
+// could only ever be one thing on one coin.
+//
+// A "book" is that missing noun. Each one is a completely separate strategy instance with its own
+// coin, its own storage, its own arming and its own scoreboard. They cannot see each other and
+// cannot spend each other's balance.
+//
+// ── WHY THIS IS WORTH DOING AT ALL ────────────────────────────────────────────────────────────
+// Measured 2026-08-22 across 12 symbols, 3 years, unit-denominated against buy-and-hold:
+//   BTC −2.0%  ETH −7.1%  DOGE −7.5%   ← the losers, and BTC is the only coin deployed
+//   XRP +67.9%  BNB +11.8%  ADA +51.8%  LINK +38.0%  AVAX +55.1%  DOT +60.7%  ATOM +68.4%
+// Correlation of unit gain with realised volatility: +0.44. BTC has the LOWEST vol in the set
+// (47% against 76–91% for the alts) and is close to the worst performer. Sell-the-pump-buy-the-dip
+// needs pumps to sell and dips to buy back; it has been deployed on the trendiest, quietest coin
+// available.
+//
+// The honest caveat, carried here so it cannot get lost: correlation with PRICE change is −0.48,
+// and all six coins whose price FELL accumulated units. Ending with 68% more ATOM while ATOM fell
+// 83% is not a win. Only XRP (+106% price, +67.9% units) and BNB (+174% price, +11.8% units) both
+// rose AND accumulated. Those two are the honest candidates; the rest of that column is a
+// downtrend harvester.
+//
+// ── EVERY NEW BOOK IS MEASURE-ONLY UNTIL EXPLICITLY ARMED ─────────────────────────────────────
+// Not a default that can be flipped by accident. A book arms only when its own spec says "armed"
+// AND the global ACCUM_EXEC is armed — two independent switches, because the failure that costs
+// real money here is a book quietly inheriting permission it was never given. It also cannot do
+// anything useful armed without that coin funded in the SPOT wallet, which is a third, physical
+// brake.
+const ACCUM_BOOK_COINS = ["BTC","ETH","SOL","XRP","BNB","DOGE","ADA","LINK","AVAX","LTC","DOT","ATOM"];
+
+// Storage keys. BTC keeps the original unsuffixed keys on purpose: the live book has real history
+// in them, and renaming it would orphan that and reseed from the wallet as if it were new.
+const accumKeyFor = coin => coin === "BTC" ? ACCUM_KEY : `${ACCUM_KEY}_${coin}`;
+const flipKeyFor = coin => coin === "BTC" ? LIVE_FLIP_KEY : `${LIVE_FLIP_KEY}_${coin}`;
+
+// The BTC book, defined exactly by the env vars that define it today, so nothing changes for it.
+function primaryAccumBook() {
+  return {
+    coin: ACCUM_COIN(),
+    key: accumKeyFor(ACCUM_COIN()),
+    flipKey: flipKeyFor(ACCUM_COIN()),
+    enabled: String(env("ACCUM", "1")) === "1",
+    exec: String(env("ACCUM_EXEC", "dry")),
+    flipTf: String((CFG.accumFlipTf && CFG.accumFlipTf()) || "off"),
+    trigger: env("ACCUM_TRIGGER", "pump1"),
+    primary: true,
+    virtualUsdt: 0,          // never virtual — this book tracks the real wallet
+    cfg: {},
+  };
+}
+
+// Extra books, parsed from "XRP:ladder,SOL:30m" — coin, then either "ladder" or a flip timeframe.
+// An optional third field arms it: "XRP:ladder:armed". Anything unrecognised is dropped with a
+// line in the log rather than guessed at, and the parse never throws.
+function parseAccumBooks(spec) {
+  const out = [];
+  if (!spec) return out;
+  for (const raw of String(spec).split(",")) {
+    const part = raw.trim();
+    if (!part) continue;
+    const [coinRaw, stratRaw, armRaw] = part.split(":").map(s => (s || "").trim());
+    const coin = String(coinRaw || "").toUpperCase();
+    if (!ACCUM_BOOK_COINS.includes(coin)) { console.log(`accum books: ignoring unknown coin "${coinRaw}"`); continue; }
+    if (coin === ACCUM_COIN()) { console.log(`accum books: ignoring ${coin} — that is the primary book`); continue; }
+    if (out.some(b => b.coin === coin)) { console.log(`accum books: ignoring duplicate ${coin}`); continue; }
+    const strat = String(stratRaw || "ladder").toLowerCase();
+    let flipTf = "off";
+    if (strat !== "ladder") {
+      const hit = FLIP_TFS.find(t => t.toLowerCase() === strat);
+      if (!hit) { console.log(`accum books: ignoring ${coin} — "${stratRaw}" is not "ladder" or a flip timeframe`); continue; }
+      flipTf = hit;
+    }
+    // Two switches, both required. A book asking to be armed while the global is dry stays dry.
+    const wantsArm = String(armRaw || "").toLowerCase() === "armed";
+    const globalArmed = String(env("ACCUM_EXEC", "dry")) === "armed";
+    const exec = wantsArm && globalArmed ? "armed" : "dry";
+    if (wantsArm && !globalArmed) console.log(`accum books: ${coin} asked to be armed but ACCUM_EXEC is dry — staying measure-only`);
+    out.push({
+      coin, key: accumKeyFor(coin), flipKey: flipKeyFor(coin),
+      enabled: true, exec, flipTf,
+      trigger: env("ACCUM_TRIGGER", "pump1"),
+      primary: false,
+      // A measure-only book has no wallet to seed from, and the accumStep default of 1 unit is
+      // worthless on a sub-dollar coin — a 20% slice lands under the venue minimum and every sell
+      // is refused, so the book reports healthy while doing nothing at all. Seed a NOTIONAL.
+      virtualUsdt: num("ACCUM_BOOK_USDT", 1000),
+      cfg: {},
+    });
+  }
+  return out;
+}
+
+function accumBooks() {
+  const books = [];
+  const p = primaryAccumBook();
+  if (p.enabled) books.push(p);
+  const spec = (CFG.accumBooks && CFG.accumBooks()) || env("ACCUM_BOOKS", "");
+  for (const b of parseAccumBooks(spec)) books.push(b);
+  return books;
+}
+
+// Run every book in turn. One book throwing must never stop the others — they are independent
+// strategies that happen to share a process, and a bad symbol on one should not silence the rest.
+async function runAccumulators() {
+  const books = accumBooks();
+  if (books.length > 1) {
+    console.log(`accumulator books: ${books.map(b => `${b.coin}/${b.flipTf === "off" ? "ladder" : b.flipTf}${b.exec === "armed" ? " ARMED" : ""}`).join(" · ")}`);
+  }
+  for (const b of books) {
+    try { await runAccumulator(b); }
+    catch (e) { console.error(`accumulator book ${b.coin} failed (isolated, the others still ran):`, e && e.message); }
+  }
+}
+
+async function runAccumulator(book = primaryAccumBook()) {
+  // ── A SECOND OBJECTIVE: UNITS, NOT MONEY ────────────────────────────────────────────────────
+  // Everything else in this file is trying to make pounds. This is trying to end the year with
+  // more BTC than it started with, which is a different question with a different scoreboard —
+  // buy-and-hold finishes with EXACTLY the starting units, always, and that is the line to beat.
+  //
+  // It runs on SPOT, never futures: on a perpetual you never own a coin, so "more BTC" is not a
+  // thing that can happen. Its decision core (accumStep, accumFlipStep, liveFlipStep) is pure —
+  // bars in, state and events out, no venue and no clock. Only the spot rails below it can put
+  // an order on the wire, and every one of those goes through sendSpotOrder's three brakes.
+  if (book.enabled) {
+    try {
+      const coin = book.coin;
+      // Read-only preflight: report whether spot is actually usable here. No orders.
+      let PF = null;
+      if (String(env("ACCUM_PREFLIGHT", "1")) === "1") {
+        try {
+          PF = await spotPreflight(coin);
+          const prod = PF.product
+            ? `scales price/base/quote ${PF.product.priceScale}/${PF.product.baseValueScale}/${PF.product.quoteValueScale}`
+            : "NOT FOUND";
+          console.log(`spot preflight: ${PF.symbol} — products ${PF.productsRead ? PF.spotSymbolCount + " spot symbols" : "UNREADABLE"} · ${prod} · wallet http ${PF.walletStatus ?? "?"}${PF.balances ? " · holding " + (PF.balances.join(", ") || "nothing") : ""}${PF.walletErr ? " · wallet error " + PF.walletErr : ""}${PF.productsErr ? " · products error " + PF.productsErr : ""}`);
+          // A console line lives only in the Actions log, which is not where John looks. The
+          // verdict belongs in the state file so the app can show it plainly.
+          PF.ready = !!(PF.product && Number.isFinite(PF.product.baseValueScale)
+                        && Number.isFinite(PF.product.quoteValueScale) && PF.walletStatus === 200
+                        && (PF.balances || []).length > 0);
+          PF.why = !PF.product ? "no spot market for this coin"
+                 : !Number.isFinite(PF.product.baseValueScale) ? "could not read the value scales"
+                 : PF.walletStatus !== 200 ? "spot wallet unreadable"
+                 : !(PF.balances || []).length ? "the SPOT wallet is empty — it needs funding before it can trade"
+                 : "ready";
+          PF.checkedAt = Date.now();
+        } catch (e) { console.error("spot preflight failed (read-only, harmless):", e && e.message); }
+      }
+      const bars = await fetchCandles(coin, "1D", 260);
+      if (bars && bars.length >= 60) {
+        let state = await getJSON(book.key, null);
+        // ── SEED FROM THE REAL WALLET (2026-08-19) ─────────────────────────────────────────────
+        // Until the spot wallet was funded this held a virtual 1.0 unit so the maths could be
+        // watched. Now there is a real balance, so the strategy tracks THAT — otherwise the
+        // panel reports a fiction and the order sizes bear no relation to what is actually there.
+        // Seeded once; after that the strategy's own bookkeeping owns the number, because a
+        // mid-cycle wallet read would double-count a slice that is currently sitting in cash.
+        if (book.primary && PF && Number.isFinite(PF.baseBalance) && PF.baseBalance > 0 && (!state || !state.seededReal)) {
+          const carried = state || {};
+          state = { ...carried, units: PF.baseBalance, cash: Number.isFinite(PF.quoteBalance) ? PF.quoteBalance : 0,
+                    startUnits: PF.baseBalance, coreUnits: null, highWater: PF.baseBalance,
+                    open: [], sells: carried.sells || 0, fills: carried.fills || 0,
+                    seededReal: true, seededAt: new Date().toISOString(), startedAt: carried.startedAt || null };
+          console.log(`accumulator seeded from the real spot wallet: ${PF.baseBalance} ${coin}` +
+                      (Number.isFinite(PF.quoteBalance) && PF.quoteBalance > 0 ? ` + ${PF.quoteBalance} USDT` : ""));
+          await pushLog({ coin, result: "ACCUM SEEDED",
+            skipped: `spot wallet funded — tracking the real balance of ${PF.baseBalance} ${coin} from here. Benchmark is that same number held and never traded.` });
+        }
+        // ── A VIRTUAL BOOK NEEDS A REALISTIC STACK, NOT ONE UNIT ──────────────────────────────
+        // accumStep defaults to units:1. On BTC that is a $65k stack and everything works. On XRP
+        // it is fifty cents, a 20% slice is a ten-cent order, and buildSpotOrder/the venue minimum
+        // refuse every one — the book then reports itself healthy while never trading. That exact
+        // bug invalidated seven of twelve symbols in the backtest before it was caught, so the
+        // measure-only books are seeded to a dollar notional instead.
+        if (!book.primary && book.virtualUsdt > 0 && (!state || !state.seededVirtual)) {
+          const px0 = bars[bars.length - 1].c;
+          const carried = state || {};
+          const u0 = book.virtualUsdt / px0;
+          state = { ...carried, units: u0, cash: 0, startUnits: u0, coreUnits: null, highWater: u0,
+                    open: [], sells: 0, fills: 0, seededVirtual: true, virtualUsdt: book.virtualUsdt,
+                    seededAt: new Date().toISOString(), startedAt: carried.startedAt || null };
+          console.log(`accumulator book ${coin}: seeded a VIRTUAL ${book.virtualUsdt} USDT stack = ${u0.toFixed(8)} ${coin} at ${formatPrice(px0)} (measure only)`);
+        }
+        const all = [];
+        // The book must follow the wallet. Snapshot before anything is applied, so an armed buy
+        // that never reached the venue can be unwound rather than absorbed.
+        const ladderArmed = book.exec === "armed";
+        const stateBefore = JSON.parse(JSON.stringify(state));
+        let ladderUnplaced = null;
+
+        // 1) FILLS — every run, against every 15-minute bar closed since the last check, so a
+        //    3am wick through a rung is caught when it happens rather than at the daily close.
+        try {
+          const fine = await fetchCandles(coin, "15m", 200);
+          if (fine && fine.length) {
+            const f = accumFillPass(state, fine, book.cfg);
+            state = f.st; all.push(...f.events);
+          }
+        } catch (e) { console.error("accumulator intraday fills skipped:", e && e.message); }
+
+        // 2) THE DAILY DECISION — the red dot only exists on a closed daily bar.
+        // Which book owns the coins this run? "off" (the default) means the ladder, exactly as
+        // before. A timeframe means the dot flip — but only once the ladder's resting rungs have
+        // all filled, because until then the ladder still has cash out against those coins and
+        // handing the same balance to a second strategy would sell it twice.
+        const flipWant = String(book.flipTf || "off");
+        const wantLower = flipWant.toLowerCase();
+        const isDotLadder = wantLower === "dotladder";
+        const flipTf = (wantLower === "off" || isDotLadder) ? null
+                     : (FLIP_TFS.find(t => t.toLowerCase() === wantLower) || null);
+        if (wantLower !== "off" && !isDotLadder && !flipTf) console.log(`accumulator: unknown flip timeframe "${flipWant}" — ladder keeps the coins`);
+        const flipBlocked = (!!flipTf || isDotLadder) && state.open && state.open.length > 0;
+        const flipOwns = (!!flipTf || isDotLadder) && !flipBlocked;
+
+        const d = accumStep(state, bars, flipOwns
+          ? { ...book.cfg, paused: true, pausedWhy: `the ${flipTf} dot flip holds the coins — ladder stood down` }
+          : { ...book.cfg });
+        state = d.st; all.push(...d.events);
+
+        const px = bars[bars.length - 1].c;
+        const units = accumUnits(state, px);
+        if (all.length) {
+          await setJSON(book.key, state);
+          for (const e of all) {
+            if (e.kind === "sell") {
+              // SPOT, never futures: you cannot accumulate coins on a perpetual. Dry unless armed.
+              let execNote = "Measure only — no order placed.";
+              try {
+                const prods = await spotProducts();
+                const built = buildSpotOrder(coin, "Sell", { price: e.px, baseQty: e.units }, prods);
+                if (built.err) execNote = `Spot order NOT built: ${built.err}`;
+                else {
+                  const r = await sendSpotOrder(built.order, e.units * e.px, { exec: book.exec });
+                  execNote = r.ok ? `SPOT SELL PLACED (${built.order.clOrdID})`
+                          : r.dry ? `dry run — would have sent a SPOT sell (${r.why})`
+                                  : `spot sell refused: ${r.error}`;
+                  execNote += fmtSpotDebug(built.debug);   // DIAGNOSTIC, see buildSpotOrder — 2026-09-07
+                }
+              } catch (err) { execNote = "spot path errored (no order sent): " + (err && err.message); }
+              await pushLog({ coin, result: "ACCUM SELL",
+                skipped: `sold 20% of the tradeable stack at ${formatPrice(e.px)} — ${e.how || "signal"}, money flow negative; buy-backs laddered at ${e.rungs.join(", ")}. ${execNote}` });
+            }
+            // ── THE BUY-BACK HAS TO BE A REAL ORDER (2026-08-21) ─────────────────────────
+            // Found while wiring the expiry rule, and it is the more serious of the two: the
+            // SELL side placed a real spot order, and the BUY side only wrote a log line. A
+            // ladder that sells real coins and buys them back in fiction is not a ladder — it is
+            // a one-way sale, and the book would have drifted from the wallet on the very first
+            // rung. It has never fired live (the dot flip has held the coins since 19 Aug and the
+            // ladder's own record is 0 sells, 0 fills), so nothing is lost yet — but it would
+            // have gone wrong the moment John switched the flip off.
+            //
+            // Same three brakes as every other spot order, and the same discipline the live flip
+            // already uses: if we were armed and the order did not reach the venue, the book is
+            // rolled back rather than carrying on from a purchase that never happened.
+            if (e.kind === "fill" || e.kind === "expire") {
+              const isExpiry = e.kind === "expire";
+              let execNote = "Measure only — no order placed.";
+              try {
+                const prods = await spotProducts();
+                const walletQuote = PF && Number.isFinite(PF.quoteBalance) ? PF.quoteBalance : null;
+                const spend = walletQuote != null ? Math.min(Number(e.usdt) || 0, walletQuote) : (Number(e.usdt) || 0);
+                if (!(spend > 0)) execNote = "nothing to spend on this rung — no order sent.";
+                else {
+                  const built = buildSpotOrder(coin, "Buy", { price: e.px, quoteQty: spend }, prods);
+                  if (built.err) { execNote = `Spot order NOT built: ${built.err}`; if (ladderArmed) ladderUnplaced = built.err; }
+                  else {
+                    const r2 = await sendSpotOrder(built.order, spend, { exec: book.exec });
+                    execNote = r2.ok ? `SPOT BUY PLACED (${built.order.clOrdID})`
+                             : r2.dry ? `dry run — would have sent a SPOT buy (${r2.why})`
+                                      : `spot buy refused: ${r2.error}`;
+                    execNote += fmtSpotDebug(built.debug);   // DIAGNOSTIC, see buildSpotOrder — 2026-09-07
+                    if (ladderArmed && !r2.ok) ladderUnplaced = r2.dry ? r2.why : r2.error;
+                  }
+                }
+              } catch (err) {
+                execNote = "spot path errored (no order sent): " + (err && err.message);
+                if (ladderArmed) ladderUnplaced = String(err && err.message || err);
+              }
+              await pushLog({ coin, result: isExpiry ? "ACCUM RUNG EXPIRED" : "ACCUM BUY",
+                skipped: isExpiry
+                  ? `a buy-back rung at ${formatPrice(e.rungPx)} went ${e.ageDays} days unfilled and was given up on. `
+                    + `Bought ${e.units.toFixed(8)} ${coin} back at the market (${formatPrice(e.px)}) with its ${e.usdt} USDT — `
+                    + `${e.lost >= 0 ? "costing" : "gaining"} ${Math.abs(e.lost).toFixed(6)} ${coin} against the slice that was sold. `
+                    + `The slot is free again, which is the point: a dead rung blocks every future ladder. ${execNote}`
+                  : `laddered buy filled at the ${e.src} level ${formatPrice(e.px)} — ${e.delta >= 0 ? "+" : ""}${e.delta.toFixed(6)} ${coin} on that slice.${e.viaDaily ? " (caught by the daily safety net)" : ""} ${execNote}` });
+            }
+            if (e.kind === "skip") await pushLog({ coin, result: "ACCUM PASS", skipped: `red dot, but no sell: ${e.why}.` });
+          }
+          if (ladderUnplaced) {
+            state = stateBefore;
+            await setJSON(book.key, state);
+            console.error(`accumulator: a BUY did not reach the venue (${ladderUnplaced}) — book rolled back, the rung will be retried next run`);
+            await pushLog({ coin, result: "ACCUM UNPLACED", countsForStats: false,
+              skipped: `a ladder buy-back did not reach the venue (${ladderUnplaced}). The strategy's book has been rolled back to match the wallet — nothing was bought. The rung is still resting and will be retried next run.` });
+          }
+        }
+        // ── THE DOT FLIP ──────────────────────────────────────────────────────────────────
+        // All eight timeframes always run as PAPER arms, whatever is armed, so the table the
+        // choice gets made from never goes dark — including for the timeframe currently live.
+        // Exactly one of them may additionally be promoted to the real balance (see the toggles
+        // in the app panel and liveFlipStep above); the paper arm and the live arm are kept in
+        // separate books so neither can flatter or corrupt the other.
+        try {
+          state.flips = state.flips || {};
+          const oneH = await fetchCandles(coin, "1H", 500);
+          const flipBars = {};
+          for (const ftf of FLIP_TFS) {
+            let fbars = null;
+            if (ftf === "3H") fbars = oneH ? aggregateBars(oneH, 3) : null;      // built, not fetched
+            else if (ftf === "1H") fbars = oneH;
+            else fbars = await fetchCandles(coin, ftf, 500);
+            if (!fbars || fbars.length < 60) continue;
+            flipBars[ftf] = fbars;                       // reused by the live arm — no second fetch
+            const f = accumFlipStep(state.flips[ftf] || null, fbars);
+            state.flips[ftf] = f.st;
+            const fpx = fbars[fbars.length - 1].c;
+            f.st.unitsNow = +(f.st.units + f.st.cash / fpx).toFixed(8);
+            f.st.gainPct = +(((f.st.unitsNow / (f.st.startUnits || 1)) - 1) * 100).toFixed(2);
+            f.st.holding = f.st.cash <= 0;
+          }
+          const line = FLIP_TFS.map(t => { const x = state.flips[t]; return x ? `${t} ${x.gainPct >= 0 ? "+" : ""}${x.gainPct}% (${x.trips})` : `${t} —`; }).join(" · ");
+          console.log(`dot flip @${num("FLIP_FEE_BPS", 1)}bps maker, paper: ${line}`);
+
+          // ── THE LADDER ARMS (2026-08-25) ─────────────────────────────────────────────────────
+          // Same exit as the flip, laddered re-entry. Reuses flipBars, so this costs no extra
+          // network. Daily only: at real fees the 4H version was catastrophic for every strategy
+          // tested (−48% flip, −27% ladder), and running an arm we already know loses would just
+          // be noise in the record.
+          try {
+            state.ladders = state.ladders || {};
+            const lbars = flipBars["1D"];
+            if (lbars && lbars.length >= 60) {
+              for (const arm of LADDER_ARMS) {
+                const r = accumLadderStep(state.ladders[arm.id] || null, lbars,
+                  { rungs: arm.rungs, stepPct: arm.stepPct });
+                state.ladders[arm.id] = r.st;
+                const lpx = lbars[lbars.length - 1].c;
+                // Marked back to COINS, including cash still out in unfilled rungs. Cash sitting
+                // in the book is not a result, it is an unfinished trade, and counting it as
+                // anything else is how a stranded strategy looks healthy.
+                r.st.unitsNow = +(r.st.units + r.st.cash / lpx).toFixed(8);
+                r.st.gainPct = +(((r.st.unitsNow / (r.st.startUnits || 1)) - 1) * 100).toFixed(2);
+                r.st.resting = Array.isArray(r.st.open) ? r.st.open.length : 0;
+                r.st.holding = (r.st.units || 0) * lpx > (r.st.cash || 0);
+              }
+              const ll = LADDER_ARMS.map(a => { const x = state.ladders[a.id];
+                return x ? `${a.rungs}x${a.stepPct}% ${x.gainPct >= 0 ? "+" : ""}${x.gainPct}% (${x.sells}s/${x.fills}f, ${x.resting} resting)` : `${a.id} —`; }).join(" · ");
+              // Printed next to the 1D flip on purpose: that is the arm it is a variant of, and
+              // the only comparison that means anything is against the thing it would replace.
+              const flip1D = state.flips && state.flips["1D"];
+              console.log(`ladder back-in, paper (1D, vs flip 1D ${flip1D ? (flip1D.gainPct >= 0 ? "+" : "") + flip1D.gainPct + "%" : "—"}): ${ll}`);
+            }
+          } catch (e) { console.error("ladder arms skipped (paper only, harmless):", e && e.message); }
+
+          // ── AND THE ONE THAT IS REAL ───────────────────────────────────────────────────────
+          let lf = await getJSON(book.flipKey, null);
+          let ll = await getJSON(LIVE_LADDER_KEY, null);
+          // Three owners now compete for the same balance: the pump ladder (state.units/cash,
+          // the fallback), the dot flip (lf) and the dot-ladder (ll). Whichever is NOT selected
+          // this run is stood down first and its balance folded back — the same handover the
+          // flip already did when toggled off, done for two owners so neither is left holding a
+          // position the selector no longer knows about.
+          if (!isDotLadder && ll && ll.tf) {
+            state.units = Number(ll.units) || 0; state.cash = Number(ll.cash) || 0;
+            console.log(`live dot-ladder stood down from ${ll.tf} — coins handed back: ${state.units.toFixed(8)} ${coin}` +
+                        (state.cash > 0 ? ` + ${state.cash.toFixed(2)} USDT still to be bought back` : ""));
+            await pushLog({ coin, result: "LADDER OFF",
+              skipped: `live dot-ladder switched off after ${ll.trips} round trip${ll.trips === 1 ? "" : "s"} — ${state.units.toFixed(8)} ${coin}${state.cash > 0 ? ` plus ${state.cash.toFixed(2)} USDT still in cash` : ""} handed back.` });
+            ll.tf = null; await setJSON(LIVE_LADDER_KEY, ll);
+            state.liveLadder = { tf: null, blocked: false, why: "off" };
+          }
+          if (isDotLadder && lf && lf.tf) {
+            state.units = Number(lf.units) || 0; state.cash = Number(lf.cash) || 0;
+            console.log(`live flip stood down from ${lf.tf} — dot-ladder takes over: ${state.units.toFixed(8)} ${coin}` +
+                        (state.cash > 0 ? ` + ${state.cash.toFixed(2)} USDT still to be bought back` : ""));
+            await pushLog({ coin, result: "FLIP OFF",
+              skipped: `${lf.tf} dot flip switched off after ${lf.trips} round trip${lf.trips === 1 ? "" : "s"} — the dot-ladder takes the coins: ${state.units.toFixed(8)} ${coin}${state.cash > 0 ? ` plus ${state.cash.toFixed(2)} USDT still in cash` : ""}.` });
+            lf.tf = null; await setJSON(book.flipKey, lf);
+            state.liveFlip = { tf: null, blocked: false, why: "off — dot-ladder holds the coins" };
+          }
+          if (isDotLadder) {
+            if (flipBlocked) {
+              state.liveLadder = { tf: null, want: "dotladder", blocked: true,
+                why: `waiting for ${state.open.length} resting pump-ladder rung${state.open.length === 1 ? "" : "s"} to fill before the dot-ladder can take the coins` };
+              console.log(`live dot-ladder: NOT armed — ${state.liveLadder.why}`);
+            } else {
+              const lbars = flipBars["1D"];
+              let fineLadder = null;
+              try { fineLadder = await fetchCandles(coin, "15m", 200); }
+              catch (e) { console.error("live dot-ladder: 15m fetch failed (rungs untouched this run):", e && e.message); }
+              if (!lbars || lbars.length < 60) {
+                const held = ll && ll.tf === "1D";
+                state.liveLadder = held
+                  ? { tf: ll.tf, blocked: false, stale: true, why: "no 1D candles this run — the arm is untouched" }
+                  : { tf: null, blocked: true, why: "no 1D candles came back this run (60+ bars needed) — unchanged, retried next run" };
+                console.log(`live dot-ladder: no daily candles this run — arm left as it was`);
+              } else {
+                const capUsdt = num("ACCUM_LADDER_MAX_USDT", num("ACCUM_FLIP_MAX_USDT", 1500));
+                const armedExec = book.exec === "armed";
+                const minOrder = num("ACCUM_MIN_ORDER_USDT", 10);
+                const wBase = PF && Number.isFinite(PF.baseBalance) ? PF.baseBalance : null;
+                const wQuote = PF && Number.isFinite(PF.quoteBalance) ? PF.quoteBalance : null;
+                const bookUnits = Number((ll && ll.tf === "1D" ? ll.units : state.units)) || 0;
+                const bookCash = Number((ll && ll.tf === "1D" ? ll.cash : state.cash)) || 0;
+                const shortOfCoins = wBase != null && bookUnits * px >= minOrder && wBase * px < minOrder;
+                const shortOfCash = wQuote != null && bookCash >= minOrder && wQuote < minOrder;
+                let outOfSync = false;
+                if (armedExec && (shortOfCoins || shortOfCash)) {
+                  const detail = shortOfCoins
+                    ? `the strategy's book holds ${bookUnits.toFixed(8)} ${coin} but the SPOT wallet has ${wBase.toFixed(8)} — about ${(wBase * px).toFixed(2)} USDT, under the ${minOrder} minimum`
+                    : `the book holds ${bookCash.toFixed(2)} USDT but the SPOT wallet has ${wQuote.toFixed(2)}`;
+                  state.liveLadder = { tf: null, want: "dotladder", blocked: true,
+                    why: `${detail}. Nothing can be traded until the two agree — re-arm to reseed from what is actually there.` };
+                  console.log(`live dot-ladder: STOOD DOWN — ${state.liveLadder.why}`);
+                  await pushLog({ coin, result: "LADDER OUT OF SYNC", skipped: state.liveLadder.why });
+                  outOfSync = true;
+                }
+                const stackUsdt = ((Number(state.units) || 0) * px) + (Number(state.cash) || 0);
+                if (outOfSync) {
+                  // already reported
+                } else if (armedExec && stackUsdt > capUsdt) {
+                  state.liveLadder = { tf: null, want: "dotladder", blocked: true,
+                    why: `the whole stack is ${stackUsdt.toFixed(0)} USDT but ACCUM_LADDER_MAX_USDT is ${capUsdt} — a red dot sells it all in one order, so it would be refused. Raise the cap above ${Math.ceil(stackUsdt / 50) * 50} to arm this.` };
+                  console.log(`live dot-ladder: NOT armed — ${state.liveLadder.why}`);
+                  await pushLog({ coin, result: "LADDER BLOCKED", skipped: state.liveLadder.why });
+                } else {
+                  const llBefore = ll ? JSON.parse(JSON.stringify(ll)) : null;
+                  let llUnplaced = null;
+                  const wasArmed = ll && ll.tf === "1D";
+                  const seedUnits = wasArmed ? null : (Number(state.units) || 0);
+                  const seedCash = wasArmed ? 0 : (Number(state.cash) || 0);
+                  const r = liveLadderStep(ll, lbars, fineLadder, { seedUnits, seedCash });
+                  ll = r.st;
+                  for (const e of r.events) {
+                    if (e.kind === "ladder-armed") {
+                      await pushLog({ coin, result: "LADDER ARMED",
+                        skipped: `dot-ladder (2 rungs, 5% apart) is now live on the real balance — ${e.units.toFixed(8)} ${coin}${e.cash > 0 ? ` + ${e.cash.toFixed(2)} USDT` : ""} at ${formatPrice(e.px)}. No order placed on arming: it waits for the first red dot AFTER this bar. The pump ladder and dot flip are stood down.` });
+                      continue;
+                    }
+                    const isSell = e.kind === "ladder-sell";
+                    const isFill = e.kind === "ladder-fill";
+                    let execNote = "Measure only — no order placed.";
+                    try {
+                      const prods = await spotProducts();
+                      if (isSell) {
+                        const reserveBps = num("ACCUM_SELL_RESERVE_BPS", 15);
+                        const walletBase = PF && Number.isFinite(PF.baseBalance) ? PF.baseBalance : null;
+                        const sellable = walletBase != null ? walletBase * (1 - reserveBps / 1e4) : null;
+                        const sellQty = sellable != null ? Math.min(e.units, sellable) : e.units;
+                        const built = buildSpotOrder(coin, "Sell", { price: e.px, baseQty: sellQty }, prods);
+                        if (built.err) { execNote = `Spot order NOT built: ${built.err}`; if (armedExec) llUnplaced = built.err; }
+                        else {
+                          const sr = await sendSpotOrder(built.order, sellQty * e.px, { cap: capUsdt, exec: book.exec });
+                          execNote = sr.ok ? `SPOT SELL PLACED (${built.order.clOrdID})`
+                                   : sr.dry ? `dry run — would have sent a SPOT sell (${sr.why})`
+                                            : `spot sell refused: ${sr.error}`;
+                          if (armedExec && !sr.ok) llUnplaced = sr.dry ? sr.why : sr.error;
+                        }
+                      } else {
+                        const walletQuote = PF && Number.isFinite(PF.quoteBalance) ? PF.quoteBalance : null;
+                        const buyQty = walletQuote != null ? Math.min(e.cash, walletQuote) : e.cash;
+                        const built = buildSpotOrder(coin, "Buy", { price: e.px, quoteQty: buyQty }, prods);
+                        if (built.err) { execNote = `Spot order NOT built: ${built.err}`; if (armedExec) llUnplaced = built.err; }
+                        else {
+                          const sr = await sendSpotOrder(built.order, buyQty, { cap: capUsdt, exec: book.exec });
+                          execNote = sr.ok ? `SPOT BUY PLACED (${built.order.clOrdID})`
+                                   : sr.dry ? `dry run — would have sent a SPOT buy (${sr.why})`
+                                            : `spot buy refused: ${sr.error}`;
+                          if (armedExec && !sr.ok) llUnplaced = sr.dry ? sr.why : sr.error;
+                        }
+                      }
+                    } catch (err) {
+                      execNote = "spot path errored (no order sent): " + (err && err.message);
+                      if (armedExec) llUnplaced = String(err && err.message || err);
+                    }
+                    await pushLog({ coin, result: isSell ? "LADDER SELL" : (isFill ? "LADDER FILL" : "LADDER SWEEP"),
+                      skipped: isSell
+                        ? `red dot — sold the whole stack, ${e.units.toFixed(8)} ${coin} at ${formatPrice(e.px)}, laddering ${e.rungs} buy-backs 5% apart. ${execNote}`
+                        : isFill
+                        ? `rung filled at ${formatPrice(e.px)} — ${e.units.toFixed(8)} ${coin} on ${e.usdt.toFixed(2)} USDT. ${execNote}`
+                        : `green dot — swept the remaining cash back to coins, ${e.units.toFixed(8)} ${coin} at ${formatPrice(e.px)} on ${e.cash.toFixed(2)} USDT. ${execNote}` });
+                  }
+                  if (llUnplaced) {
+                    ll = llBefore || { tf: null, units: 0, cash: 0, trips: 0, sells: 0, fills: 0, lastT: 0, lastFineT: 0, startUnits: 0, open: [] };
+                    console.error(`live dot-ladder: ORDER DID NOT PLACE (${llUnplaced}) — book rolled back, retried next run`);
+                    await pushLog({ coin, result: "LADDER UNPLACED",
+                      skipped: `a dot-ladder order did not reach the venue (${llUnplaced}). The strategy's book has been rolled back to match the wallet — nothing was bought or sold. It will retry on the next run.` });
+                  }
+                  const lpx = lbars[lbars.length - 1].c;
+                  ll.unitsNow = +(ll.units + (ll.cash || 0) / lpx).toFixed(8);
+                  ll.gainPct = +(((ll.unitsNow / (ll.startUnits || ll.unitsNow || 1)) - 1) * 100).toFixed(2);
+                  ll.holding = (ll.units || 0) * lpx > (ll.cash || 0);
+                  await setJSON(LIVE_LADDER_KEY, ll);
+                  state.units = ll.units; state.cash = ll.cash || 0;
+                  state.liveLadder = { tf: ll.tf, blocked: false, armedAt: ll.armedAt, units: ll.units,
+                                       cash: ll.cash, unitsNow: ll.unitsNow, startUnits: ll.startUnits,
+                                       gainPct: ll.gainPct, holding: ll.holding, trips: ll.trips, sells: ll.sells,
+                                       fills: ll.fills, resting: Array.isArray(ll.open) ? ll.open.length : 0 };
+                  console.log(`live dot-ladder (REAL, 2x5%): ${ll.unitsNow} units vs ${ll.startUnits} at arming — ${ll.gainPct >= 0 ? "+" : ""}${ll.gainPct}% · ${ll.sells} sells, ${ll.fills} fills, ${ll.trips} sweeps · ${ll.holding ? "holding coins" : "in cash, rungs resting"}`);
+                }
+              }
+            }
+          } else if (flipBlocked) {
+            state.liveFlip = { tf: null, want: flipTf, blocked: true,
+              why: `waiting for ${state.open.length} resting ladder rung${state.open.length === 1 ? "" : "s"} to fill before the flip can take the coins` };
+            console.log(`live flip ${flipTf}: NOT armed — ${state.liveFlip.why}`);
+          } else if (flipTf && flipBars[flipTf]) {
+            const wasTf = lf && lf.tf;
+            // ── THE CAP HAS TO BE CHECKED *BEFORE* ARMING, NOT AT THE ORDER ─────────────────
+            // The flip sells the WHOLE stack in one order, and sendSpotOrder answers an
+            // over-cap notional with {dry:true} — no order, no error. The internal book would
+            // record a sell that never happened and every number after it would be fiction,
+            // with the wallet still holding coins the strategy thinks it converted to cash.
+            // So an arm that cannot possibly execute is refused up front and said out loud.
+            const capUsdt = num("ACCUM_FLIP_MAX_USDT", 1500);
+            const armedExec = book.exec === "armed";
+            let outOfSync = false;
+            // ── THE WALLET IS THE ARBITER (2026-08-19) ──────────────────────────────────────
+            // Found live: the book said 0.00767931 BTC while the spot wallet held 0.00000031.
+            // Every run then fired a sell for coins that were not there, Phemex refused it, the
+            // rollback undid it, and the next run did the same — a loop that would have run all
+            // night writing failures into the log and learning nothing.
+            //
+            // A book that disagrees with the wallet is not a trading problem to push through,
+            // it is a RECONCILIATION problem, and the only safe move is to stop and say so.
+            // Silence here would be the worst outcome: a strategy that looks armed, is not
+            // trading, and never explains why.
+            const minOrder = num("ACCUM_MIN_ORDER_USDT", 10);
+            const wBase = PF && Number.isFinite(PF.baseBalance) ? PF.baseBalance : null;
+            const wQuote = PF && Number.isFinite(PF.quoteBalance) ? PF.quoteBalance : null;
+            const bookUnits = Number((lf && lf.tf === flipTf ? lf.units : state.units)) || 0;
+            const bookCash = Number((lf && lf.tf === flipTf ? lf.cash : state.cash)) || 0;
+            const shortOfCoins = wBase != null && bookUnits * px >= minOrder && wBase * px < minOrder;
+            const shortOfCash = wQuote != null && bookCash >= minOrder && wQuote < minOrder;
+            if (armedExec && (shortOfCoins || shortOfCash)) {
+              const detail = shortOfCoins
+                ? `the strategy's book holds ${bookUnits.toFixed(8)} ${coin} but the SPOT wallet has ${wBase.toFixed(8)} — about ${(wBase * px).toFixed(2)} USDT, under the ${minOrder} minimum`
+                : `the book holds ${bookCash.toFixed(2)} USDT but the SPOT wallet has ${wQuote.toFixed(2)}`;
+              state.liveFlip = { tf: null, want: flipTf, blocked: true,
+                why: `${detail}. Nothing can be traded until the two agree — check whether the balance was moved off the spot wallet, then re-arm to reseed from what is actually there.` };
+              console.log(`live flip ${flipTf}: STOOD DOWN — ${state.liveFlip.why}`);
+              await pushLog({ coin, result: "FLIP OUT OF SYNC", skipped: state.liveFlip.why });
+              outOfSync = true;
+            }
+            const stackUsdt = ((Number(state.units) || 0) * px) + (Number(state.cash) || 0);
+            if (outOfSync) {
+              // already reported above; nothing else may run this pass
+            } else if (armedExec && stackUsdt > capUsdt) {
+              state.liveFlip = { tf: null, want: flipTf, blocked: true,
+                why: `the whole stack is ${stackUsdt.toFixed(0)} USDT but ACCUM_FLIP_MAX_USDT is ${capUsdt} — a flip sells it all in one order, so it would be refused. Raise the cap above ${Math.ceil(stackUsdt / 50) * 50} to arm this.` };
+              console.log(`live flip ${flipTf}: NOT armed — ${state.liveFlip.why}`);
+              await pushLog({ coin, result: "FLIP BLOCKED", skipped: state.liveFlip.why });
+            } else {
+            const lfBefore = lf ? JSON.parse(JSON.stringify(lf)) : null;
+            let placeFailed = null;
+            // Seed from the ladder's book on handover. The ladder has nothing resting (checked
+            // above), so its units and cash ARE the whole balance.
+            const seedUnits = wasTf === flipTf ? null : (Number(state.units) || 0);
+            const seedCash = wasTf === flipTf ? 0 : (Number(state.cash) || 0);
+            const r = liveFlipStep(lf, flipBars[flipTf], flipTf, { seedUnits, seedCash });
+            lf = r.st;
+            for (const e of r.events) {
+              if (e.kind === "flip-armed") {
+                await pushLog({ coin, result: "FLIP ARMED",
+                  skipped: `${flipTf} dot flip is now live on the real balance${e.prev ? ` (switched from ${e.prev})` : ""} — ${e.units.toFixed(8)} ${coin}${e.cash > 0 ? ` + ${e.cash.toFixed(2)} USDT` : ""} at ${formatPrice(e.px)}. No order placed on arming: it waits for the first dot AFTER this bar. The pump ladder is stood down.` });
+                continue;
+              }
+              const isSell = e.kind === "flip-sell";
+              let execNote = "Measure only — no order placed.";
+              try {
+                const prods = await spotProducts();
+                // ── SIZE FROM THE WALLET, NOT ONLY FROM THE BOOK ─────────────────────────────
+                // The book is what the strategy believes it holds; the wallet is what Phemex will
+                // actually let it sell. They can differ — a fee taken in base, part of the balance
+                // locked, a rounding crumb — and the venue arbitrates, not us. Taking the smaller
+                // of the two means a disagreement costs a crumb rather than the whole order.
+                // ── NEVER ASK FOR 100% OF THE BALANCE (2026-08-19) ───────────────────────────
+                // Proved by arithmetic after the live refusal: 0.00767931 BTC scales to exactly
+                // 767931, which is exactly the wallet's balanceEv — so the order asked for every
+                // last satoshi and Phemex answered INSUFFICIENT_BASE_BALANCE. Flooring did not
+                // help because there was no fractional slack to floor away. The venue wants room
+                // for its fee, so leave it some.
+                //
+                // For THIS strategy the reserve is close to free: what stays behind stays as
+                // BTC, and BTC is the thing being accumulated. A sell that never places is far
+                // more expensive — it misses the whole cycle, which is what happened at 17:09.
+                const reserveBps = num("ACCUM_SELL_RESERVE_BPS", 15);
+                const walletBase = PF && Number.isFinite(PF.baseBalance) ? PF.baseBalance : null;
+                const sellable = walletBase != null ? walletBase * (1 - reserveBps / 1e4) : null;
+                const sellQty = sellable != null ? Math.min(e.units, sellable) : e.units;
+                const walletQuote = PF && Number.isFinite(PF.quoteBalance) ? PF.quoteBalance : null;
+                const buyQty = walletQuote != null ? Math.min(e.cash, walletQuote) : e.cash;
+                // A BUY is priced against the venue's own book, not only against Binance (see
+                // spotVenuePx). The venue's bid/ask/last always go in the log line.
+                let venueNote = "";
+                let buyPx = e.px;
+                if (!isSell) {
+                  const symS = "s" + String(coin).toUpperCase() + "USDT";
+                  const vp = await spotVenuePx(symS, prods && prods[symS] && prods[symS].priceScale);
+                  const cl = clampBuyPx(e.px, vp, num("ACCUM_BUY_CLAMP_BPS", 50));
+                  buyPx = cl.px;
+                  venueNote = vp
+                    ? ` [venue bid=${vp.bid} ask=${vp.ask} last=${vp.last}${cl.clamped ? `; limit clamped ${formatPrice(e.px)} -> ${formatPrice(cl.px)}` : ""}]`
+                    : " [venue ticker unreadable]";
+                }
+                const built = isSell
+                  ? buildSpotOrder(coin, "Sell", { price: e.px, baseQty: sellQty }, prods)
+                  : buildSpotOrder(coin, "Buy", { price: buyPx, quoteQty: buyQty }, prods);
+                if (built.err) {
+                  execNote = `Spot order NOT built: ${built.err}`;
+                  if (armedExec) placeFailed = built.err;
+                } else {
+                  const notional = isSell ? sellQty * e.px : buyQty;
+                  const sr = await sendSpotOrder(built.order, notional, { cap: capUsdt, exec: book.exec });
+                  execNote = sr.ok ? `SPOT ${isSell ? "SELL" : "BUY"} PLACED (${built.order.clOrdID})`
+                           : sr.dry ? `dry run — would have sent a SPOT ${isSell ? "sell" : "buy"} (${sr.why})`
+                                    : `spot ${isSell ? "sell" : "buy"} refused: ${sr.error}`;
+                  // DIAGNOSTIC (2026-09-07): the scales/priceEp actually used, never sent to the
+                  // venue — see the big comment above buildSpotOrder for why this was added.
+                  execNote += fmtSpotDebug(built.debug) + venueNote;
+                  // Armed and NOT placed is the one outcome the book must never absorb. A dry
+                  // note here means a brake fired (kill, cap) while we believed we were live.
+                  if (armedExec && !sr.ok) placeFailed = sr.dry ? sr.why : sr.error;
+                }
+              } catch (err) {
+                execNote = "spot path errored (no order sent): " + (err && err.message);
+                if (armedExec) placeFailed = String(err && err.message || err);
+              }
+              await pushLog({ coin, result: isSell ? "FLIP SELL" : "FLIP BUY",
+                skipped: isSell
+                  ? `${flipTf} red dot — sold the whole stack, ${e.units.toFixed(8)} ${coin} at ${formatPrice(e.px)}. Waiting for the green dot to buy it back. ${execNote}`
+                  : `${flipTf} green dot — bought back with ${e.cash.toFixed(2)} USDT at ${formatPrice(e.px)}, ${e.units.toFixed(8)} ${coin}. ${execNote}` });
+            }
+            // ── THE BOOK FOLLOWS THE WALLET, NOT THE OTHER WAY ROUND ───────────────────────
+            // If we were armed and an order did not reach the venue, the position on Phemex is
+            // unchanged — so the strategy's book must be unchanged too. Rolling back to the
+            // pre-step snapshot also rewinds `lastT`, which means the same dot is retried next
+            // run: right for a transient failure, and loud enough in the log to be caught if it
+            // is not. The alternative — carrying on from a sell that never happened — silently
+            // corrupts every number downstream and is not recoverable without a manual audit.
+            if (placeFailed) {
+              lf = lfBefore || { tf: null, units: 0, cash: 0, trips: 0, sells: 0, lastT: 0, startUnits: 0 };
+              console.error(`live flip ${flipTf}: ORDER DID NOT PLACE (${placeFailed}) — book rolled back, the dot will be retried next run`);
+              await pushLog({ coin, result: "FLIP UNPLACED",
+                skipped: `a ${flipTf} flip order did not reach the venue (${placeFailed}). The strategy's book has been rolled back to match the wallet — nothing was bought or sold. It will retry on the next run.` });
+            }
+            const lpx = flipBars[flipTf][flipBars[flipTf].length - 1].c;
+            lf.unitsNow = +(lf.units + (lf.cash || 0) / lpx).toFixed(8);
+            lf.gainPct = +(((lf.unitsNow / (lf.startUnits || lf.unitsNow || 1)) - 1) * 100).toFixed(2);
+            // "Holding" means the coins are what it owns, not that its cash is exactly zero —
+            // a cent of leftover USDT does not make a stack of BTC into a cash position.
+            lf.holding = (lf.units || 0) * lpx > (lf.cash || 0);
+            await setJSON(book.flipKey, lf);
+            // ONE TRUTH about what is actually held. While the flip owns the coins the ladder's
+            // own book would otherwise sit frozen at the handover figures, and every downstream
+            // reader — the panel, the console line, the benchmark — would quietly report a
+            // position that no longer exists. Mirroring keeps state.units meaning what it says.
+            // startUnits is deliberately NOT touched: the benchmark is still the balance this
+            // whole exercise began with, whichever strategy is currently driving.
+            state.units = lf.units; state.cash = lf.cash || 0;
+            state.liveFlip = { tf: lf.tf, blocked: false, armedAt: lf.armedAt, units: lf.units,
+                               cash: lf.cash, unitsNow: lf.unitsNow, startUnits: lf.startUnits,
+                               gainPct: lf.gainPct, holding: lf.holding, trips: lf.trips, sells: lf.sells };
+            console.log(`live flip ${lf.tf} (REAL): ${lf.unitsNow} units vs ${lf.startUnits} at arming — ${lf.gainPct >= 0 ? "+" : ""}${lf.gainPct}% · ${lf.sells} sells, ${lf.trips} round trips · ${lf.holding ? "holding coins" : "in cash, waiting for green"}`);
+            }
+          } else if (flipTf) {
+            // ── ASKED FOR A TIMEFRAME, BUT ITS CANDLES DID NOT ARRIVE ───────────────────────
+            // This used to fall through to the "off" branch below, which hands the coins back to
+            // the ladder and clears lf.tf. So a single failed fetch — a rate-limit, a slow venue,
+            // a daily series shorter than the 60-bar floor — silently un-armed a live strategy
+            // and logged it as FLIP OFF, indistinguishable from the user flicking the switch.
+            // Next run it re-armed. That is why 1D "kept swapping back": nothing was rejecting
+            // the setting, the agent was standing it down and picking it up again.
+            //
+            // A missing fetch is a gap in the data, not an instruction. The arm is left exactly
+            // as it was and the gap is reported.
+            const held = lf && lf.tf === flipTf;
+            state.liveFlip = held
+              ? { tf: lf.tf, blocked: false, stale: true, armedAt: lf.armedAt, units: lf.units,
+                  cash: lf.cash, unitsNow: lf.unitsNow, startUnits: lf.startUnits, gainPct: lf.gainPct,
+                  holding: lf.holding, trips: lf.trips, sells: lf.sells,
+                  why: `no ${flipTf} candles this run — the arm is untouched and it will act on the next one` }
+              : { tf: null, want: flipTf, blocked: true,
+                  why: `no ${flipTf} candles came back this run (at least 60 bars are needed). The setting is unchanged and it will try again on the next run.` };
+            console.log(`live flip ${flipTf}: no candles this run — arm left as it was, NOT stood down`);
+          } else {
+            // Toggled back to off — HAND THE COINS BACK. The flip may well be sitting in cash
+            // mid-cycle, so the ladder must resume from what is actually held rather than from
+            // the figures it was frozen at on handover; otherwise it would size its next sell
+            // against coins that are currently USDT. The arm's record is kept, not deleted:
+            // switching away should not erase what it did.
+            if (lf && lf.tf) {
+              state.units = Number(lf.units) || 0;
+              state.cash = Number(lf.cash) || 0;
+              console.log(`live flip stood down from ${lf.tf} — ladder resumes with ${state.units.toFixed(8)} ${coin}` +
+                          (state.cash > 0 ? ` + ${state.cash.toFixed(2)} USDT still to be bought back` : ""));
+              await pushLog({ coin, result: "FLIP OFF",
+                skipped: `${lf.tf} dot flip switched off after ${lf.trips} round trip${lf.trips === 1 ? "" : "s"} — the pump ladder has the coins again: ${state.units.toFixed(8)} ${coin}${state.cash > 0 ? ` plus ${state.cash.toFixed(2)} USDT still in cash` : ""}.` });
+              lf.tf = null; await setJSON(book.flipKey, lf);
+            }
+            state.liveFlip = { tf: null, blocked: false, why: "off — the pump ladder holds the coins" };
+          }
+        } catch (e) { console.error("dot flip skipped:", e && e.message); }
+
+        if (units != null) {
+          const since = state.startedAt || "today";
+          const resting = state.open.map(r => `${r.src}@${formatPrice(r.px)}`).join(", ") || "none";
+          // Benchmark is the STARTING balance, not 1.0 — see the same fix in the app panel.
+          const startU = Number(state.startUnits) > 0 ? Number(state.startUnits) : 1;
+          const gainPct = (units / startU - 1) * 100;
+          console.log(`accumulator (${coin} SPOT, core ${(state.coreUnits || 0).toFixed(8)}, ${book.exec === "armed" ? "ARMED" : "measure only"}): ${units.toFixed(8)} units vs buy-and-hold ${startU.toFixed(8)} — ${gainPct >= 0 ? "+" : ""}${gainPct.toFixed(2)}% since ${since} · ${state.sells} sells, ${state.fills} fills · resting: ${resting}`);
+          state.unitsNow = +units.toFixed(6); state.pxNow = px;
+          state.trigger = book.trigger;
+          state.exec = book.exec;
+          if (PF) state.spot = { ready: PF.ready, why: PF.why, symbol: PF.symbol, hasProduct: !!PF.product,
+                                 scales: PF.product ? `${PF.product.priceScale}/${PF.product.baseValueScale}/${PF.product.quoteValueScale}` : null,
+                                 spotSymbols: PF.spotSymbolCount || 0, walletStatus: PF.walletStatus ?? null,
+                                 balances: PF.balances || [], err: PF.walletErr || PF.productsErr || null,
+                                 baseBalance: Number.isFinite(PF.baseBalance) ? PF.baseBalance : null,
+                                 quoteBalance: Number.isFinite(PF.quoteBalance) ? PF.quoteBalance : null,
+                                 exec: book.exec, checkedAt: PF.checkedAt };
+
+          // ── brain oversight: weekly, cheap, and it cannot change anything ──────────────────
+          // Only when something has actually happened (a sell or a fill), at most once every
+          // ACCUM_REVIEW_DAYS, sharing the same daily spend cap as the autopsy.
+          try {
+            const bSlot = shadowSlot(await loadShadow(), "brain_autopsy");
+            const days = num("ACCUM_REVIEW_DAYS", 7);
+            const due = !state.lastReview || (Date.now() - state.lastReview) > days * 864e5;
+            if (brainProvider() && due && (state.sells || 0) + (state.fills || 0) > 0
+                && brainBudget(bSlot, Date.now(), null)) {
+              const res = await brainCall(buildAccumReviewPrompt(state, px,
+                "gains units in ranging/falling markets, loses them in sustained rallies; full history -27.8%, since Jan 2024 +14.9%"));
+              if (res) {
+                brainBudget(bSlot, Date.now(), res.usage);
+                const rv = parseAccumReview(res.text);
+                state.lastReview = Date.now();
+                if (rv) {
+                  state.lastReviewText = rv;
+                  console.log(`accumulator review: ${rv.read}${rv.concern ? " · concern: " + rv.concern : ""}`);
+                  await pushLog({ coin, result: "ACCUM REVIEW",
+                    skipped: `${rv.read}${rv.concern ? ` Concern: ${rv.concern}.` : ""}${rv.suggestion && !rv.sampleTooSmall ? ` Suggestion (advisory only, would have to win a shadow arm before anything changes): ${rv.suggestion}` : " No suggestion — sample too small."}` });
+                }
+              }
+            }
+          } catch (e) { console.error("accumulator review skipped (harmless, changes nothing):", e && e.message); }
+
+          await setJSON(book.key, state);
+        }
+      }
+    } catch (e) { console.error("accumulator failed (harmless, measures only):", e && e.message); }
+  }
+}
+
+// ═══════════ HEALTH: ONE LINE THAT SAYS WHETHER THIS RUN LEFT THINGS RIGHT (2026-10-26) ═══════════
+// Every watcher — Grok's hourly check, a morning summary, John glancing at the file — had to
+// reconstruct "is the bot OK?" from 300 log lines and five state keys, and each did it slightly
+// differently. The bot knows best what it just did, so it says so: cipher_health = OK / WARN /
+// FAIL / CRASH plus the reasons. A crash is caught by the entry point and written here too
+// (the workflow now saves state even when the run fails), so a dead run is never silent again.
+const HEALTH_KEY = "cipher_health";
+
+// PURE. The invariants, checked against what this run saved.
+function healthOf({ now, canSeeBook, mode, open, registry, runLog, prevBeatAt, maxGapMin = 45 }) {
+  const fail = [], warn = [];
+  if (!canSeeBook) fail.push("could not read open positions from Phemex — nothing was placed or protected this run");
+  const live = Object.entries(open || {}).filter(([, p]) => p && p.size > 0 && p.plan && !p.closedBy);
+  let stops = 0, targets = 0;
+  const noStop = [], noTarget = [];
+  for (const [k, p] of live) {
+    const r = registry && registry[k];
+    if (r && r.stop && !r.pulled) stops++; else noStop.push(`${p.coin} ${p.dir}`);
+    if (r && r.target && !r.pulled) targets++; else noTarget.push(`${p.coin} ${p.dir}`);
+  }
+  if (mode === "armed" && canSeeBook) {
+    if (noStop.length) fail.push(`no stop on ${noStop.length} position(s): ${noStop.join(", ")}`);
+    if (noTarget.length) warn.push(`no target on ${noTarget.length} position(s): ${noTarget.join(", ")}`);
+  }
+  const orphans = Object.values(open || {}).filter(p => p && p.size > 0 && !p.plan);
+  if (orphans.length) fail.push(`${orphans.length} position(s) with no plan at all: ${orphans.map(p => p.coin + " " + p.dir).join(", ")}`);
+  const count = (re) => (runLog || []).filter(e => re.test(String(e.result || ""))).length;
+  const n1 = count(/^STOP ATTACH FAILED/), n2 = count(/^DE-HEDGE (FAILED|GIVEN UP)/), n3 = count(/^ERR/), n4 = count(/^FILL LOOKUP EMPTY/);
+  if (n1) warn.push(`${n1} stop attach failure(s)`);
+  if (n2) warn.push(`${n2} de-hedge failure(s)`);
+  if (n3) warn.push(`${n3} order error(s)`);
+  if (n4) warn.push("some closes graded from the price range (no fill found)");
+  const gapMin = prevBeatAt ? Math.round((now - Date.parse(prevBeatAt)) / 6e4) : null;
+  if (gapMin != null && gapMin > maxGapMin) warn.push(`${gapMin} min since the previous run (expected ≤ ${maxGapMin})`);
+  return { at: new Date(now).toISOString(), status: fail.length ? "FAIL" : warn.length ? "WARN" : "OK", mode,
+           positions: live.length, stops, targets, gapMin, problems: [...fail, ...warn] };
+}
+
+async function writeHealth({ started, canSeeBook, mode }) {
+  try {
+    const prev = await getJSON(HEALTH_KEY, null);
+    const beat = await getJSON("cipher_heartbeat", null);
+    const h = healthOf({ now: Date.now(), canSeeBook, mode,
+      open: await getJSON(OPEN_KEY, {}), registry: await getJSON(PROTECT_KEY, {}),
+      runLog: ((await getJSON(KEY.log, [])) || []).filter(e => e && Date.parse(e.at) >= started),
+      prevBeatAt: beat && beat.at, maxGapMin: num("HEALTH_MAX_GAP_MIN", 45) });
+    await setJSON(HEALTH_KEY, h);
+    console.log(`HEALTH: ${h.status} — ${h.positions} position(s), ${h.stops} stop(s), ${h.targets} target(s)` +
+      (h.gapMin != null ? `, ${h.gapMin} min since last run` : "") + (h.problems.length ? ` · ${h.problems.join(" · ")}` : ""));
+    // Into the decision log only when it is not OK or it has just changed, so the 300-line ring
+    // is not filled with "OK" every fifteen minutes.
+    if (h.status !== "OK" || (prev && prev.status !== "OK"))
+      await pushLog({ result: "HEALTH " + h.status, skipped: h.problems.join(" · ") || "all checks passed" });
+  } catch (e) { console.error("health check failed:", e && e.message); }
+}
+
+// ═══════════════════════ THE LOOP ═══════════════════════
+export default async function cipherAgent() {
+  const started = Date.now();
+  LIVE = await loadLiveConfig();
+  const applied = applyLiveConfig(LIVE);
+  if (applied.length) console.log("live config from the app: " + applied.join(", "));
+  const mode = CFG.mode();
+  if (mode === "off") {
+    console.log(`MODE=off — futures scanner idle${LIVE && LIVE.kill ? " (KILL is ON from the app)" : ""}`);
+    // …but the accumulator is a different strategy on a different product, with its own switches.
+    // Letting the futures mode silently disable it is what cost 2026-08-19 an afternoon: the
+    // relay read timed out, MODE fell back to off, and the spot strategy never ran. KILL still
+    // stops it — that check lives on the order path in sendSpotOrder, where it cannot be missed.
+    await runAccumulators();
+    await setJSON(HEALTH_KEY, { at: new Date().toISOString(), status: "OFF", mode, problems: ["MODE is off — the futures scanner is idle"] });
+    return;
+  }
+
+  // Rotate through the universe a batch at a time so every run finishes well inside 60s.
+  let uni = await topUniverse(CFG.universe());
+
+  // Only coins this venue actually carries. Everything else is a trade that could never have
+  // happened, dressed up as a decision.
+  const perps = await perpSymbols();
+  if (perps) {
+    const before = uni.length;
+    const dropped = uni.filter(c => !perps.has(c));
+    uni = uni.filter(c => perps.has(c));
+    console.log(`universe: ${uni.length} of ${before} carried by phemex (${perps.size} perpetuals listed)`
+      + (dropped.length ? ` — not listed here: ${dropped.join(", ")}` : ""));
+    if (!uni.length) { console.warn("universe: phemex carries NONE of the top movers — falling back to the unfiltered list"); uni = await topUniverse(CFG.universe()); }
+  }
+
+  const allowed = await relayWhitelist();
+  if (allowed) {
+    const before = uni.length;
+    uni = uni.filter(c => allowed.has(c));
+    if (!uni.length) uni = [...allowed];                      // none of the top movers are allowed
+    console.log(`universe: ${uni.length} tradeable of ${before} (relay whitelist)`);
+  }
+  const cursor = await getJSON(KEY.cursor, 0);
+  const batch = Math.max(5, CFG.batch());
+  const slice = [];
+  const seenThisRun = new Set();
+  // Coins whose trade resolved last run jump the queue — see "TARGET HIT → LOOK THE OTHER WAY".
+  // On a 100-coin rotation the cursor can take hours to come back round, by which time the
+  // reverse setup is history.
+  const priority = await getJSON(PRIORITY_KEY, []);
+  for (const sym of priority) {
+    if (slice.length >= batch) break;
+    if (!seenThisRun.has(sym) && uni.includes(sym)) { seenThisRun.add(sym); slice.push(sym); }
+  }
+  if (priority.length) console.log(`priority scan: ${priority.join(", ")} (resolved last run)`);
+  await setJSON(PRIORITY_KEY, []);
+  for (let i = 0; i < batch && seenThisRun.size < uni.length && slice.length < batch; i++) {
+    const sym = uni[(cursor + i) % uni.length];
+    if (!seenThisRun.has(sym)) { seenThisRun.add(sym); slice.push(sym); }
+  }
+  // NOT advanced here. The scan below can stop early on its time budget, and moving the cursor
+  // by the full batch before knowing that skipped the tail of every batch permanently — same
+  // positions every run, because the stride is fixed. It is advanced after the loop, by the
+  // number of coins actually looked at.
+
+  // Day-scoped dedupe: one trade per coin+direction per day, same as the app.
+  const day = new Date().toISOString().slice(0, 10);
+  let fired = await getJSON(KEY.fired, {});
+  for (const k of Object.keys(fired)) if (!k.endsWith(day)) delete fired[k];
+
+  // ── ATTEMPT CAP (2026-08-15) ──────────────────────────────────────────────────────────────
+  // Un-burning a coin on a 5xx was right — a server fault is not a decision. But with nothing
+  // counting, one broken hop turned into BCH long attempted 15 times in a day, SUI 14, SOL 14.
+  // That is not resilience, it is a feedback loop that manufactures its own traffic and buries
+  // the real signal in noise. Three goes, then the coin rests until tomorrow.
+  let attempts = await getJSON("cipher_attempts", {});
+  for (const k of Object.keys(attempts)) if (!k.endsWith(day)) delete attempts[k];
+
+  // A failed position read is not an empty book. If we cannot see what we are holding we cannot
+  // honour the no-hedge rule, the correlation guard or "already holding" — so we scan and log,
+  // but place nothing. Missing a setup costs one setup; placing blind cost ten tangled positions.
+  const positionsRead = await openPositions();
+  const canSeeBook = positionsRead !== null;
+  const positions = positionsRead || [];
+  if (!canSeeBook) console.log("WARNING: could not read open positions — scanning only, no orders will be placed this run");
+  // ── NO OPPOSING LEG ON THE SAME COIN (2026-08-15) ────────────────────────────────────────────
+  // Found LINK, XRP, ETH, UNI and BTC each holding a long AND a short at once. The bot never chose
+  // to hedge — openPositions() was silently returning [] (see findPositions), so "already holding
+  // this coin" was checking an empty list and always said no. That accessor is fixed, but a bug
+  // being fixed is a weaker promise than code that refuses, so this is the explicit rule:
+  //
+  //   the bot has no hedging thesis, so it may never hold both sides of one coin.
+  //
+  // A real hedge needs a reason, a level and a stop on BOTH legs. This engine produces
+  // one-directional setups; two opposing legs is not a position, it is two positions paying
+  // funding against each other. Refuse, and say why in the log so it is visible rather than quiet.
+  const bookMap = await getJSON(BOOKMAP_KEY, {});
+  // ── What resolved since last run, and what that suggests looking at ──
+  const prevOpen = await getJSON(OPEN_KEY, {});
+  const lastPrice = {};                       // filled as the scan fetches candles anyway
+  const priceOf = c => lastPrice[c];
+  const heldDir = new Map();                      // "book|COIN" → Set("long"|"short")
+  const addHeld = (book, coin, d) => { const k = book + "|" + coin; if (!heldDir.has(k)) heldDir.set(k, new Set()); heldDir.get(k).add(d); };
+  for (const p of positions) {
+    const coin = String(p.symbol || "").replace(/USDT$/, "").toUpperCase();
+    // Phemex reports posSide Long/Short in hedge mode; fall back to side, then to a signed size.
+    let d = String(p.posSide || p.side || "").toLowerCase();
+    if (d !== "long" && d !== "short") d = Number(p.size) < 0 ? "short" : "long";
+    const known = bookMap[posKey(coin, d)];
+    if (known) addHeld(known, coin, d);
+    else { addHeld("fast", coin, d); addHeld("swing", coin, d); }   // unknown → protected in both
+  }
+  // "book|COIN" — a coin can be held in one book and still be free in the other, which is the
+  // whole point: a weekly BTC long must not block a 4H BTC trade in the fast book.
+  const held = new Set();
+  for (const [k, set] of heldDir) if (set.size) held.add(k);
+
+  const opposes = (book, coin, dir) => {
+    const other = dir === "long" ? "short" : "long";
+    const k = book + "|" + coin;
+    return heldDir.has(k) && heldDir.get(k).has(other);
+  };
+  const noteOpened = (book, coin, dir) => { addHeld(book, coin, dir); bookMap[posKey(coin, dir)] = book; };
+  const dupes = [...heldDir].filter(([, set]) => set.size > 1).map(([k]) => k);
+  if (dupes.length) console.log(`WARNING: ${dupes.length} coin(s) already hold BOTH sides — ${dupes.join(", ")}. Not adding to them.`);
+  // ...and, unlike before, do something about it. Reduce-only, smaller leg, armed mode only.
+  if (mode === "armed" && canSeeBook) {
+    try {
+      const hf = await resolveHedges(positions);
+      // ── A LEG WE JUST CLOSED IS NOT A POSITION ANY MORE (2026-10-26, run #826) ──────────────
+      // `positions` was read before the de-hedge, so the protection sweep later in this run gave
+      // the SOL long it had just closed a fresh stop and target — two orders guarding nothing.
+      // Drop closed legs from this run's picture of the book.
+      for (const leg of hf.closedLegs || []) { const i = positions.indexOf(leg); if (i >= 0) positions.splice(i, 1); }
+      if (hf.found) console.log(`hedges found on ${hf.found} coin(s) — ${hf.closed} smaller leg(s) closed`
+        + (hf.failed ? `, ${hf.failed} failed` : "")
+        + (hf.givenUp ? `, ${hf.givenUp} given up on (waiting for you to close by hand)` : ""));
+    } catch (e) { console.error("de-hedge pass failed (harmless, reduce-only):", e && e.message); }
+  }
+
+  // ── PULL A FINISHED TRADE'S LEFTOVER ORDER BEFORE TRADING AGAIN (audit 2026-10-26) ──────────
+  // A stop and its target are not linked at the venue: when one fills, the other stays live. The
+  // resolution pass cancels it — but at the END of the run, after this run's entries. A new
+  // position on the same coin and side opened in between could be closed by the old leftover.
+  // So cancel the recorded orders of every position that has gone (or been replaced) right here,
+  // and keep the record for the resolution pass to attribute the close.
+  // Keys whose old trade was CLOSED and a new one opened on the same coin and side since last run.
+  // Decided from the venue's own fills, not from the entry price (audit, second pass): a re-entry
+  // at the same price was missed, and an entry that merely drifted was recorded as a fake close.
+  const reopenedKeys = new Set();
+  if (mode === "armed" && canSeeBook && CFG.direct()) {
+    try {
+      const nowByKey = {};
+      for (const p of positions) {
+        const coin = String(p.symbol || "").replace(/USDT$/, "").toUpperCase();
+        let d = String(p.posSide || p.side || "").toLowerCase();
+        if (d !== "long" && d !== "short") d = Number(p.size) < 0 ? "short" : "long";
+        if (Math.abs(Number(p.size) || 0) > 0) nowByKey[posKey(coin, d)] = { avgEntry: +(p.avgEntryPriceRp ?? p.avgEntryPrice) || undefined };
+      }
+      // For every position held both last run and now: did fills since it opened close at least its
+      // whole size? Then what is open now is a different trade. A lookup that cannot be read splits
+      // nothing — a missed reopen costs one muddled record; a fake close costs a live stop.
+      let checked = 0;
+      for (const k of Object.keys(prevOpen || {})) {
+        const was = prevOpen[k];
+        if (!nowByKey[k] || !(Number(was && was.size) > 0) || !(Number(was.since) > 0)) continue;
+        if (checked++ >= num("REOPEN_CHECKS_PER_RUN", 16)) break;
+        try {
+          const { rows } = await fetchFillRows(`${was.coin}USDT`, was.since);
+          if (!rows) continue;
+          const closed = closedQtySince(rows, was.dir === "short" ? "Short" : "Long", Number(was.since));
+          if (closed >= Number(was.size) * 0.999) reopenedKeys.add(k);
+        } catch { }
+      }
+      const finished = Object.keys(prevOpen || {}).filter(k => !nowByKey[k] || reopenedKeys.has(k));
+      if (finished.length) {
+        const n = await cancelProtectionFor(finished, { keep: true });
+        if (n) console.log(`protection: pulled ${n} leftover stop/target order(s) from ${finished.length} finished position(s) before trading`);
+      }
+    } catch (e) { console.error("early leftover-order pull failed (the resolution pass retries it):", e && e.message); }
+  }
+
+  // ── WHAT THE VENUE HAS ALREADY REFUSED ────────────────────────────────────────────────────
+  // Loaded once per run, saved only when it changes. Benched symbols are printed every run: a
+  // universe that quietly narrows itself is a universe nobody is auditing.
+  let VENUE = {};
+  try {
+    VENUE = await getJSON(VENUE_KEY, {}) || {};
+    const bench = venueBench(VENUE, Date.now());
+    if (bench.length) console.log(`venue bench (${bench.length}): ${bench.join(", ")}`);
+  } catch (e) { console.error("venue memory read failed (fails open — every symbol allowed):", e && e.message); VENUE = {}; }
+
+  // ── CIRCUIT BREAKER: check the money before asking for more risk ──────────────────────────
+  let BREAKER = { paused: false, st: {} };
+  try {
+    const bst = await getJSON(BREAKER_KEY, {});
+    const eq = canSeeBook ? equityNow() : null;
+    const wasPaused = (bst.pausedUntil || 0) > Date.now();
+    BREAKER = breakerStep(bst, { now: Date.now(), equity: eq });
+    await setJSON(BREAKER_KEY, BREAKER.st);
+    if (BREAKER.trips.length) {
+      console.log(`CIRCUIT BREAKER TRIPPED (${BREAKER.trips.join("+")}): ${BREAKER.st.pausedWhy}`);
+      await pushLog({ result: "BREAKER", skipped: BREAKER.st.pausedWhy });
+    } else if (BREAKER.paused) {
+      console.log(`circuit breaker holding: ${BREAKER.st.pausedWhy} (until ${new Date(BREAKER.st.pausedUntil).toISOString()})`);
+    } else if (wasPaused) {
+      console.log("circuit breaker released — new entries allowed again");
+    }
+    if (eq == null && canSeeBook) console.log("breaker: no account balance in the positions response — drawdown arms inactive this run, streak arm still live");
+  } catch (e) { console.error("breaker check failed (fails open for exits, closed for entries is handled per-trade):", e && e.message); }
+  // Positions are read ONCE per run, so trades opened during this run must be counted too —
+  // otherwise a single pass can stack far past CORR_MAX before the next run notices. Found when
+  // the ported detectors made one run place 10 orders (2026-08-11).
+  const openedThisRun = [];   // { book, dir }
+  let confluenceOff = 0;      // coins the switched-off confluence path would have fired on this run
+  const sameDir = (book, dir) => {
+    const fromExchange = positions.filter(p => {
+      const coin = String(p.symbol || "").replace(/USDT$/, "").toUpperCase();
+      let d = String(p.posSide || p.side || "").toLowerCase();
+      if (d !== "long" && d !== "short") d = Number(p.size) < 0 ? "short" : "long";
+      if (d !== dir) return false;
+      const known = bookMap[posKey(coin, d)];
+      return known ? known === book : true;      // unknown positions count against BOTH books
+    }).length;
+    return fromExchange + openedThisRun.filter(x => x.book === book && x.dir === dir).length;
+  };
+  const placedInBook = { fast: 0, swing: 0 };
+
+  const log24 = (await getJSON(KEY.log, [])).filter(e => e.result === "PLACED" || e.result === "dry-run OK");
+  const dayAgo = Date.now() - 864e5;
+  let placedToday = log24.filter(e => new Date(e.at).getTime() > dayAgo).length;
+
+  // Clear out anything that never filled before scanning, so a coin freed by an expiry can be
+  // looked at again on this same run rather than waiting another fifteen minutes.
+  if (mode === "armed") {
+    try {
+      const ex = await expireStaleOrders();
+      if (ex.checked) console.log(`entry expiry: ${ex.checked} past ${CFG.entryExpiryH()}h — ${ex.cancelled} cancelled, ${ex.cleared} already gone${ex.blind ? `, ${ex.blind} unreadable (left alone)` : ""}`);
+    } catch (e) { console.error("entry expiry pass failed (harmless, cancels only):", e && e.message); }
+  }
+
+  let scanned = 0, candidates = 0, placed = 0;
+  let _setupsFired = 0, _setupsSkipped = false;
+  // Where the rotation got to. Distinct from `scanned`, which counts coins the loop accepted —
+  // this counts positions consumed from the slice, so a coin skipped for not being crypto still
+  // advances the queue and cannot jam it.
+  let consumed = 0;
+  const rankPool = [];                       // every coin's best signal this run, threshold or not
+  const SHADOW = await loadShadow();
+  _regimeCache = null; _rsCache = null;      // one BTC daily read, one field ranking, per run
+  const REGIME = await regimeSnapshot();
+  const RS = await relativeStrength(uni.slice(0, 40));
+  if (RS.ok) console.log(`field: ${RS.n} coins ranked over ${RS_LOOKBACK_D}d — leader ${RS.leader}, laggard ${RS.laggard} (measured only, it filters nothing)`);
+  if (REGIME.label) console.log(`regime: ${REGIME.label} (BTC ${REGIME.distPct >= 0 ? "+" : ""}${REGIME.distPct}% vs its ${REGIME_MA}D average) — measured only, it filters nothing`);
+
+  for (const coin of slice) {
+    if (Date.now() - started > num("SCAN_BUDGET_MS", 90000)) {
+      console.log(`time budget reached — stopping early after ${consumed} of ${slice.length}; the cursor resumes here rather than skipping the rest`);
+      break;
+    }
+    consumed++;
+    if (!coin || NOT_CRYPTO.test(coin)) continue;
+    scanned++;
+
+    // ── ALL FIVE TIMEFRAMES AT ONCE (2026-08-25) ─────────────────────────────────────────────
+    // These were five sequential awaits — about three seconds a coin, which is the whole reason
+    // the 45-second budget only ever reached 13 coins. They do not depend on each other, so
+    // there was never a reason to queue them.
+    //
+    // Promise.all is safe here specifically because fetchCandles NEVER throws: every failure path
+    // in it returns null. If that ever stops being true this needs allSettled, or one bad symbol
+    // takes the whole coin down.
+    const SCAN_TFS = ["1D", "4H", "1H", "30m", "15m"];
+    const bars = {}, tfData = {};
+    const fetched = await Promise.all(SCAN_TFS.map(tf => fetchCandles(coin, tf, 260)));
+    SCAN_TFS.forEach((tf, k) => { bars[tf] = fetched[k]; });
+    // analyzeTF is pure CPU work on candles already in hand — it stays sequential because making
+    // it concurrent would buy nothing and only obscure the order.
+    for (const tf of ["1D", "4H", "1H"]) tfData[tf] = analyzeTF(bars[tf]);
+    try { regimeBreadthTally(REGIME, bars["1D"]); } catch {}   // free: the candles are already here
+
+    // ── THE DISCOVERED SETUPS, IN SHADOW ─────────────────────────────────────────────────────
+    // Deliberately after the fetches, so it costs no extra network, and gated on the clock so it
+    // can never eat the coverage the rotation fix just bought back. Two thirds of the budget,
+    // tracking it rather than a fixed number — a hardcoded 30s next to a configurable budget is
+    // the kind of pair that drifts apart and nobody notices.
+    if (Date.now() - started < num("SCAN_BUDGET_MS", 90000) * 0.67) {
+      const lab = await setupLab();
+      if (lab) _setupsFired += shadowDiscovered(lab, SHADOW, coin, bars,
+        { reg: REGIME.label, regDist: REGIME.distPct, breadth: REGIME.breadth });
+    } else if (_setupsFired === 0 && !_setupsSkipped) {
+      _setupsSkipped = true;
+      console.log("setup lab: skipped this run — the scan used its time budget on coverage, which comes first");
+    }
+
+    // Two independent sources of a trade: the confluence score, and the pattern detectors.
+    // Detectors carry no score, so they use the configured minimum — the guards below still bind.
+    let sig = scoreCoin(tfData);
+    if (sig && sig.score < CFG.minScore()) sig = null;
+    if (sig && !CFG.confluence()) { confluenceOff++; sig = null; }   // off by default — see CFG.confluence
+    if (!sig) {
+      // Look at EVERY timeframe and detector, then take the STRONGEST hit — not whichever
+      // happened to be checked first. Taking the first match meant a 15m wobble could outrank a
+      // clean daily signal, and made the bot fire on ~75% of coins (2026-08-12).
+      const TF_WEIGHT = { "1D": 3, "4H": 2.5, "1H": 2, "30m": 1, "15m": 0.5 };
+      // rollover raised 1 → 2 (2026-08-13). At 1 it was arithmetically IMPOSSIBLE for a 4H
+      // rollover to fire: 2.5 + 1 + 1 = 4.5 against a threshold of 5, so the timeframe John
+      // actually trades was silently excluded. That was a side effect of the weights, not a
+      // decision. At 2 the reachable set becomes: extreme-zone rollovers on 1D/4H/1H (5.5/5.0/
+      // 5.0) and mid-range only on the daily (5.0) — while every sub-1H rollover stays out
+      // (30m 4.0, 15m 3.5), which is what MIN_QUALITY was raised to 5 to achieve in the first
+      // place. Deliberately the smallest change that reopens 4H without reopening the noise.
+      const DET_WEIGHT = { divergence: 3, greendot: 2, rollover: 2 };
+      const hits = [];
+      for (const tf of ["1D", "4H", "1H", "30m", "15m"]) {
+        const c = bars[tf]; if (!c || c.length < 80) continue;
+        for (const [nm, fn] of [["divergence", detectWTDivergence], ["rollover", detectMomentumRollover], ["greendot", detectGreenDotMFReversal]]) {
+          let r = null; try { r = fn(c); } catch {}
+          if (!r || !r.match) continue;
+          const bonus = (r.stage === "extreme" || r.stage === "fresh") ? 1 : 0;
+          hits.push({ m: r, label: nm, tf, c, q: (TF_WEIGHT[tf] || 1) + (DET_WEIGHT[nm] || 1) + bonus });
+        }
+      }
+      // Ranking alone does NOT reduce how often we trade — a candidate still exists if ANY
+      // timeframe fires, and across 5 timeframes that is ~half of all coins. A minimum quality
+      // is what actually bites: a bare rollover on a low timeframe is not a trade. At 5.0 the
+      // bar is roughly "daily extreme-zone rollover, or a divergence on 4H+" (2026-08-12).
+      const MIN_QUALITY = num("MIN_QUALITY", 5);
+      if (hits.length) {
+        hits.sort((a, b) => b.q - a.q);
+        const best = hits[0];
+        // ── RANKING EXPERIMENT (shadow) ───────────────────────────────────────────────────────
+        // The live rule fires whatever clears MIN_QUALITY, so a hot market gives twenty mediocre
+        // trades and a quiet one gives nothing — and a whole day can pass with "quality 4.0 < 5"
+        // on every line. The variant asks a different question: of everything the scanner saw
+        // this run, which are the BEST few? Threshold vs rank, same signals, graded on the same
+        // forward candles. Recorded here whether or not it clears the bar.
+        rankPool.push({ coin, dir: best.m.dir, quality: best.q, tf: best.tf, label: best.label,
+                        price: best.c[best.c.length - 1].c });
+        if (best.q < MIN_QUALITY) {
+          await pushLog({ coin, dir: best.m.dir, skipped: `signal too weak — ${best.label} on ${best.tf} (quality ${best.q.toFixed(1)} < ${MIN_QUALITY})` });
+        } else {
+        sig = { bias: best.m.dir, score: CFG.minScore(),
+                ev: [best.m.label || best.label, ...(best.m.ev || [])].slice(0, 4),
+                price: best.c[best.c.length - 1].c, planTf: best.tf, detector: best.label,
+                alt: hits.length > 1 ? hits.length - 1 : 0, quality: +best.q.toFixed(2) };
+        }
+      }
+    }
+    if (!sig) continue;
+    candidates++;
+
+    const key = `${coin}|${sig.bias}|${day}`;
+    if (fired[key]) continue;
+    if ((attempts[key] || 0) >= CFG.maxAttempts()) { await pushLog({ coin, dir: sig.bias, score: sig.score, skipped: `attempt cap — ${attempts[key]} failed sends today, resting until tomorrow` }); continue; }
+    const book = bookFor(sig.planTf || "1D");
+    const bcfg = BOOK_CFG[book];
+    if (!canSeeBook) { await pushLog({ coin, dir: sig.bias, book, score: sig.score, skipped: "REFUSED — cannot read open positions, so cannot check for an opposing leg" }); continue; }
+    // The no-hedge rule lives INSIDE a book. A 4H short while a weekly long runs is not a hedge,
+    // it is a different trade on a different horizon — which is the whole point of splitting them.
+    if (opposes(book, coin, sig.bias)) { await pushLog({ coin, dir: sig.bias, book, score: sig.score, skipped: `REFUSED — would open a ${sig.bias} against an existing ${sig.bias === "long" ? "short" : "long"} on ${coin} in the ${book} book. This bot does not hedge within a book.` }); continue; }
+    if (held.has(book + "|" + coin)) { await pushLog({ coin, dir: sig.bias, book, score: sig.score, skipped: `already holding ${coin} in the ${book} book` }); continue; }
+    if (sameDir(book, sig.bias) >= bcfg.corrMax()) { await pushLog({ coin, dir: sig.bias, book, score: sig.score, skipped: `correlation guard — already ${sameDir(book, sig.bias)} ${sig.bias} positions in the ${book} book (max ${bcfg.corrMax()})` }); continue; }
+    if (placedInBook[book] + placedToday >= CFG.dayCap() || placedInBook[book] >= bcfg.dayCap()) { await pushLog({ coin, dir: sig.bias, book, score: sig.score, skipped: `daily cap reached for the ${book} book (${bcfg.dayCap()})` }); continue; }
+    // The only filter in this bot that is allowed to refuse a trade on evidence — see gate1dShort.
+    // Placed after rankPool.push() above, so the decision it blocks is still measured.
+    {
+      const why1d = gate1dShort(sig.bias, sig.planTf, REGIME.label);
+      if (why1d) { await pushLog({ coin, dir: sig.bias, book, score: sig.score, skipped: "REFUSED — " + why1d }); continue; }
+    }
+
+    const planBars = bars[sig.planTf] || await fetchCandles(coin, sig.planTf || "1D", 260);
+    const plan = planBars ? buildTradePlan(planBars, sig.bias, sig.price) : null;
+    if (!plan) {
+      // One sentence for three different failures is how this stayed the biggest line in the log
+      // for weeks without anyone being able to act on it. Missing candles and a refused-because-
+      // too-volatile setup are not the same event and must never read the same again.
+      const nb = Array.isArray(planBars) ? planBars.length : 0;
+      const why = !nb ? `no ${sig.planTf || "1D"} candles came back — the venue did not answer, so there was nothing to build a plan from`
+                : nb < 60 ? `only ${nb} ${sig.planTf || "1D"} candles came back, too few to measure a stop from`
+                : `refused — the stop the structure asks for is more than 3× ATR away on ${sig.planTf || "1D"}. A move that size has no edge over this signal.`;
+      await pushLog({ coin, dir: sig.bias, score: sig.score, planTf: sig.planTf || "1D", bars: nb, skipped: why });
+      continue;
+    }
+
+    const t = { coin, dir: sig.bias, entry: plan.entry, sl: plan.stop, tp1: plan.targets[0], tp2: plan.targets[1], score: sig.score,
+                stopKind: plan.stopKind, trend: plan.trend, zone: plan.zone };
+    // WHICH SETUP MADE THIS TRADE (2026-09-19). Until now the record said what was traded, never why,
+    // so live results could not be split by setup. Carried onto the placed record, the open position
+    // and the resolved record. "confluence" is the score path; otherwise the detector name.
+    const setupName = sig.detector || "confluence", setupTf = sig.planTf || "1D";
+    // The quality score that let this trade through (MIN_QUALITY), carried onto every record so
+    // "do 6s beat 5s?" can be answered from LIVE trades, not only from the shadow tests (2026-10-26).
+    // The confluence path has no quality score; it is recorded as absent, not as zero.
+    const quality = Number.isFinite(sig.quality) ? sig.quality : undefined;
+    lastPrice[coin] = sig.price;
+    const bad = planValid(t);
+    if (bad) { await pushLog({ ...t, skipped: "REFUSED — " + bad }); continue; }
+
+    // The breaker blocks NEW entries only — everything above (scan, shadow records) and every
+    // risk-reducing pass (exits, expiry, de-hedge) has already run. The coin is not burned for
+    // the day: the signal was fine, the account state was not.
+    if (BREAKER.paused) { await pushLog({ ...t, skipped: "CIRCUIT BREAKER — " + (BREAKER.st.pausedWhy || "paused") }); continue; }
+
+    // Already told no by the venue? Do not ask again, and do not spend the day's slot finding out.
+    const benched = venueBlock(VENUE, String(coin).toUpperCase() + "USDT", Date.now());
+    if (benched) {
+      await pushLog({ ...t, result: "SKIPPED (venue)", skipped: benched.label,
+                      rejection: { label: benched.why, klass: "execution_artifact", cause: "venue", code: benched.code },
+                      countsForStats: false });
+      continue;                                   // the coin is NOT burned — the setup was fine
+    }
+
+    const built = buildOrder(t);
+    if (built.err) { await pushLog({ ...t, skipped: built.err }); continue; }
+
+    // Ask the question Phemex is about to ask, before spending the coin on it.
+    if (mode === "armed") {
+      const mk = await markPriceFor(built.meta.symbol);
+      const stale = markStopVerdict(built.order, mk);
+      if (stale) {
+        await pushLog({ ...t, result: "SKIPPED (aged out)", skipped: stale.detail,
+                        rejection: { ...stale }, countsForStats: false });
+        continue;                                 // not burned: the same setup may be fine next run
+      }
+    }
+
+    fired[key] = Date.now();
+    if (mode === "dry") {
+      openedThisRun.push({ book, dir: sig.bias, coin, setup: setupName, setupTf, quality, plan: { entry: t.entry, stop: t.sl, target: t.tp2 ?? t.tp1 } });
+      noteOpened(book, coin, sig.bias);    // a dry run must model the same book the armed one would
+      held.add(book + "|" + coin); placedInBook[book]++;
+      await pushLog({ ...t, qty: built.meta.qty, risk: built.meta.riskActual, clamped: built.meta.clamped || undefined, mode, result: "dry-run OK", thesis: sig.ev.join("; ") + " · plan from " + (sig.planTf || "1D") + (sig.detector ? " · " + sig.detector + " detector" + (sig.alt ? " (best of " + (sig.alt + 1) + " hits)" : "") : " · confluence") });
+      placed++; placedToday++;
+      continue;
+    }
+    let r;
+    attempts[key] = (attempts[key] || 0) + 1;          // count the send, not the outcome
+    try { r = await execOrder(built.order); }
+    catch (e) {
+      // A hiccup on one coin should cost that coin, not the rest of the sweep.
+      delete fired[key];                               // transient — let the next run retry it
+      await pushLog({ ...t, qty: built.meta.qty, risk: built.meta.riskActual, clamped: built.meta.clamped || undefined, mode, via: EXEC(), attempt: attempts[key], result: "ERR unreachable — " + String(e && e.message || e).slice(0, 160), diag: { ms: e && e.ms, error: String(e && e.name || "") } });
+      continue;
+    }
+    // An empty 200 is NOT a fill — require the relay to have actually said something back,
+    // or a blank response gets logged as a placed trade that doesn't exist.
+    const isOK = (x) => x.status === 200 && x.data && !x.data.error && !x.data.parseError && Object.keys(x.data).length > 0;
+    let ok = isOK(r), recovered = "";
+
+    // ── VERIFY, THEN RETRY ONCE, ON A 5xx (2026-08-14) ──
+    // ~45% of order POSTs come back as a Cloudflare HTML 502 with no correlation to anything
+    // about the trade. Ask the exchange whether it landed before doing anything: if it did, the
+    // trade is real and we record it rather than firing a duplicate. Only if it genuinely is not
+    // there do we send again — one retry, not a loop, so a systemic outage can't machine-gun.
+    if (!ok && r.status >= 500) {
+      await new Promise(res => setTimeout(res, 1500));   // let the exchange settle before asking
+      const chk = await confirmPlaced(built.meta.symbol, built.order.clOrdID, coin);
+      if (chk.landed) {
+        ok = true; recovered = " (recovered — 502 on the way back, but it " + chk.how + ")";
+        if (chk.orderID) r = { status: 200, data: { phemex: { data: { data: { orderID: chk.orderID } } } } };
+      } else if ((attempts[key] || 0) < CFG.maxAttempts()) {
+        try {
+          attempts[key] = (attempts[key] || 0) + 1;
+          const r2 = await execOrder(built.order);
+          if (isOK(r2)) { r = r2; ok = true; recovered = " (retried after a " + r.status + ")"; }
+          else r = r2;
+        } catch { /* keep the original failure */ }
+      }
+    }
+    const oid = (r.data?.phemex?.data?.data?.orderID) || "";
+    // If the relay answered with something we could not parse, say so and keep the first 200
+    // chars. A bare "ERR 502" is undiagnosable after the fact — it hid a relay crash for two
+    // days (2026-08-13). The cause must be in the log entry itself, not in a val's console.
+    const why = r.data.error || (r.data.parseError ? r.status + " unparseable — " + String(r.data.raw || "").slice(0, 200) : r.status);
+    await pushLog({ ...t, qty: built.meta.qty, risk: built.meta.riskActual, clamped: built.meta.clamped || undefined, mode, orderID: oid, entryKind: built.meta.entryKind, stopKind: built.meta.stopKind, book, recovered: recovered ? recovered.trim() : undefined, via: EXEC(), attempt: attempts[key], diag: ok ? undefined : r.diag, result: ok ? (r.data.dryRun ? "dry-run OK" : "PLACED" + recovered) : "REJECTED (not a signal) — " + explainRejection(why).label,
+      rejection: ok ? undefined : { ...explainRejection(why), raw: String(why).slice(0, 120) },
+      countsForStats: ok ? true : false, thesis: sig.ev.join("; ") + " · plan from " + (sig.planTf || "1D") + (sig.detector ? " · " + sig.detector + " detector" + (sig.alt ? " (best of " + (sig.alt + 1) + " hits)" : "") : " · confluence") });
+    // The ledger gets the order attempt too, so a rejection rate can be measured over months
+    // rather than over whatever happens to still be in the last 300 log lines.
+    await pushLedger({ kind: ok ? "placed" : "rejected", coin: t.coin, dir: t.dir, book, setup: setupName, setupTf, quality,
+      entry: t.entry, stop: t.sl, target: t.tp1, qty: built.meta.qty, risk: built.meta.riskActual,
+      mode, via: EXEC(), orderID: oid || undefined,
+      dryRun: ok ? !!r.data.dryRun : undefined,
+      rejection: ok ? undefined : { ...explainRejection(why), raw: String(why).slice(0, 120) },
+      countsForStats: !!ok });
+
+    // Remember what the venue said, so the next run does not spend a coin rediscovering it.
+    {
+      const sym = built.meta.symbol;
+      const code = ok ? null : (explainRejection(why).code || null);
+      const before = JSON.stringify(VENUE);
+      VENUE = ok ? venueClear(VENUE, sym) : venueNote(VENUE, sym, code, Date.now());
+      if (JSON.stringify(VENUE) !== before) await setJSON(VENUE_KEY, VENUE);
+    }
+    // fired[] was set BEFORE the attempt, so a failed order still burned the coin for the whole
+    // day — 17 signals in Aug were lost twice over: no order placed AND no retry. A server-side
+    // fault is not a decision, so undo the mark and let the next sweep have another go. A 4xx IS
+    // a decision (cap breached, bad symbol) and would just repeat, so that one stays burned.
+    if (!ok && r.status >= 500) delete fired[key];
+    if (ok) { try { await rememberResting(built.meta, built.order, coin, sig.bias, oid); } catch {}
+      placed++; placedToday++; placedInBook[book]++;
+      openedThisRun.push({ book, dir: sig.bias, coin, setup: setupName, setupTf, quality, plan: { entry: t.entry, stop: t.sl, target: t.tp2 ?? t.tp1 } });
+      held.add(book + "|" + coin); noteOpened(book, coin, sig.bias); }
+  }
+
+  if (!CFG.confluence()) console.log(`confluence path OFF (CONFLUENCE=1 turns it on): it would have fired on ${confluenceOff} coin(s) this run`);
+
+  // ── SHADOW: record this run's decisions, grade older ones, let the evidence decide ──────────
+  try {
+    const RANK_TOP_N = num("RANK_TOP_N", 3);
+    const planFor = async (x) => {
+      const bars = await fetchCandles(x.coin, x.tf || "1D", 260);
+      const plan = bars ? buildTradePlan(bars, x.dir, x.price) : null;
+      if (!plan) return null;
+      const t = { coin: x.coin, dir: x.dir, entry: plan.entry, sl: plan.stop, tp1: plan.targets[0],
+                  tp2: plan.targets[1], planTf: x.tf };
+      return planValid(t) ? null : t;
+    };
+    const MINQ = num("MIN_QUALITY", 5);
+    const baselineSet = rankPool.filter(x => x.quality >= MINQ);
+    const variantSet  = [...rankPool].sort((a, b) => b.quality - a.quality).slice(0, RANK_TOP_N);
+    for (const [arm, set] of [["baseline", baselineSet], ["variant", variantSet]]) {
+      for (const x of set) {
+        const t = await planFor(x);
+        if (t) shadowRecord(SHADOW, "rank_vs_threshold", arm, t,
+          { quality: +x.quality.toFixed(1), note: x.label,
+            reg: REGIME.label, regDist: REGIME.distPct, breadth: REGIME.breadth,
+            rs: RS.ok ? RS.rank(x.coin, x.dir) : null });
+      }
+    }
+    const gradedN = await gradeShadow(SHADOW);
+
+    // ── TIME-STOP EXPERIMENT ─────────────────────────────────────────────────────────────────
+    // Re-scores the SAME decisions the ranking experiment already recorded, under each candidate
+    // window. No extra trades, no extra risk — just a second question asked of the same data:
+    // would giving up after N bars have made more R than holding on?
+    const tsSlot = shadowSlot(SHADOW, "time_stop");
+    if (staleArms(tsSlot)) {
+      tsSlot.arms = {};
+      console.log(`shadow time_stop: totals discarded — built by the pre-guard grader (now ${SHADOW_GRADER_REV})`);
+    }
+    tsSlot.arms = tsSlot.arms || {};
+    const src = (SHADOW.rank_vs_threshold && SHADOW.rank_vs_threshold.records) || [];
+    const byKey = new Map();
+    for (const rec of src) {
+      if (rec.arm !== "baseline") continue;                       // score the live rule's trades
+      const k = rec.coin + "|" + (rec.tf || "1D");
+      if (!byKey.has(k)) byKey.set(k, []);
+      byKey.get(k).push(rec);
+    }
+    for (const [k, recs] of byKey) {
+      const [coin, tf] = k.split("|");
+      let candles = null;
+      try { candles = await fetchCandles(coin, tf, 300); } catch {}
+      if (!candles) continue;
+      for (const rec of recs) {
+        for (const n of TIMESTOP_BARS) {
+          const key = "bars" + n;
+          tsSlot.arms[key] = tsSlot.arms[key] || { sum: 0, n: 0, seen: [] };
+          const id = rec.coin + rec.at;
+          if (tsSlot.arms[key].seen.includes(id)) continue;
+          const R = gradeWithTimeStop(rec, candles, n);
+          if (R === null) continue;
+          tsSlot.arms[key].sum += R; tsSlot.arms[key].n++;
+          tsSlot.arms[key].seen.push(id);
+          if (tsSlot.arms[key].seen.length > SHADOW_MAX_RECORDS) tsSlot.arms[key].seen = tsSlot.arms[key].seen.slice(-SHADOW_MAX_RECORDS);
+        }
+      }
+    }
+    const holdStats = armStats(src, "baseline");
+    const tsLine = TIMESTOP_BARS.map(n => { const a = tsSlot.arms["bars" + n] || { sum: 0, n: 0 };
+      return `${n}b ${a.n ? (a.sum / a.n).toFixed(3) : "—"}R (${a.n})`; }).join(" · ");
+    console.log(`shadow time_stop: hold-forever ${holdStats.meanR}R (${holdStats.n}) · ${tsLine}`);
+
+    // ── MAKER-ENTRY EXPERIMENT (2026-08-19) ──────────────────────────────────────────────────
+    // The same decisions, a fourth question: what would a post-only limit at the signal price
+    // have returned, net of fees, against the marketable limit the bot actually sends? Graded on
+    // the timeframe below the signal so a fill and a stop can be told apart within the bar.
+    const meSlot = shadowSlot(SHADOW, "maker_entry");
+    if (staleArms(meSlot)) {
+      meSlot.arms = { taker: { sum: 0, n: 0 }, maker: { sum: 0, n: 0, filled: 0, missed: 0 } };
+      meSlot.seen = [];
+      console.log(`shadow maker_entry: totals discarded — built by the pre-guard grader (now ${SHADOW_GRADER_REV})`);
+    }
+    meSlot.arms = meSlot.arms || { taker: { sum: 0, n: 0 }, maker: { sum: 0, n: 0, filled: 0, missed: 0 } };
+    meSlot.seen = meSlot.seen || [];
+    const meNeed = new Map();
+    for (const rec of src) {
+      if (rec.arm !== "baseline") continue;
+      if (meSlot.seen.includes(rec.coin + rec.at)) continue;
+      const gtf = GRADE_TF_BELOW[rec.tf || "1D"] || "1H";
+      const mk = rec.coin + "|" + gtf;
+      if (!meNeed.has(mk)) meNeed.set(mk, []);
+      meNeed.get(mk).push(rec);
+    }
+    for (const [mk, mrecs] of meNeed) {
+      const [coin, gtf] = mk.split("|");
+      let candles = null;
+      try { candles = await fetchCandles(coin, gtf, 600); } catch { }
+      if (!candles) continue;
+      for (const rec of mrecs) {
+        const g = gradeMakerEntry(rec, candles, CFG.entryExpiryH() || 8);
+        if (!g) continue;                       // not settled yet — try again next run
+        meSlot.arms.taker.sum += g.takerR; meSlot.arms.taker.n++;
+        meSlot.arms.maker.sum += g.makerR; meSlot.arms.maker.n++;
+        if (g.filled) meSlot.arms.maker.filled++; else meSlot.arms.maker.missed++;
+        meSlot.seen.push(rec.coin + rec.at);
+        if (meSlot.seen.length > SHADOW_MAX_RECORDS) meSlot.seen = meSlot.seen.slice(-SHADOW_MAX_RECORDS);
+      }
+    }
+    {
+      const a = meSlot.arms, meanME = x => x.n ? (x.sum / x.n).toFixed(3) : "—";
+      console.log(`shadow maker_entry: taker ${meanME(a.taker)}R (${a.taker.n}) · maker ${meanME(a.maker)}R (${a.maker.n}: ${a.maker.filled} filled, ${a.maker.missed} missed)`);
+    }
+
+    const v = shadowJudge(SHADOW, "rank_vs_threshold");
+    await saveShadow(SHADOW);
+    console.log(`shadow rank_vs_threshold: baseline ${v.base.n} trades @ ${v.base.meanR}R · variant ${v.varr.n} @ ${v.varr.meanR}R · edge ${v.edge >= 0 ? "+" : ""}${v.edge}R${v.ready ? "" : " (still gathering)"}${v.changed ? " — " + v.changed.toUpperCase() : ""}${gradedN ? ` · graded ${gradedN} this run` : ""}${SHADOW_DUPS_THIS_RUN ? ` · ${SHADOW_DUPS_THIS_RUN} duplicate offer(s) not re-recorded` : ""}`);
+    if (v.changed) await pushLog({ shadow: "rank_vs_threshold", result: v.changed.toUpperCase(),
+      skipped: `ranking ${v.changed}: variant ${v.varr.meanR}R vs baseline ${v.base.meanR}R over ${v.varr.n}/${v.base.n} resolved trades` });
+
+    // ── REGIME EXPERIMENT ────────────────────────────────────────────────────────────────────
+    // Same decisions again, asked a third question: does it matter which way the market was
+    // pointing? Reported every run so the sample builds in the open; believed only when a box
+    // wins in both halves of its own history.
+    const rv = regimeVerdict(src);
+    const boxLine = Object.entries(rv.boxes)
+      .map(([k, b]) => `${k} ${b.meanR === null ? "—" : (b.meanR >= 0 ? "+" : "") + b.meanR + "R"} (${b.n})`).join(" · ");
+    console.log(`shadow regime_direction: ${boxLine}`);
+    if (rv.ready) {
+      for (const t of rv.trustworthy) {
+        console.log(`  → ${t.box} ${t.sign} consistently: ${t.meanR}R over ${t.n}, and holds in both halves (${t.firstHalf} then ${t.secondHalf})`);
+      }
+      const prev = shadowSlot(SHADOW, "regime_direction");
+      const sig = rv.trustworthy.map(t => t.box + ":" + t.sign).sort().join(",");
+      if (prev.lastVerdict !== sig) {
+        prev.lastVerdict = sig;
+        prev.history.push({ at: Date.now(), changed: "evidence", boxes: rv.boxes, trustworthy: rv.trustworthy });
+        await pushLog({ shadow: "regime_direction", result: "EVIDENCE",
+          skipped: `regime boxes now stable: ${rv.trustworthy.map(t => `${t.box} ${t.sign} ${t.meanR}R over ${t.n}`).join("; ")}. Still advisory — nothing is filtered.` });
+      }
+    } else {
+      const need = Object.entries(rv.boxes).filter(([, b]) => b.n < REGIME_MIN_PER_BOX * 2).length;
+      console.log(`  → still gathering: ${need} of 4 boxes short of ${REGIME_MIN_PER_BOX * 2} resolved trades, and none may be believed until both halves agree`);
+    }
+
+    // ── RELATIVE STRENGTH EXPERIMENT ─────────────────────────────────────────────────────────
+    const sv = rsVerdict(src);
+    console.log('shadow relative_strength: ' + Object.entries(sv.boxes)
+      .map(([k, b]) => `${k.slice(3)} ${b.meanR === null ? "—" : (b.meanR >= 0 ? "+" : "") + b.meanR + "R"} (${b.n})`).join(" · "));
+    if (sv.ready) {
+      for (const t of sv.trustworthy) {
+        console.log(`  → ${t.box} ${t.sign} consistently: ${t.meanR}R over ${t.n}, and holds in both halves (${t.firstHalf} then ${t.secondHalf})`);
+      }
+      const slot = shadowSlot(SHADOW, "relative_strength");
+      const sig = sv.trustworthy.map(t => t.box + ":" + t.sign).sort().join(",");
+      if (slot.lastVerdict !== sig) {
+        slot.lastVerdict = sig;
+        slot.history.push({ at: Date.now(), changed: "evidence", boxes: sv.boxes, trustworthy: sv.trustworthy });
+        await pushLog({ shadow: "relative_strength", result: "EVIDENCE",
+          skipped: `rank boxes now stable: ${sv.trustworthy.map(t => `${t.box} ${t.sign} ${t.meanR}R over ${t.n}`).join("; ")}. Still advisory — nothing is filtered.` });
+      }
+    }
+    // ── INSIGHT SCAN ─────────────────────────────────────────────────────────────────────────
+    // Every pre-registered feature, swept over every graded live decision, every run. Insights
+    // are reported when stable in both halves; a change in the stable set is logged so it can be
+    // seen from the app. Measures only — an insight earns a shadow arm, never a filter, from here.
+    const ins = insightScan(src);
+    const stable = ins.filter(r => r.stable);
+    const gathering = ins.filter(r => !r.stable && r.n < INSIGHT_MIN_N).length;
+    if (stable.length) {
+      for (const r of stable) {
+        console.log(`insight: ${r.feature}=${r.bucket} ${r.meanR >= 0 ? "+" : ""}${r.meanR}R over ${r.n}, holds in both halves (${r.firstHalf} then ${r.secondHalf})`);
+      }
+    }
+    console.log(`insight scan: ${ins.length} buckets watched · ${stable.length} stable · ${gathering} still gathering toward n=${INSIGHT_MIN_N}`);
+    {
+      const slot = shadowSlot(SHADOW, "insight_scan");
+      const sig = stable.map(r => `${r.feature}=${r.bucket}:${r.meanR >= 0 ? "+" : "-"}`).sort().join(",");
+      if (slot.lastVerdict !== sig) {
+        slot.lastVerdict = sig;
+        slot.history.push({ at: Date.now(), changed: "evidence", stable });
+        if (stable.length) await pushLog({ shadow: "insight_scan", result: "EVIDENCE",
+          skipped: `stable insights now: ${stable.map(r => `${r.feature}=${r.bucket} ${r.meanR}R over ${r.n}`).join("; ")}. Still advisory — nothing is filtered.` });
+      }
+    }
+
+    // ── THE BRAIN'S EYES: loser autopsy (2026-08-19) ─────────────────────────────────────────
+    // One batched call, only when there are new graded losses, hard daily cap, labels only.
+    try {
+      const bSlot = shadowSlot(SHADOW, "brain_autopsy");
+      const fresh = src.filter(r => r.arm === "baseline" && r.R !== null && r.R <= AUTOPSY_MAX_R() && !r.autopsy)
+                       .sort((a, b) => a.at - b.at).slice(0, AUTOPSY_BATCH());
+      if (!brainProvider()) {
+        // ── OFF IS A STATE, NOT AN ABSENCE (2026-08-21) ──────────────────────────────────────
+        // John: "why has brain_autopsy never recorded anything?" Because it has never run: there
+        // is no ANTHROPIC_API_KEY, so it returns here every time. That was reported only to the
+        // GitHub Actions console, which is not where anyone looks — so from the app's side the
+        // feature looked wired up and simply silent, which is indistinguishable from broken.
+        //
+        // It is a config gap, not a bug: add ANTHROPIC_API_KEY to the repo secrets and it starts.
+        // Until then it says so on the record, once, where it can actually be seen.
+        if (fresh.length) {
+          console.log(`brain autopsy: ${fresh.length} unread loss(es) waiting — no brain configured. Set ANTHROPIC_API_KEY, or BRAIN_BASE_URL + BRAIN_API_KEY for any OpenAI-compatible provider.`);
+          if (!bSlot.offNoted || Date.now() - bSlot.offNoted > 6 * 3600e3) {
+            bSlot.offNoted = Date.now();
+            await pushLog({ shadow: "brain_autopsy", result: "OFF", countsForStats: false,
+              skipped: `${fresh.length} losing trade(s) are waiting to be read, but the loser-autopsy brain has never run: no brain is configured on the repo, so it returns before doing anything. Either ANTHROPIC_API_KEY, or BRAIN_BASE_URL plus BRAIN_API_KEY for a cheaper OpenAI-compatible provider. `
+                + `This is a setting, not a fault — add the secret in Settings → Secrets and variables → Actions and it starts on the next run. `
+                + `It costs at most $${num("BRAIN_DAILY_USD", 0.25)} a day and never places, sizes or blocks an order.` });
+          }
+        }
+      } else if (fresh.length && brainBudget(bSlot, Date.now(), null)) {
+        const res = await brainCall(buildAutopsyPrompt(fresh));
+        if (res) {
+          const withinBudget = brainBudget(bSlot, Date.now(), res.usage);
+          const labels = parseAutopsy(res.text, fresh.length);
+          for (const { i, c, w } of labels) { fresh[i].autopsy = c; fresh[i].autopsyWhy = w; }
+          console.log(`brain autopsy: read ${labels.length}/${fresh.length} losses · $${(bSlot.spendUsd || 0).toFixed(3)} of $${num("BRAIN_DAILY_USD", 0.25)} today${withinBudget ? "" : " — cap reached, brain rests until tomorrow"}`);
+        }
+      } else if (fresh.length) {
+        console.log(`brain autopsy: ${fresh.length} unread loss(es) held — daily cap $${num("BRAIN_DAILY_USD", 0.25)} already spent`);
+      }
+      // report the failure modes whether or not the brain ran this cycle
+      const vc = vetoCandidates(src);
+      if (vc.length) {
+        console.log("brain vetoes: " + vc.map(v => `${v.cause} ${v.meanR}R (${v.n}${v.candidate ? " CANDIDATE" : ""})`).join(" · "));
+        const sig = vc.filter(v => v.candidate).map(v => v.cause).sort().join(",");
+        if (bSlot.lastVerdict !== sig) {
+          bSlot.lastVerdict = sig;
+          bSlot.history.push({ at: Date.now(), changed: "evidence", candidates: vc.filter(v => v.candidate) });
+          if (sig) await pushLog({ shadow: "brain_autopsy", result: "EVIDENCE",
+            skipped: `recurring failure modes: ${vc.filter(v => v.candidate).map(v => `${v.cause} (${v.n} trades, ${v.meanR}R)`).join("; ")}. Advisory only — a veto must be written as a mechanical rule and win a shadow arm before it can block anything.` });
+        }
+      }
+    } catch (e) { console.error("brain autopsy failed (harmless, labels only):", e && e.message); }
+
+    await saveShadow(SHADOW);
+  } catch (e) { console.error("shadow pass failed (harmless, no orders involved):", e && e.message); }
+
+  // ── Resolutions → the reverse look ─────────────────────────────────────────────────────────
+  try {
+    const nowOpen = snapshotOpen(positions, bookMap, prevOpen);
+    // ── SAME KEY, DIFFERENT TRADE (audit 2026-10-26) ──────────────────────────────────────────
+    // A position closed and reopened on the same coin and side between two runs used to inherit
+    // the old one's since, plan, setup and orders — the old trade never resolved and its stop
+    // stayed armed against the new one. Split them: the old one resolves below, the new one
+    // starts clean (and is adopted or given this run's plan like any other).
+    const reopened = {};
+    for (const k of Object.keys(nowOpen)) {
+      const was = prevOpen && prevOpen[k];
+      if (!was || !reopenedKeys.has(k)) continue;
+      reopened[k] = was;
+      nowOpen[k] = { ...nowOpen[k], since: Date.now(), plan: null, setup: undefined, setupTf: undefined,
+                     quality: undefined, adopted: undefined, closedBy: undefined, unprotected: undefined };
+      console.log(`reopened: ${k} — the venue's fills closed the old position in full since it opened; the old trade is resolved and the new one starts clean`);
+    }
+    const gone = k => !nowOpen[k] || !!reopened[k];
+    // Attach the plan to anything opened this run, so the NEXT run can tell how it ended. Without
+    // this a resolution is just "gone" — with it we can say target, stop, or neither.
+    for (const o of openedThisRun) {
+      const k = posKey(o.coin, o.dir);
+      if (!nowOpen[k]) nowOpen[k] = { coin: o.coin, dir: o.dir, size: 0, book: o.book, since: Date.now() };
+      nowOpen[k].plan = o.plan || nowOpen[k].plan || null;
+      nowOpen[k].setup = o.setup || nowOpen[k].setup;
+      nowOpen[k].setupTf = o.setupTf || nowOpen[k].setupTf;
+      if (Number.isFinite(o.quality)) nowOpen[k].quality = o.quality;
+      nowOpen[k].book = o.book;
+    }
+    // Anything held with no plan gets adopted — see adoptOrphans. Bookkeeping only, no orders.
+    const adopted = await adoptOrphans(nowOpen, bookMap);
+    if (adopted.length) console.log(`adopted ${adopted.length} plan-less position(s): ${adopted.map(p => p.coin + " " + p.dir).join(", ")} — plan and book attached, no orders placed`);
+    // ── THEN MAKE SURE WHAT HAS A PLAN ACTUALLY HAS A STOP AT THE VENUE (2026-09-02) ────────────
+    // Runs right after adoption so a position just given a plan this run (like SOL) gets checked
+    // in the SAME cycle, not next one. See protectOpenPositions() above for the two bugs this closes.
+    const protect = await protectOpenPositions(nowOpen, priceOf);
+    if (protect.placed || protect.failed || protect.blind)
+      console.log(`protect sweep: ${protect.placed} stop(s) attached, ${protect.failed} failed, ${protect.alreadyOk} already ok, ${protect.blind} unreadable`);
+    // ── AND THE ONES IT COULD NOT ADOPT ─────────────────────────────────────────────────────
+    // Reported EVERY run, not once when it appeared. A warning you have to have been watching
+    // for is not a warning; this is money sitting at the venue with no stop on it, and it stays
+    // on the screen until it is gone. Recorded on state so the app panel shows it too.
+    const orphans = Object.values(nowOpen).filter(p => p && !p.plan && p.size > 0);
+    await setJSON(ORPHAN_KEY, orphans.map(p => ({
+      coin: p.coin, dir: p.dir, size: p.size, avgEntry: p.avgEntry,
+      notional: (Number(p.size) || 0) * (Number(p.avgEntry) || 0), since: p.since })));
+    if (orphans.length) {
+      console.error(`⚠ ${orphans.length} UNPROTECTED position(s) — no stop, no target, not in any book: ` +
+        orphans.map(p => `${p.coin} ${p.dir} ${p.size} (~${((Number(p.size)||0)*(Number(p.avgEntry)||0)).toFixed(0)} USDT)`).join(", "));
+    }
+    // The range each resolved position traded through since we last saw it, so a target that was
+    // hit and given back before the next run still reads as a target rather than as "closed".
+    // ── A TRADE CAN ONLY BE GRADED IF WE KNOW WHAT PRICE DID (2026-08-21, evening) ──────────
+    // John: "why do we only have two graded trades?" Five of seven resolutions came back
+    // "closed_by_hand — no entry recorded", and that phrase was the clue: it is printed when the
+    // classifier has NO PRICE for the coin. priceOf reads `lastPrice`, which is filled by the scan
+    // — and the scan only touches the 20 coins in this run's batch, rotating through 100. So a
+    // position whose coin was not in the batch of the run that noticed it had closed arrived at
+    // the classifier with no price at all, and fell through every test to "somebody closed this
+    // by hand". DOT and APT were opened at 15:38 while they WERE in the batch, and written off at
+    // 16:05 when the cursor had moved on. Nothing was wrong with the trades. We just looked away.
+    //
+    // The fix costs nothing: we are already fetching 15m candles for exactly these coins to build
+    // the range. The last close of those candles IS a price for the coin, current to the minute.
+    // Take it, and every resolution gets graded on what price actually did.
+    // ── GRADE ON THE VENUE THAT HELD THE POSITION (2026-08-22) ────────────────────────────────
+    // This used to build the range from Binance/OKX — mainnet — for a position that lived on
+    // Phemex testnet. Measured basis between the two on 2026-08-22 was 0.35% on BTC and 0.78% on
+    // DOT, against stops placed 2.2–2.5% away. A third of the stop distance, before the basis has
+    // moved. So real stop-outs landed at prices the reference market never printed, the range said
+    // "never touched", and 18 of 24 resolutions were written off as closed-by-hand.
+    //
+    // The venue is asked first. The reference market remains the fallback, because a grade from
+    // the wrong book still beats no grade at all — but which one answered is now RECORDED, so the
+    // two can never again be mistaken for each other.
+    const ranges = {}, exitPx = {}, gradedOn = {};
+    for (const k of Object.keys(prevOpen || {})) {
+      if (!gone(k)) continue;
+      const coin = prevOpen[k].coin;
+      if (ranges[coin] || exitPx[coin]) continue;
+      const since = Number(prevOpen[k].lastSeen) || (Date.now() - 6 * 36e5);
+      // The reference the scale check is measured against: what we believed the price was when
+      // the position was opened. It is the one number here that is certainly the right order of
+      // magnitude for this coin.
+      const refPx = Number((prevOpen[k].plan && prevOpen[k].plan.entry) || prevOpen[k].avgEntry) || null;
+      const useBars = (c, src) => {
+        if (!c || !c.length) return false;
+        const last = Number(c[c.length - 1].c);
+        const win = c.filter(b => b.t >= since - 36e5);
+        if (!win.length) return false;
+        if (Number.isFinite(last) && last > 0) exitPx[coin] = last;
+        ranges[coin] = { hi: Math.max(...win.map(b => b.h)), lo: Math.min(...win.map(b => b.l)) };
+        gradedOn[coin] = src;
+        return true;
+      };
+      try {
+        if (!useBars(await phemexCandles(coin, "15m", 96, refPx), "venue")) {
+          useBars(await fetchCandles(coin, "15m", 96), "reference");   // ~24h, far more than any run gap
+        }
+      } catch { /* no range and no price — classifyResolution says exactly that, and blames nobody */ }
+    }
+    {
+      const v = Object.values(gradedOn).filter(x => x === "venue").length;
+      const r = Object.values(gradedOn).filter(x => x === "reference").length;
+      if (v || r) console.log(`resolution graded on: ${v} from the venue, ${r} from the reference market` +
+        (r ? " — reference grades cannot see a venue-only stop-out and are marked as such" : ""));
+    }
+    // Prefer the scan's price when the coin happened to be in this batch; otherwise the one we
+    // just fetched. Either way the classifier is no longer at the mercy of the rotation cursor.
+    const priceForResolution = c => {
+      const scanned = priceOf(c);
+      return Number.isFinite(Number(scanned)) && Number(scanned) > 0 ? Number(scanned) : exitPx[c];
+    };
+    const blind = Object.keys(prevOpen || {}).filter(gone)
+      .map(k => prevOpen[k].coin).filter(c => !Number.isFinite(priceForResolution(c)));
+    if (blind.length) console.warn(`resolution: no price for ${[...new Set(blind)].join(", ")} — those cannot be graded and will say so`);
+    const stillOpen = Object.fromEntries(Object.entries(nowOpen).filter(([k]) => !reopened[k]));
+    const resolved = resolvedSince(prevOpen, stillOpen, priceForResolution, c => ranges[c] || null)
+      // Which market judged this. A resolution graded on the reference book carries strictly less
+      // authority than one graded on the venue, and the ledger has to be able to say which it was
+      // — otherwise the next person reading the record cannot tell a fact from an approximation.
+      .map(r => ({ ...r, gradedOn: gradedOn[r.coin] || "none" }));
+    // ── THEN ASK THE VENUE WHAT ACTUALLY CLOSED IT (2026-10-26) ─────────────────────────────
+    // The range verdict above stays as the fallback. Where Phemex's trade history has the closing
+    // fill, that fill decides: its price is the real exit and its clOrdID names the closer. Capped
+    // per run so a mass close cannot turn one run into fifty API calls.
+    let fillLookups = 0, fillsFound = 0; const fillMisses = []; let firstMiss = "";
+    const protectReg = (await getJSON(PROTECT_KEY, {})) || {};
+    const regKeys = resolved.map(r => regKeyFor(posKey(r.coin, r.dir), r.since, protectReg));
+    for (let i = 0; i < resolved.length; i++) {
+      const r = resolved[i];
+      if (!r.plan || fillLookups >= num("FILL_LOOKUPS_PER_RUN", 8)) continue;
+      fillLookups++;
+      let fill = null;
+      try { fill = await fetchCloseFill(`${r.coin}USDT`, r.dir === "short" ? "Short" : "Long", Number(r.since) || 0); } catch { }
+      if (fill) fillsFound++; else { fillMisses.push(`${r.coin} ${r.dir}`); if (!firstMiss) firstMiss = lastFillMiss; }
+      const a = attributeClose(r, fill, regKeys[i] ? protectReg[regKeys[i]] : null);
+      if (a) resolved[i] = { ...r, ...a };
+      else if (r.closedBy === "stop_breach_close" && Number.isFinite(r.exit)) {
+        // We closed it ourselves last run because the stop was already behind price.
+        const risk = Math.abs(r.plan.entry - r.plan.stop);
+        resolved[i] = { ...r, how: "stop", closedBy: "stop_breach_close", outcome: "loss", klass: "strategy",
+          execution: "filled_snapshot_only", countsForStreak: true, countsForStats: true,
+          R: risk > 0 ? +(((r.dir === "short" ? r.plan.entry - r.exit : r.exit - r.plan.entry)) / risk).toFixed(3) : -1,
+          why: "the bot closed it at market because price was already past its stop (no fill found, R from the last price)" };
+        if (resolved[i].R > 0) resolved[i].outcome = "win";
+      }
+    }
+    // Take each ended position's recorded stop and target off the venue, so neither can fire on
+    // the next position opened on the same coin and side.
+    try {
+      if (fillLookups) console.log(`fill lookups: ${fillsFound} of ${fillLookups} closing fill(s) found at the venue — the rest were graded from the price range`);
+      // One line per run naming EVERY miss (audit: the old once-per-run line named only the first).
+      if (fillMisses.length) await pushLog({ result: "FILL LOOKUP EMPTY",
+        skipped: `${fillMisses.length} of ${fillLookups} closed position(s) had no closing fill at the venue and were graded from the price range: ${fillMisses.join(", ")}. First venue answer: ${String(firstMiss).slice(0, 300)}` });
+      const pulled = await cancelProtectionFor(regKeys.filter(Boolean));
+      if (pulled) console.log(`protection: cancelled ${pulled} leftover stop/target order(s) for ${resolved.length} closed position(s)`);
+    } catch (e) { console.error("leftover-order cleanup failed (harmless, retried by the next reset):", e && e.message); }
+    const queue = [];
+    for (const r of resolved) {
+      const line = `${r.coin} ${r.dir} ${r.how}${Number.isFinite(r.exit) ? " at " + formatPrice(r.exit) : ""}`;
+      // The four labels go ON the record, not just into the sentence. A panel that has to read
+      // English to know whether something was a win will eventually read it wrong.
+      await pushLog({ coin: r.coin, dir: r.dir, book: r.book || undefined, gradedOn: r.gradedOn,
+        closedBy: r.closedBy || undefined, quality: Number.isFinite(r.quality) ? r.quality : undefined,
+        how: r.how, outcome: r.outcome, klass: r.klass, execution: r.execution,
+        R: Number.isFinite(r.R) ? r.R : undefined,
+        entry: r.plan && Number.isFinite(r.plan.entry) ? r.plan.entry : undefined,
+        exit: Number.isFinite(r.exit) ? r.exit : undefined,
+        countsForStats: !!r.countsForStats, countsForStreak: !!r.countsForStreak,
+        result: r.klass === "execution_artifact" ? "RESOLVED (not counted)" : "RESOLVED",
+        skipped: `${line} — ${r.why}` +
+          (r.klass === "execution_artifact"
+            ? " This is an EXECUTION ARTIFACT: it does not count toward the loss streak or the strategy's record."
+            : r.how === "target" ? " Target hit, queued for a reverse look." : "") });
+      await pushLedger({ kind: "resolved", coin: r.coin, dir: r.dir, book: r.book || undefined,
+        how: r.how, outcome: r.outcome, klass: r.klass, execution: r.execution,
+        R: Number.isFinite(r.R) ? r.R : undefined,
+        entry: r.plan && Number.isFinite(r.plan.entry) ? r.plan.entry : undefined,
+        stop: r.plan && Number.isFinite(r.plan.stop) ? r.plan.stop : undefined,
+        target: r.plan && Number.isFinite(r.plan.target) ? r.plan.target : undefined,
+        exit: Number.isFinite(r.exit) ? r.exit : undefined,
+        opened: r.since || undefined,
+        setup: r.setup || undefined, setupTf: r.setupTf || undefined,
+        quality: Number.isFinite(r.quality) ? r.quality : undefined,
+        closedBy: r.closedBy || undefined, gradedOn: r.gradedOn || undefined,
+        fill: r.closeFill ? { px: r.closeFill.px, ordType: r.closeFill.ordType || undefined,
+          clOrdID: r.closeFill.clOrdID ? r.closeFill.clOrdID.slice(0, 24) : undefined,
+          pnl: r.closeFill.closedPnl, at: r.closeFill.at } : undefined,
+        why: r.why ? String(r.why).slice(0, 200) : undefined,
+        countsForStats: !!r.countsForStats, countsForStreak: !!r.countsForStreak });
+      delete bookMap[posKey(r.coin, r.dir)];
+      if (r.how === "target") queue.push(r.coin);
+    }
+    if (queue.length) await setJSON(PRIORITY_KEY, queue);
+    // Stamp when each open position was last seen, so the next resolution knows how far back to
+    // look for its range. Without this the window is a guess.
+    const seenAt = Date.now();
+    for (const v of Object.values(nowOpen)) if (v) v.lastSeen = seenAt;
+    await setJSON(OPEN_KEY, nowOpen);
+    if (resolved.length) console.log(`resolved: ${resolved.map(r => `${r.coin} ${r.how}${r.klass === "execution_artifact" ? " (artifact, not counted)" : ""}`).join(", ")}`);
+
+    // ── ONLY REAL STRATEGY OUTCOMES REACH THE BREAKER (2026-08-20) ─────────────────────────
+    // The circuit breaker exists to stop the bot re-asking a market that keeps saying no. A
+    // rejected order, a hand-closed position or an unrecoverable ambiguity is not the market
+    // saying no — it is the plumbing, or you, and pausing trading over it would be the breaker
+    // firing at a phantom. Artifacts are logged in full above and consumed by nothing.
+    const strategyOutcomes = resolved.filter(r => r.countsForStreak);
+    const artifacts = resolved.filter(r => r.klass === "execution_artifact");
+    if (artifacts.length) console.log(`  ${artifacts.length} of those were execution artifacts and count toward nothing: ${artifacts.map(r => r.coin + " " + r.how).join(", ")}`);
+    if (strategyOutcomes.length) {
+      const bst = await getJSON(BREAKER_KEY, {});
+      const b = breakerStep(bst, { now: Date.now(), equity: null, resolvedHows: strategyOutcomes.map(r => r.how) });
+      await setJSON(BREAKER_KEY, b.st);
+      if (b.trips.includes("streak")) {
+        console.log(`CIRCUIT BREAKER TRIPPED (streak): ${b.st.pausedWhy}`);
+        await pushLog({ result: "BREAKER", skipped: b.st.pausedWhy });
+      }
+    }
+  } catch (e) { console.error("resolution pass failed (no orders involved):", e && e.message); }
+
+  // ── THE ACCUMULATOR ─────────────────────────────────────────────────────────────────────────
+  // The second objective: units, not money. It also runs on the MODE=off path above, so this
+  // call is for the normal scan path only. See runAccumulator for why the two are separate.
+  await runAccumulators();
+
+  await setJSON(BOOKMAP_KEY, bookMap);
+  await setJSON(KEY.fired, fired);
+  await setJSON("cipher_attempts", attempts);
+  if (_setupsFired) console.log(`setup lab: ${_setupsFired} shadow decision(s) recorded from discovered setups — none of them placed anything`);
+  // Advance by what was REACHED. A run that got through 13 of 20 resumes at 13 next time instead
+  // of starting at 20 and orphaning seven coins for good.
+  await setJSON(KEY.cursor, (cursor + Math.max(1, consumed)) % uni.length);
+  if (consumed < slice.length) console.log(`rotation: covered ${consumed}/${slice.length} this run — next run starts at the one after`);
+  await writeHealth({ started, canSeeBook, mode });      // before the heartbeat, so it can read the previous one
+  await setJSON("cipher_heartbeat", { at: new Date().toISOString(), scanned, candidates, placed, mode, via: EXEC(), ms: Date.now() - started });
+  console.log(`cipher-agent: scanned ${scanned}, ${candidates} candidates, ${placed} placed (${mode}, via ${EXEC()}) in ${Date.now() - started}ms`);
+}
+
+// ── HTTP view: the app reads these so the Bot Trades panel can show server decisions ──
+// Deploy this as a SECOND (HTTP) val importing { agentHttp } from this file, or split it out.
+export async function agentHttp(req) {
+  const cors = { "Access-Control-Allow-Origin": "*", "Access-Control-Allow-Headers": "Authorization" };
+  const auth = req.headers.get("Authorization") || "";
+  if (auth !== "Bearer " + env("AGENT_TOKEN", "")) return new Response("unauthorised", { status: 401, headers: cors });
+  const body = {
+    heartbeat: await getJSON("cipher_heartbeat", null),
+    decisions: await getJSON(KEY.log, []),
+    mode: CFG.mode(),
+  };
+  return new Response(JSON.stringify(body), { headers: { ...cors, "Content-Type": "application/json" } });
+}
+
+// ── Node / GitHub Actions entry point ──────────────────────────────────────────────────────
+// On Val Town the default export is invoked by the cron. Under Node nothing calls it, so run it
+// here and exit non-zero on failure so a broken run shows as a red tick rather than passing quietly.
+if (!IS_DENO && typeof process !== "undefined") {
+  cipherAgent()
+    .then(() => process.exit(0))
+    .catch(async (e) => {
+      console.error("cipher-agent failed:", e && (e.stack || e.message || e));
+      // A crash writes its own HEALTH record — the workflow saves state even on failure now — so
+      // the cause is in the repo, not only in a GitHub log nobody can read from outside.
+      try { await setJSON(HEALTH_KEY, { at: new Date().toISOString(), status: "CRASH",
+        problems: [String(e && (e.stack || e.message || e)).slice(0, 900)] }); } catch { }
+      process.exit(1);
+    });
+}
