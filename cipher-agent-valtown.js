@@ -1857,8 +1857,9 @@ function attributeClose(was, fill, reg) {
   // from the stats — a stop that filled 1.6R past its level because price jumped through it read
   // as somebody else's order, so the worst losses quietly vanished and the record looked better
   // than it was. The registry knows the exact orders placed for THIS position: match on those.
-  const isReg = (leg) => !!(reg && reg[leg] && ((fill.orderID && reg[leg].orderID && fill.orderID === String(reg[leg].orderID)) ||
-                                                (fill.clOrdID && reg[leg].clOrdID && fill.clOrdID === String(reg[leg].clOrdID))));
+  const same = (o) => o && ((fill.orderID && o.orderID && fill.orderID === String(o.orderID)) ||
+                            (fill.clOrdID && o.clOrdID && fill.clOrdID === String(o.clOrdID)));
+  const isReg = (leg) => !!(reg && (same(reg[leg]) || (reg.history || []).some(h => h.leg === leg && same(h))));
   const gap = (lvl) => risk > 0 && Number.isFinite(lvl) ? Math.abs(fill.px - lvl) / risk : 0;
   if (isReg("stop"))
     return strat("stop", "cipher_stop", `its own stop filled at ${formatPrice(fill.px)}` + (gap(stop) > 0.1 ? ` — ${gap(stop).toFixed(2)}R past the level (price gapped through it)` : ""));
@@ -1886,9 +1887,24 @@ function attributeClose(was, fill, reg) {
   return art("closed_by_hand", "outside_bot", `closed by an order this bot did not send (${fill.ordType || "unknown type"}${fill.clOrdID ? ", " + fill.clOrdID.slice(0, 20) : ""}) at ${formatPrice(fill.px)} — by hand, the app, or another tool`);
 }
 
-let _fillShapeLogged = false;
-async function fetchCloseFill(symbol, posSide, sinceMs) {
-  if (!CFG.direct()) return null;
+// PURE. How much of this side was CLOSED by fills at or after sinceMs. Rows without a readable time
+// are not counted — they cannot be shown to come after the position opened.
+function closedQtySince(rows, posSide, sinceMs) {
+  const closing = posSide === "Long" ? "Sell" : "Buy";
+  let q = 0;
+  for (const r of rows || []) {
+    if (!r || (r.posSide && String(r.posSide) !== posSide) || (r.side && String(r.side) !== closing)) continue;
+    const ns = Number(r.transactTimeNs); const ms = ns > 0 ? ns / 1e6 : Number(r.createdAt ?? r.execTime ?? r.transactTime ?? 0);
+    const t = ms > 1e14 ? ms / 1e6 : ms;
+    if (!(t > 0) || t < sinceMs - 60e3) continue;
+    q += Math.abs(Number(r.execQtyRq ?? r.execQty ?? 0)) || 0;
+  }
+  return q;
+}
+
+let lastFillMiss = "";
+async function fetchFillRows(symbol, sinceMs) {
+  if (!CFG.direct()) return { rows: null, seen: ["relay mode"] };
   const tries = [
     ["/exchange/order/v2/tradingList", `symbol=${symbol}&currency=USDT&offset=0&limit=50&withCount=false`],
     ["/api-data/g-futures/trades", `symbol=${symbol}&limit=50` + (sinceMs ? `&start=${Math.floor(sinceMs - 60e3)}` : "")],
@@ -1898,15 +1914,19 @@ async function fetchCloseFill(symbol, posSide, sinceMs) {
     try {
       const r = await phemexCall("GET", path, q, null);
       const rows = r.status === 200 ? fillRowsFrom(r.data) : null;
-      if (rows) { const f = pickClosingFill(rows, posSide, sinceMs); if (f) return { ...f, via: path }; }
+      if (rows && rows.length) return { rows, seen, via: path };
       seen.push(`${path} → http ${r.status} ${JSON.stringify(r.data || {}).slice(0, 160)}`);
     } catch (e) { seen.push(`${path} → ${String((e && e.message) || e).slice(0, 100)}`); }
   }
-  if (!_fillShapeLogged) {
-    _fillShapeLogged = true;
-    await pushLog({ coin: symbol.replace(/USDT$/, ""), result: "FILL LOOKUP EMPTY",
-      skipped: `could not find the closing fill for ${symbol} ${posSide} — graded from the price range instead. What the venue returned: ${seen.join(" ;; ")}` });
-  }
+  return { rows: null, seen };
+}
+
+async function fetchCloseFill(symbol, posSide, sinceMs) {
+  // A position with no recorded start still gets a window, never an open-ended one.
+  const since = Number(sinceMs) > 0 ? Number(sinceMs) : Date.now() - 7 * 864e5;
+  const { rows, seen, via } = await fetchFillRows(symbol, since);
+  if (rows) { const f = pickClosingFill(rows, posSide, since); if (f) return { ...f, via }; seen.push(`${via} → ${rows.length} fill(s), none closing ${posSide} since the position opened`); }
+  lastFillMiss = seen.join(" ;; ");
   return null;
 }
 
@@ -2709,6 +2729,9 @@ async function protectOpenPositions(nowOpen, priceOf) {
       if (reg && (reg.stop || reg.target)) registry[`${k}#${reg.since}`] = reg;
       reg = registry[k] = { symbol, posSide, since: pos.since }; dirty = true;
     }
+    // Pulled by the early pass (the position looked finished) but still open: those orders were
+    // CANCELLED, so the record must not go on claiming the position is covered (audit, 2nd pass).
+    if (reg.pulled) { delete reg.stop; delete reg.target; delete reg.pulled; dirty = true; }
     // The market-side check must use a MARKET price. The old sweep fell back to the position's
     // average entry when the coin was not in this run's scan batch, so a long whose stop had been
     // set above entry to lock in profit (DOT, adopted 2026-10-22) was refused every run as "stop
@@ -2729,7 +2752,10 @@ async function protectOpenPositions(nowOpen, priceOf) {
 
     // ── STOP ────────────────────────────────────────────────────────────────────────────────
     const seenStop = findRestingStop(orders, posSide);
-    const stopMoved = reg.stop && levelMoved(reg.stop.px, pos.plan.stop);
+    // Moved = the plan's level changed OR the position's size did (a partial close): either way the
+    // resting order no longer matches the position, so it is replaced.
+    const sizeMoved = (leg) => leg && Number(leg.qty) > 0 && Math.abs(Number(leg.qty) - Number(pos.size)) > 1e-9;
+    const stopMoved = reg.stop && (levelMoved(reg.stop.px, pos.plan.stop) || sizeMoved(reg.stop));
     if (stopMoved && reg.stop.orderID) {
       // The plan's stop has moved (trailed or rebuilt). Take the old one off before the new one
       // goes on, or the stack starts again one level at a time.
@@ -2753,7 +2779,10 @@ async function protectOpenPositions(nowOpen, priceOf) {
       if (!r.ok && !r.breached && /TE_(RISING|FALLING)_TRIGGER_DIRECTLY|phemex 1104[23]\b/i.test(String(r.why || ""))) r.breached = true;
       if (r.ok && !r.dry) {
         out.placed++;
-        reg.stop = { px: pos.plan.stop, sentPx: r.px, orderID: r.orderID, clOrdID: r.clOrdID, at: Date.now(), source: "placed" }; dirty = true;
+        reg.stop = { px: pos.plan.stop, sentPx: r.px, qty: pos.size, orderID: r.orderID, clOrdID: r.clOrdID, at: Date.now(), source: "placed" }; dirty = true;
+        // Every order ever placed for this position, so a replaced stop that still fills (its cancel
+        // having failed or raced) is still recognised as THIS trade's stop (audit, 2nd pass).
+        (reg.history = reg.history || []).push({ leg: "stop", orderID: r.orderID, clOrdID: r.clOrdID });
         await pushLog({ coin: pos.coin, dir: pos.dir, result: "STOP ATTACHED",
           skipped: `attached the plan's stop at ${formatPrice(pos.plan.stop)}. Recorded, so it will not be attached again while this position lives.` });
       } else if (!r.ok && r.breached && String(env("STOP_BREACH_CLOSE", "1")) === "1") {
@@ -2781,7 +2810,7 @@ async function protectOpenPositions(nowOpen, priceOf) {
 
     // ── TARGET ──────────────────────────────────────────────────────────────────────────────
     const seenTarget = findRestingTarget(orders, posSide);
-    const tgtMoved = reg.target && levelMoved(reg.target.px, pos.plan.target);
+    const tgtMoved = reg.target && (levelMoved(reg.target.px, pos.plan.target) || sizeMoved(reg.target));
     // Our targets are plain limits, which the book read DOES show. So if we recorded one and the
     // book is readable and it is not there, it has gone (filled, cancelled, expired): forget it.
     // Run #826 showed the open-orders rows arrive WITHOUT ordType, posSide or reduceOnly — which
@@ -2792,7 +2821,7 @@ async function protectOpenPositions(nowOpen, priceOf) {
     if (tgtMoved && reg.target && reg.target.orderID) {
       const c = await cancelOrder(symbol, reg.target.orderID, reg.target.clOrdID, posSide);
       if (c.ok) { delete reg.target; dirty = true; }
-    }
+    } else if (tgtMoved) { delete reg.target; dirty = true; }
     if (seenTarget && !reg.target) {
       reg.target = { px: pos.plan.target, sentPx: Number(seenTarget.priceRp ?? seenTarget.stopPxRp) || undefined, orderID: seenTarget.orderID, clOrdID: seenTarget.clOrdID, at: Date.now(), source: "book" };
       dirty = true;
@@ -2801,7 +2830,8 @@ async function protectOpenPositions(nowOpen, priceOf) {
       const r = await directProtect({ symbol, posSide, kind: "Target", triggerPx: pos.plan.target, qty: pos.size, refPx: await venueRef() });
       if (r.ok && !r.dry) {
         out.targets++;
-        reg.target = { px: pos.plan.target, sentPx: r.px, orderID: r.orderID, clOrdID: r.clOrdID, at: Date.now(), source: "placed" }; dirty = true;
+        reg.target = { px: pos.plan.target, sentPx: r.px, qty: pos.size, orderID: r.orderID, clOrdID: r.clOrdID, at: Date.now(), source: "placed" }; dirty = true;
+        (reg.history = reg.history || []).push({ leg: "target", orderID: r.orderID, clOrdID: r.clOrdID });
         await pushLog({ coin: pos.coin, dir: pos.dir, result: "TARGET PLACED",
           skipped: `resting reduce-only limit at the plan's target ${formatPrice(pos.plan.target)} — the trade can now end at its own target at the exchange, not only when the bot happens to look.` });
       } else if (!r.ok) {
@@ -2857,6 +2887,12 @@ async function protectOpenPositions(nowOpen, priceOf) {
     }
   } catch (e) { console.error("order check failed (log only, harmless):", e && e.message); }
 
+  // Archived records of trades that never resolved (no fill found, coin left the book) would pile
+  // up for ever. Two weeks is far past any trade this bot holds on the fast book.
+  for (const k of Object.keys(registry)) {
+    const r = registry[k];
+    if (k.includes("#") && Date.now() - (Number(r && (r.pulled || r.since)) || 0) > 14 * 864e5) { delete registry[k]; dirty = true; }
+  }
   if (dirty) await setJSON(PROTECT_KEY, registry);
   if (out.noTarget.length)
     await pushLog({ result: "NO TARGET RESTING",
@@ -2888,15 +2924,6 @@ async function cancelProtectionFor(posKeys, { keep = false } = {}) {
   return n;
 }
 
-// PURE. Is the position under this key a DIFFERENT trade from the one we saw last run?
-// The bot never adds to a position, so its average entry only moves when the position was
-// closed and a new one opened on the same coin and side in between (audit 2026-10-26: a late-
-// filling entry order is the likely way). Treated as a close plus a new open.
-function positionReopened(was, cur, tol = 0.003) {
-  const a = Number(was && was.avgEntry), b = Number(cur && cur.avgEntry);
-  if (!(a > 0) || !(b > 0)) return false;
-  return Math.abs(a - b) / a > tol;
-}
 // The registry record for a finished position: its own key, or the archive slot the sweep moved
 // it to when the same key was reused by a new position.
 function regKeyFor(k, since, registry) {
@@ -5672,6 +5699,10 @@ export default async function cipherAgent() {
   // position on the same coin and side opened in between could be closed by the old leftover.
   // So cancel the recorded orders of every position that has gone (or been replaced) right here,
   // and keep the record for the resolution pass to attribute the close.
+  // Keys whose old trade was CLOSED and a new one opened on the same coin and side since last run.
+  // Decided from the venue's own fills, not from the entry price (audit, second pass): a re-entry
+  // at the same price was missed, and an entry that merely drifted was recorded as a fake close.
+  const reopenedKeys = new Set();
   if (mode === "armed" && canSeeBook && CFG.direct()) {
     try {
       const nowByKey = {};
@@ -5681,7 +5712,22 @@ export default async function cipherAgent() {
         if (d !== "long" && d !== "short") d = Number(p.size) < 0 ? "short" : "long";
         if (Math.abs(Number(p.size) || 0) > 0) nowByKey[posKey(coin, d)] = { avgEntry: +(p.avgEntryPriceRp ?? p.avgEntryPrice) || undefined };
       }
-      const finished = Object.keys(prevOpen || {}).filter(k => !nowByKey[k] || positionReopened(prevOpen[k], nowByKey[k]));
+      // For every position held both last run and now: did fills since it opened close at least its
+      // whole size? Then what is open now is a different trade. A lookup that cannot be read splits
+      // nothing — a missed reopen costs one muddled record; a fake close costs a live stop.
+      let checked = 0;
+      for (const k of Object.keys(prevOpen || {})) {
+        const was = prevOpen[k];
+        if (!nowByKey[k] || !(Number(was && was.size) > 0) || !(Number(was.since) > 0)) continue;
+        if (checked++ >= num("REOPEN_CHECKS_PER_RUN", 16)) break;
+        try {
+          const { rows } = await fetchFillRows(`${was.coin}USDT`, was.since);
+          if (!rows) continue;
+          const closed = closedQtySince(rows, was.dir === "short" ? "Short" : "Long", Number(was.since));
+          if (closed >= Number(was.size) * 0.999) reopenedKeys.add(k);
+        } catch { }
+      }
+      const finished = Object.keys(prevOpen || {}).filter(k => !nowByKey[k] || reopenedKeys.has(k));
       if (finished.length) {
         const n = await cancelProtectionFor(finished, { keep: true });
         if (n) console.log(`protection: pulled ${n} leftover stop/target order(s) from ${finished.length} finished position(s) before trading`);
@@ -6259,11 +6305,11 @@ export default async function cipherAgent() {
     const reopened = {};
     for (const k of Object.keys(nowOpen)) {
       const was = prevOpen && prevOpen[k];
-      if (!was || !positionReopened(was, nowOpen[k])) continue;
+      if (!was || !reopenedKeys.has(k)) continue;
       reopened[k] = was;
       nowOpen[k] = { ...nowOpen[k], since: Date.now(), plan: null, setup: undefined, setupTf: undefined,
                      quality: undefined, adopted: undefined, closedBy: undefined, unprotected: undefined };
-      console.log(`reopened: ${k} — average entry moved ${formatPrice(was.avgEntry)} → ${formatPrice(nowOpen[k].avgEntry)}; the old trade is resolved and the new one starts clean`);
+      console.log(`reopened: ${k} — the venue's fills closed the old position in full since it opened; the old trade is resolved and the new one starts clean`);
     }
     const gone = k => !nowOpen[k] || !!reopened[k];
     // Attach the plan to anything opened this run, so the NEXT run can tell how it ended. Without
@@ -6374,7 +6420,7 @@ export default async function cipherAgent() {
     // The range verdict above stays as the fallback. Where Phemex's trade history has the closing
     // fill, that fill decides: its price is the real exit and its clOrdID names the closer. Capped
     // per run so a mass close cannot turn one run into fifty API calls.
-    let fillLookups = 0, fillsFound = 0;
+    let fillLookups = 0, fillsFound = 0; const fillMisses = []; let firstMiss = "";
     const protectReg = (await getJSON(PROTECT_KEY, {})) || {};
     const regKeys = resolved.map(r => regKeyFor(posKey(r.coin, r.dir), r.since, protectReg));
     for (let i = 0; i < resolved.length; i++) {
@@ -6383,7 +6429,7 @@ export default async function cipherAgent() {
       fillLookups++;
       let fill = null;
       try { fill = await fetchCloseFill(`${r.coin}USDT`, r.dir === "short" ? "Short" : "Long", Number(r.since) || 0); } catch { }
-      if (fill) fillsFound++;
+      if (fill) fillsFound++; else { fillMisses.push(`${r.coin} ${r.dir}`); if (!firstMiss) firstMiss = lastFillMiss; }
       const a = attributeClose(r, fill, regKeys[i] ? protectReg[regKeys[i]] : null);
       if (a) resolved[i] = { ...r, ...a };
       else if (r.closedBy === "stop_breach_close" && Number.isFinite(r.exit)) {
@@ -6400,6 +6446,9 @@ export default async function cipherAgent() {
     // the next position opened on the same coin and side.
     try {
       if (fillLookups) console.log(`fill lookups: ${fillsFound} of ${fillLookups} closing fill(s) found at the venue — the rest were graded from the price range`);
+      // One line per run naming EVERY miss (audit: the old once-per-run line named only the first).
+      if (fillMisses.length) await pushLog({ result: "FILL LOOKUP EMPTY",
+        skipped: `${fillMisses.length} of ${fillLookups} closed position(s) had no closing fill at the venue and were graded from the price range: ${fillMisses.join(", ")}. First venue answer: ${String(firstMiss).slice(0, 300)}` });
       const pulled = await cancelProtectionFor(regKeys.filter(Boolean));
       if (pulled) console.log(`protection: cancelled ${pulled} leftover stop/target order(s) for ${resolved.length} closed position(s)`);
     } catch (e) { console.error("leftover-order cleanup failed (harmless, retried by the next reset):", e && e.message); }

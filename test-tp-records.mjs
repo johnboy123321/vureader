@@ -149,7 +149,8 @@ ok("and no stop field at all on a close", dh && dh.stopLossRp === undefined && d
 ok("it closes the SMALLER leg", dh && dh.posSide === "Short" && dh.side === "Buy");
 
 console.log("\n7. A position closes — the venue's fill says how");
-const prev = { cipher_open: SOL_OPEN, cipher_protect: { "SOL|short": { symbol:"SOLUSDT", posSide:"Short", since: SINCE,
+const RESET_DONE = { rev: "2026-10-26-unstack", done: ["SOLUSDT", "DOTUSDT", "ADAUSDT", "APTUSDT"] };   // live since run #826
+const prev = { cipher_protect_rev: RESET_DONE, cipher_open: SOL_OPEN, cipher_protect: { "SOL|short": { symbol:"SOLUSDT", posSide:"Short", since: SINCE,
   stop:{ px:109.67, orderID:"S1", clOrdID:"cipherStop1" }, target:{ px:100.89, orderID:"T1", clOrdID:"cipherTarget1" } } } };
 const fillAt = (px, clOrdID, ordType="Limit", orderID="") => ({ SOLUSDT: [{ symbol:"SOLUSDT", side:"Buy", posSide:"Short", execPriceRp:String(px), execQtyRq:"2.4",
   ordType, clOrdID, orderID, transactTimeNs: String((Date.now()-36e5)*1e6), closedPnlRv:"14.6" }] });
@@ -189,7 +190,8 @@ ok("closedBy = outside_bot, not counted", res9 && res9.closedBy === "outside_bot
 console.log("\n10. No fill to be found — falls back to the range, and says what the venue returned");
 const r10 = await run({ label:"nofill", state: prev, positions: [], fills: {} });
 ok("still resolved (range fallback)", r10.ledger.some(e => e.kind === "resolved" && e.coin === "SOL"));
-ok("the empty lookup is logged once, with the venue's answer", r10.log.filter(e => e.result === "FILL LOOKUP EMPTY").length === 1);
+ok("the empty lookup is logged once per run, with the venue's answer", r10.log.filter(e => e.result === "FILL LOOKUP EMPTY").length === 1);
+ok("AUDIT 2: and that line names every coin it missed", r10.log.some(e => e.result === "FILL LOOKUP EMPTY" && /SOL short/.test(e.skipped || "")));
 
 console.log("\n10b. AUDIT: same coin and side REOPENED between runs (entry moved)");
 const reopenPos = [{ symbol:"SOLUSDT", posSide:"Short", side:"Sell", size:3.0, avgEntryPriceRp:"104.00" }];
@@ -201,6 +203,47 @@ const newSol = r10b.st.cipher_open["SOL|short"];
 ok("the new position starts clean (new since, not the old setup)", newSol && newSol.since > SINCE && newSol.setup === undefined, JSON.stringify(newSol && { since: newSol.since, setup: newSol.setup }));
 ok("and gets its own fresh stop + target", stops(r10b).length === 1 && targets(r10b).length === 1, JSON.stringify({ s: stops(r10b).length, t: targets(r10b).length }));
 ok("the old record is gone from the registry; the new one is live", r10b.st.cipher_protect["SOL|short"] && r10b.st.cipher_protect["SOL|short"].since === newSol.since && !r10b.st.cipher_protect[`SOL|short#${SINCE}`], JSON.stringify(Object.keys(r10b.st.cipher_protect)));
+
+console.log("\n10b2. AUDIT 2: re-entered at the SAME price — the venue's fills still reveal it");
+const samePos = [{ symbol:"SOLUSDT", posSide:"Short", side:"Sell", size:2.4, avgEntryPriceRp:"106.97" }];
+const r10b2 = await run({ label:"reopen-same", state: prev, positions: samePos, marks:{ SOLUSDT: 106.0 }, fills: fillAt(109.67, "cipherStop1", "Stop", "S1") });
+ok("the old trade resolves although the entry price did not move", r10b2.ledger.some(e => e.kind === "resolved" && e.coin === "SOL" && e.closedBy === "cipher_stop"),
+   JSON.stringify(r10b2.ledger.filter(e => e.kind === "resolved")));
+ok("and the new position gets fresh orders", stops(r10b2).length === 1 && targets(r10b2).length === 1);
+
+console.log("\n10b3. AUDIT 2: entry DRIFTED but nothing closed — no fake close");
+const driftPos = [{ symbol:"SOLUSDT", posSide:"Short", side:"Sell", size:2.4, avgEntryPriceRp:"104.00" }];
+const r10b3 = await run({ label:"drift", state: prev, positions: driftPos, marks:{ SOLUSDT: 105.0 }, fills: {} });
+ok("no resolved record is invented", !r10b3.ledger.some(e => e.kind === "resolved"), JSON.stringify(r10b3.ledger.filter(e => e.kind === "resolved")));
+ok("its live stop and target are left alone", !r10b3.cancels.length, JSON.stringify(r10b3.cancels));
+ok("and nothing is re-placed", stops(r10b3).length === 0 && targets(r10b3).length === 0);
+
+console.log("\n10b4. AUDIT 2: a record marked PULLED for a position that is still open");
+const pulledState = { cipher_protect_rev: RESET_DONE, cipher_open: SOL_OPEN, cipher_protect: { "SOL|short": { ...prev.cipher_protect["SOL|short"], pulled: Date.now() - 6e4 } } };
+const r10b4 = await run({ label:"pulled-live", state: pulledState, positions: SOL_POS, marks:{ SOLUSDT: 105.0 } });
+ok("the stop goes back on (the pulled orders are gone)", stops(r10b4).length === 1, stops(r10b4).length);
+ok("and the target", targets(r10b4).length === 1, targets(r10b4).length);
+
+console.log("\n10b5. AUDIT 2: partial close — the orders are resized");
+const sizedState = { cipher_protect_rev: RESET_DONE, cipher_open: SOL_OPEN, cipher_protect: { "SOL|short": { symbol:"SOLUSDT", posSide:"Short", since: SINCE,
+  stop:{ px: SOL_OPEN["SOL|short"].plan.stop, qty: 2.4, orderID:"S1", clOrdID:"cipherStop1" }, target:{ px: SOL_OPEN["SOL|short"].plan.target, qty: 2.4, orderID:"T1", clOrdID:"cipherTarget1" } } } };
+const halfPos = [{ symbol:"SOLUSDT", posSide:"Short", side:"Sell", size:1.2, avgEntryPriceRp:"106.97" }];
+const r10b5 = await run({ label:"partial", state: sizedState, positions: halfPos, marks:{ SOLUSDT: 105.0 } });
+ok("the old stop and target are cancelled", r10b5.cancels.some(q => q.includes("orderID=S1")) && r10b5.cancels.some(q => q.includes("orderID=T1")), JSON.stringify(r10b5.cancels));
+ok("and replaced at the new size", stops(r10b5)[0] && stops(r10b5)[0].orderQtyRq === "1.2" && targets(r10b5)[0] && targets(r10b5)[0].orderQtyRq === "1.2",
+   JSON.stringify([stops(r10b5)[0] && stops(r10b5)[0].orderQtyRq, targets(r10b5)[0] && targets(r10b5)[0].orderQtyRq]));
+
+console.log("\n10b6. AUDIT 2: a REPLACED stop that still fills counts as this trade's stop");
+const histState = { cipher_protect_rev: RESET_DONE, cipher_open: SOL_OPEN, cipher_protect: { "SOL|short": { ...prev.cipher_protect["SOL|short"],
+  stop:{ px:107.5, orderID:"S2", clOrdID:"cipherStop2" }, history:[{ leg:"stop", orderID:"S1", clOrdID:"cipherStop1" }, { leg:"stop", orderID:"S2", clOrdID:"cipherStop2" }] } } };
+const r10b6 = await run({ label:"history", state: histState, positions: [], fills: fillAt(109.7, "cipherStop1", "Stop", "S1") });
+const res10b6 = r10b6.ledger.find(e => e.kind === "resolved" && e.coin === "SOL");
+ok("counted as its own stop, not 'stale'", res10b6 && res10b6.closedBy === "cipher_stop" && res10b6.countsForStats === true, JSON.stringify(res10b6));
+
+console.log("\n10b7. AUDIT 2: archived records of trades that never resolved are cleared after 14 days");
+const archState = { cipher_protect_rev: RESET_DONE, cipher_open: SOL_OPEN, cipher_protect: { ...prev.cipher_protect, ["ETH|short#" + (Date.now() - 20 * 864e5)]: { symbol:"ETHUSDT", posSide:"Short", since: Date.now() - 20 * 864e5, stop:{ orderID:"E1" } } } };
+const r10b7 = await run({ label:"archive", state: archState, positions: SOL_POS, marks:{ SOLUSDT: 105.0 } });
+ok("the 20-day-old archive is gone", !Object.keys(r10b7.st.cipher_protect).some(k => k.startsWith("ETH|short#")), JSON.stringify(Object.keys(r10b7.st.cipher_protect)));
 
 console.log("\n10c. AUDIT: a leftover order is pulled at the START of the run, before any new trade");
 const r10c = await run({ label:"early-pull", state: prev, positions: [], fills: {} });
