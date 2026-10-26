@@ -1811,7 +1811,7 @@ function pickClosingFill(rows, posSide, sinceMs) {
   };
   const cands = (rows || []).filter(r => r &&
     (!r.posSide || String(r.posSide) === posSide) &&
-    (!r.side || String(r.side) === closing) &&
+    String(r.side || "") === closing &&                 // must say it closed this side (audit, 3rd pass)
     // A fill with no readable time cannot be shown to belong to THIS position (audit 2026-10-26):
     // with a since to check against, it is left out rather than waved through.
     (!sinceMs || (at(r) > 0 && at(r) >= sinceMs - 60e3)) &&
@@ -1893,7 +1893,9 @@ function closedQtySince(rows, posSide, sinceMs) {
   const closing = posSide === "Long" ? "Sell" : "Buy";
   let q = 0;
   for (const r of rows || []) {
-    if (!r || (r.posSide && String(r.posSide) !== posSide) || (r.side && String(r.side) !== closing)) continue;
+    // The row must SAY it closed this side (audit, 3rd pass): a row with no side could be the
+    // opening fill of the opposite leg, and counting it would record a reopen that never happened.
+    if (!r || String(r.side || "") !== closing || (r.posSide && String(r.posSide) !== posSide)) continue;
     const ns = Number(r.transactTimeNs); const ms = ns > 0 ? ns / 1e6 : Number(r.createdAt ?? r.execTime ?? r.transactTime ?? 0);
     const t = ms > 1e14 ? ms / 1e6 : ms;
     if (!(t > 0) || t < sinceMs - 60e3) continue;

@@ -211,6 +211,13 @@ ok("the old trade resolves although the entry price did not move", r10b2.ledger.
    JSON.stringify(r10b2.ledger.filter(e => e.kind === "resolved")));
 ok("and the new position gets fresh orders", stops(r10b2).length === 1 && targets(r10b2).length === 1);
 
+console.log("\n10b2b. AUDIT 3: fill rows with NO side (opening the other leg) do not fake a reopen");
+const noSideFills = { SOLUSDT: [{ symbol:"SOLUSDT", execPriceRp:"106.5", execQtyRq:"2.4", ordType:"Market", clOrdID:"agentSOL1", orderID:"L1",
+  transactTimeNs: String((Date.now()-36e5)*1e6) }] };
+const r10b2b = await run({ label:"noside", state: prev, positions: samePos, marks:{ SOLUSDT: 106.0 }, fills: noSideFills });
+ok("no resolved record is invented", !r10b2b.ledger.some(e => e.kind === "resolved"), JSON.stringify(r10b2b.ledger.filter(e => e.kind === "resolved")));
+ok("and the live orders are left alone", !r10b2b.cancels.length && stops(r10b2b).length === 0, JSON.stringify(r10b2b.cancels));
+
 console.log("\n10b3. AUDIT 2: entry DRIFTED but nothing closed — no fake close");
 const driftPos = [{ symbol:"SOLUSDT", posSide:"Short", side:"Sell", size:2.4, avgEntryPriceRp:"104.00" }];
 const r10b3 = await run({ label:"drift", state: prev, positions: driftPos, marks:{ SOLUSDT: 105.0 }, fills: {} });
@@ -284,6 +291,8 @@ ok("an OPENING stop order on the other side does not",
    !findRestingStop([{ posSide:"Short", side:"Sell", ordType:"Stop", closeOnTrigger:true }], "Short"));
 ok("AUDIT: a fill with no readable time is not attributed to this position",
    pickClosingFill([{ side:"Buy", posSide:"Short", execPriceRp:"100" }], "Short", SINCE) === null);
+ok("AUDIT 3: a fill row that does not say its side never counts as a close",
+   pickClosingFill([{ posSide:"Short", execPriceRp:"100", transactTimeNs: String(Date.now()*1e6) }], "Short", SINCE) === null);
 ok("pickClosingFill ignores the opening fill",
    pickClosingFill([{ side:"Sell", posSide:"Short", execPriceRp:"107", transactTimeNs: String(Date.now()*1e6) }], "Short", SINCE) === null);
 const liq = attributeClose({ dir:"long", plan:{ entry:100, stop:97, target:107 } }, { px: 80, ordType:"Liq", clOrdID:"", text:"", execStatus:"" });
