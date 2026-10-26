@@ -110,6 +110,7 @@ jobs:
         run: node cipher-agent-valtown.js
 
       - name: Save state back to the repo
+        if: always()
         run: |
           if [[ -n "$(git status --porcelain agent-state.json)" ]]; then
             git config user.name  "cipher-agent"
