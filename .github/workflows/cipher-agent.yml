@@ -44,7 +44,9 @@ permissions:
 jobs:
   scan:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    # One job now runs the agent every 15 minutes for ~5 hours (see "Run the agent" below), so the
+    # limit is the job's, not one run's. GitHub's hard cap for a job is 360 minutes.
+    timeout-minutes: 340
     env:
       MODE: off             # FALLBACK ONLY. The app panel sets the real mode via the relay and
                             # that wins whenever the relay answers. This value is what the agent
@@ -106,8 +108,43 @@ jobs:
             echo "::warning::Phemex testnet unreachable from this runner (HTTP $code) — direct exec will fail here; set EXEC_DIRECT=0 to fall back to the relay"
           fi
 
-      - name: Run the agent
-        run: node cipher-agent-valtown.js
+      # ── EVERY 15 MINUTES, WITHOUT A TOKEN OR AN OUTSIDE TIMER (2026-10-26) ─────────────────────
+      # GitHub's schedule fires this workflow only every 2–6 hours in practice, which left a bot
+      # trading 15m/1H/4H setups looking at the market a few times a day. So each run now LOOPS:
+      # run the agent, save state, wait out the rest of the 15 minutes, repeat — 20 times (~5h).
+      # By the time it finishes, the next scheduled run is normally already queued behind it.
+      #   • never two at once: one loop does one cycle at a time, and the concurrency lock above
+      #     keeps any other run queued until this one ends;
+      #   • each cycle pulls first, so a code upload or a kill from the app takes effect within 15
+      #     minutes, not 5 hours;
+      #   • one failed cycle is logged and the loop carries on — the next cycle is a fresh run.
+      - name: Run the agent (every 15 minutes, ~5 hours)
+        env:
+          CYCLES: "20"
+          CYCLE_SECONDS: "900"
+        run: |
+          git config user.name  "cipher-agent"
+          git config user.email "cipher-agent@users.noreply.github.com"
+          save_state() {
+            if [[ -n "$(git status --porcelain agent-state.json)" ]]; then
+              git add agent-state.json
+              git commit -q -m "agent state $(date -u '+%Y-%m-%d %H:%M UTC')"
+              git pull -q --rebase --autostash origin "${GITHUB_REF_NAME}" || true
+              git push -q || echo "::warning::state push failed this cycle — next cycle retries"
+            fi
+          }
+          for i in $(seq 1 "$CYCLES"); do
+            t0=$(date +%s)
+            echo "── cycle $i/$CYCLES $(date -u '+%H:%M:%S UTC') ──"
+            git pull -q --rebase --autostash origin "${GITHUB_REF_NAME}" || echo "::warning::pull failed — running the code already here"
+            node cipher-agent-valtown.js || echo "::warning::cycle $i failed — its CRASH health record is saved; the loop carries on"
+            save_state
+            if [ "$i" -lt "$CYCLES" ]; then
+              wait=$(( CYCLE_SECONDS - ($(date +%s) - t0) ))
+              [ "$wait" -lt 60 ] && wait=60
+              sleep "$wait"
+            fi
+          done
 
       - name: Save state back to the repo
         if: always()
