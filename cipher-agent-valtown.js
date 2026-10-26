@@ -5558,6 +5558,62 @@ async function runAccumulator(book = primaryAccumBook()) {
   }
 }
 
+// ═══════════ HEALTH: ONE LINE THAT SAYS WHETHER THIS RUN LEFT THINGS RIGHT (2026-10-26) ═══════════
+// Every watcher — Grok's hourly check, a morning summary, John glancing at the file — had to
+// reconstruct "is the bot OK?" from 300 log lines and five state keys, and each did it slightly
+// differently. The bot knows best what it just did, so it says so: cipher_health = OK / WARN /
+// FAIL / CRASH plus the reasons. A crash is caught by the entry point and written here too
+// (the workflow now saves state even when the run fails), so a dead run is never silent again.
+const HEALTH_KEY = "cipher_health";
+
+// PURE. The invariants, checked against what this run saved.
+function healthOf({ now, canSeeBook, mode, open, registry, runLog, prevBeatAt, maxGapMin = 45 }) {
+  const fail = [], warn = [];
+  if (!canSeeBook) fail.push("could not read open positions from Phemex — nothing was placed or protected this run");
+  const live = Object.entries(open || {}).filter(([, p]) => p && p.size > 0 && p.plan && !p.closedBy);
+  let stops = 0, targets = 0;
+  const noStop = [], noTarget = [];
+  for (const [k, p] of live) {
+    const r = registry && registry[k];
+    if (r && r.stop && !r.pulled) stops++; else noStop.push(`${p.coin} ${p.dir}`);
+    if (r && r.target && !r.pulled) targets++; else noTarget.push(`${p.coin} ${p.dir}`);
+  }
+  if (mode === "armed" && canSeeBook) {
+    if (noStop.length) fail.push(`no stop on ${noStop.length} position(s): ${noStop.join(", ")}`);
+    if (noTarget.length) warn.push(`no target on ${noTarget.length} position(s): ${noTarget.join(", ")}`);
+  }
+  const orphans = Object.values(open || {}).filter(p => p && p.size > 0 && !p.plan);
+  if (orphans.length) fail.push(`${orphans.length} position(s) with no plan at all: ${orphans.map(p => p.coin + " " + p.dir).join(", ")}`);
+  const count = (re) => (runLog || []).filter(e => re.test(String(e.result || ""))).length;
+  const n1 = count(/^STOP ATTACH FAILED/), n2 = count(/^DE-HEDGE (FAILED|GIVEN UP)/), n3 = count(/^ERR/), n4 = count(/^FILL LOOKUP EMPTY/);
+  if (n1) warn.push(`${n1} stop attach failure(s)`);
+  if (n2) warn.push(`${n2} de-hedge failure(s)`);
+  if (n3) warn.push(`${n3} order error(s)`);
+  if (n4) warn.push("some closes graded from the price range (no fill found)");
+  const gapMin = prevBeatAt ? Math.round((now - Date.parse(prevBeatAt)) / 6e4) : null;
+  if (gapMin != null && gapMin > maxGapMin) warn.push(`${gapMin} min since the previous run (expected ≤ ${maxGapMin})`);
+  return { at: new Date(now).toISOString(), status: fail.length ? "FAIL" : warn.length ? "WARN" : "OK", mode,
+           positions: live.length, stops, targets, gapMin, problems: [...fail, ...warn] };
+}
+
+async function writeHealth({ started, canSeeBook, mode }) {
+  try {
+    const prev = await getJSON(HEALTH_KEY, null);
+    const beat = await getJSON("cipher_heartbeat", null);
+    const h = healthOf({ now: Date.now(), canSeeBook, mode,
+      open: await getJSON(OPEN_KEY, {}), registry: await getJSON(PROTECT_KEY, {}),
+      runLog: ((await getJSON(KEY.log, [])) || []).filter(e => e && Date.parse(e.at) >= started),
+      prevBeatAt: beat && beat.at, maxGapMin: num("HEALTH_MAX_GAP_MIN", 45) });
+    await setJSON(HEALTH_KEY, h);
+    console.log(`HEALTH: ${h.status} — ${h.positions} position(s), ${h.stops} stop(s), ${h.targets} target(s)` +
+      (h.gapMin != null ? `, ${h.gapMin} min since last run` : "") + (h.problems.length ? ` · ${h.problems.join(" · ")}` : ""));
+    // Into the decision log only when it is not OK or it has just changed, so the 300-line ring
+    // is not filled with "OK" every fifteen minutes.
+    if (h.status !== "OK" || (prev && prev.status !== "OK"))
+      await pushLog({ result: "HEALTH " + h.status, skipped: h.problems.join(" · ") || "all checks passed" });
+  } catch (e) { console.error("health check failed:", e && e.message); }
+}
+
 // ═══════════════════════ THE LOOP ═══════════════════════
 export default async function cipherAgent() {
   const started = Date.now();
@@ -5572,6 +5628,7 @@ export default async function cipherAgent() {
     // relay read timed out, MODE fell back to off, and the spot strategy never ran. KILL still
     // stops it — that check lives on the order path in sendSpotOrder, where it cannot be missed.
     await runAccumulators();
+    await setJSON(HEALTH_KEY, { at: new Date().toISOString(), status: "OFF", mode, problems: ["MODE is off — the futures scanner is idle"] });
     return;
   }
 
@@ -6530,6 +6587,7 @@ export default async function cipherAgent() {
   // of starting at 20 and orphaning seven coins for good.
   await setJSON(KEY.cursor, (cursor + Math.max(1, consumed)) % uni.length);
   if (consumed < slice.length) console.log(`rotation: covered ${consumed}/${slice.length} this run — next run starts at the one after`);
+  await writeHealth({ started, canSeeBook, mode });      // before the heartbeat, so it can read the previous one
   await setJSON("cipher_heartbeat", { at: new Date().toISOString(), scanned, candidates, placed, mode, via: EXEC(), ms: Date.now() - started });
   console.log(`cipher-agent: scanned ${scanned}, ${candidates} candidates, ${placed} placed (${mode}, via ${EXEC()}) in ${Date.now() - started}ms`);
 }
@@ -6554,5 +6612,12 @@ export async function agentHttp(req) {
 if (!IS_DENO && typeof process !== "undefined") {
   cipherAgent()
     .then(() => process.exit(0))
-    .catch((e) => { console.error("cipher-agent failed:", e && (e.stack || e.message || e)); process.exit(1); });
+    .catch(async (e) => {
+      console.error("cipher-agent failed:", e && (e.stack || e.message || e));
+      // A crash writes its own HEALTH record — the workflow saves state even on failure now — so
+      // the cause is in the repo, not only in a GitHub log nobody can read from outside.
+      try { await setJSON(HEALTH_KEY, { at: new Date().toISOString(), status: "CRASH",
+        problems: [String(e && (e.stack || e.message || e)).slice(0, 900)] }); } catch { }
+      process.exit(1);
+    });
 }

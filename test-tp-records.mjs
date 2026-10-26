@@ -14,7 +14,7 @@ import fs from "node:fs";
 
 const base = fs.readFileSync("cipher-agent-valtown.js", "utf8")
   .replace(/if \(!IS_DENO && typeof process !== "undefined"\) \{[\s\S]*?\n\}\n?$/, "")
-  + "\nexport { attributeClose, pickClosingFill, fillRowsFrom, levelMoved, findRestingStop, findRestingTarget, directOrder };\n";
+  + "\nexport { attributeClose, pickClosingFill, fillRowsFrom, levelMoved, findRestingStop, findRestingTarget, directOrder, healthOf };\n";
 fs.mkdirSync("/tmp/cipher-test", { recursive: true });
 
 const candles = n => { const out=[]; let p=100;
@@ -302,6 +302,50 @@ const opening = await directOrder({ symbol:"SOLUSDT", side:"Buy", posSide:"Long"
 ok("an OPENING order still carries its stop and target", opening.data.wouldSend.stopLossRp === "97" && opening.data.wouldSend.takeProfitRp === "107" && opening.data.wouldSend.reduceOnly === false, JSON.stringify(opening.data));
 const noStop = await directOrder({ symbol:"SOLUSDT", side:"Buy", posSide:"Long", orderQtyRq:"1", refPx: 100 });
 ok("and an opening order with no stop is still refused", noStop.status === 400 && /no stop/.test(noStop.data.error));
+
+console.log("\n13. HEALTH — one line that says whether the run left things right");
+ok("a normal run writes cipher_health", r1.st.cipher_health && ["OK","WARN"].includes(r1.st.cipher_health.status), JSON.stringify(r1.st.cipher_health));
+ok("and counts what it checked", r1.st.cipher_health && r1.st.cipher_health.positions === 1 && r1.st.cipher_health.stops === 1 && r1.st.cipher_health.targets === 1, JSON.stringify(r1.st.cipher_health));
+const { healthOf } = r11.A;
+const now = Date.now();
+const openOK = { "SOL|short": { coin:"SOL", dir:"short", size:2.4, plan:{ stop:1, target:2 } } };
+const regOK = { "SOL|short": { stop:{ orderID:"S" }, target:{ orderID:"T" } } };
+ok("all covered, recent previous run → OK", healthOf({ now, canSeeBook:true, mode:"armed", open: openOK, registry: regOK, runLog: [], prevBeatAt: new Date(now - 15*6e4).toISOString() }).status === "OK");
+const h2 = healthOf({ now, canSeeBook:true, mode:"armed", open: openOK, registry: { "SOL|short": { target:{ orderID:"T" } } }, runLog: [] });
+ok("a position with no stop → FAIL, named", h2.status === "FAIL" && /no stop on 1 position\(s\): SOL short/.test(h2.problems.join()), JSON.stringify(h2));
+const h3 = healthOf({ now, canSeeBook:true, mode:"armed", open: openOK, registry: { "SOL|short": { stop:{ orderID:"S" }, target:{ orderID:"T" }, pulled: now } }, runLog: [] });
+ok("a PULLED record does not count as covered", h3.status === "FAIL", JSON.stringify(h3));
+const h4 = healthOf({ now, canSeeBook:true, mode:"armed", open: openOK, registry: regOK, runLog: [], prevBeatAt: new Date(now - 5*36e5).toISOString() });
+ok("a 5-hour gap since the last run → WARN with the minutes", h4.status === "WARN" && h4.gapMin === 300, JSON.stringify(h4));
+ok("unreadable positions → FAIL", healthOf({ now, canSeeBook:false, mode:"armed", open:{}, registry:{}, runLog:[] }).status === "FAIL");
+ok("a position closed this run by a breach is not counted as unprotected",
+   healthOf({ now, canSeeBook:true, mode:"armed", open: { "DOT|long": { coin:"DOT", dir:"long", size:110, plan:{ stop:1, target:2 }, closedBy:"stop_breach_close" } }, registry:{}, runLog:[] }).status === "OK");
+
+console.log("\n14. TRIGGER — every 15 minutes, never two runs at once");
+const trigSrc = fs.readFileSync("cipher-trigger-valtown.js", "utf8");
+fs.writeFileSync("/tmp/cipher-test/trigger.mjs", trigSrc);
+async function trig({ token = "t", inProgress = 0, queued = 0, checkStatus = 200 } = {}) {
+  globalThis.Deno = { env: { get: k => (k === "GH_DISPATCH_TOKEN" ? token : undefined) } };
+  const calls = [];
+  globalThis.fetch = async (url, opts = {}) => {
+    calls.push((opts.method || "GET") + " " + String(url).replace("https://api.github.com/repos/johnboy123321/vureader/actions/workflows/cipher-agent.yml", ""));
+    if (/runs\?status=in_progress/.test(url)) return { ok: checkStatus === 200, status: checkStatus, json: async () => ({ total_count: inProgress }) };
+    if (/runs\?status=queued/.test(url)) return { ok: true, status: 200, json: async () => ({ total_count: queued }) };
+    if (/dispatches/.test(url)) return { ok: true, status: 204, text: async () => "" };
+    return { ok: false, status: 404, text: async () => "" };
+  };
+  const T = await import("/tmp/cipher-test/trigger.mjs?t=" + Math.random());
+  await T.default();
+  return calls;
+}
+ok("nothing running → starts a run on main", (await trig()).some(c => c === "POST /dispatches"));
+ok("a run IN PROGRESS → does not start another", !(await trig({ inProgress: 1 })).some(c => /dispatches/.test(c)));
+ok("a run QUEUED → does not start another", !(await trig({ queued: 1 })).some(c => /dispatches/.test(c)));
+ok("cannot ask GitHub → skips rather than guessing", !(await trig({ checkStatus: 500 })).some(c => /dispatches/.test(c)));
+ok("no token → no calls at all", (await trig({ token: "" })).length === 0);
+const wf = fs.readFileSync(".github/workflows/cipher-agent.yml", "utf8");
+ok("the workflow's concurrency lock is still there (second guard against overlap)", /concurrency:\s*\n\s*group: cipher-agent\s*\n\s*cancel-in-progress: false/.test(wf));
+ok("the workflow saves state even when the run fails", /- name: Save state back to the repo\s*\n\s*if: always\(\)/.test(wf));
 
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);
