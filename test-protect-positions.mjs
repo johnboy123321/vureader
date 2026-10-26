@@ -4,7 +4,7 @@
 //   2. protectOpenPositions() attaches a real stop to any planned, open position missing one at
 //      the venue (the SOL orphan case: adopted, plan built, no order ever placed).
 //   3. It does NOT invent a stop when one is already resting.
-//   4. Take-profit is flagged (NO TARGET RESTING) but never auto-placed.
+//   4. Take-profit: since 2026-10-26 it IS placed (reduce-only limit at plan.target).
 //   5. The KILL switch still stops it, same as every other order path.
 import fs from "node:fs";
 
@@ -79,8 +79,10 @@ ok("posSide matches the position", stopSent && stopSent.posSide === "Short");
 ok("reduceOnly + closeOnTrigger, so it can only close, never open", stopSent && stopSent.reduceOnly === true && stopSent.closeOnTrigger === true);
 ok("triggered at the bot's OWN plan.stop, not a guess", stopSent && Math.abs(Number(stopSent.stopPxRp) - 111.93) < 0.1, stopSent && stopSent.stopPxRp);
 ok("logged as STOP ATTACHED for SOL", r1.log.some(e => e.coin==="SOL" && e.result==="STOP ATTACHED"));
-ok("no take-profit was invented", !r1.sent.some(o => o.clOrdID && o.clOrdID.startsWith("cipherTarget")));
-ok("but the missing target IS flagged", r1.log.some(e => e.result==="NO TARGET RESTING" && /SOL short/.test(e.skipped||"")));
+// 2026-10-26: targets are now placed (resting reduce-only limit at plan.target) — see test-tp-records.mjs.
+const tgtSent = r1.sent.find(o => o.clOrdID && o.clOrdID.startsWith("cipherTarget"));
+ok("a take-profit is placed at the plan's target", !!tgtSent && tgtSent.ordType === "Limit" && tgtSent.reduceOnly === true && Math.abs(Number(tgtSent.priceRp) - 83.13) < 0.01, JSON.stringify(tgtSent));
+ok("so nothing is flagged as missing a target", !r1.log.some(e => e.result==="NO TARGET RESTING" && /SOL short/.test(e.skipped||"")));
 
 console.log("\n2. Same position, but a stop AND a target are already resting");
 const already = { SOLUSDT: [

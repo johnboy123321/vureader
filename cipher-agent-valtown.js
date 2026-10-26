@@ -50,6 +50,13 @@ const CFG = {
   mode: () => String(env("MODE", "dry")).toLowerCase(),   // off | dry | armed
   risk: () => num("RISK_GBP", 10),
   minScore: () => num("MIN_SCORE", 6),
+  // ── THE CONFLUENCE PATH IS OFF BY DEFAULT (2026-09-19) ─────────────────────────────────────
+  // 3-year replay: 940 trades, −£0.74 a trade, interval excluding zero — one of only two
+  // statistically real losers in the whole record (see the setup-evidence note). The three
+  // pattern detectors (divergence, rollover, green dot) are untouched and still trade.
+  // CONFLUENCE=1 in the workflow turns it back on. While it is off the run still counts how many
+  // coins it WOULD have fired on and prints that, so the decision stays measurable.
+  confluence: () => String(env("CONFLUENCE", "0")) === "1",
   dayCap: () => num("DAY_CAP", 25),
   corrMax: () => num("CORR_MAX", 6),
   batch: () => num("BATCH", 20),
@@ -714,6 +721,50 @@ function buildTradePlan(candles, dir, entry) {
 // ═══════════════════════ GUARDS (same rules as the app's exec) ═══════════════════════
 // Leveraged ETFs / stock tickers must never reach a crypto exchange.
 const NOT_CRYPTO = /^(SPY|QQQ|MU|DIA|IWM|TLT|GLD|SLV|VOO|VTI|ARKK|TQQQ|SQQQ|SOXL|SPXL|UPRO|LABU|NVDL|TSLL|MSTU|MSTX)[A-Z]?$/;
+// ═══════════ THE ONE VALIDATED FILTER: NO 1D SHORTS IN A BULL REGIME (2026-09-12) ═══════════
+// Every other filter this project has tried is still measure-only, because every one of them
+// failed when it was finally tested forward — the relative-strength ladder inverted, the regime
+// arm went negative in both live boxes. This one is different, and it is worth writing down why,
+// because the bar it cleared is the bar the next idea has to clear too:
+//
+//   1. Forward-collected, not mined from the same history that suggested it. 19 distinct 1D
+//      short setups across 9 coins, every one resolving at a full stop. Not 91 — the records
+//      were deduplicated first, see shadowRecord.
+//   2. It survived a resolution audit. A 1D stop is ~6.6% wide and was being graded on 4H bars,
+//      which can contain both the stop and the 14.8% target — the artefact that made "43 of 43
+//      were losses" on 2026-08-18. secondOpinion() re-walked all 78 records on 1H bars: agree
+//      78/78, 78 stop / 0 target / 0 timeout. The stop genuinely traded first.
+//   3. An independent pre-registered scan found it without being asked. Run #575's insight
+//      scanner, 14 buckets watched: `timeframe=1D −1R over 55, holds in both halves`.
+//
+// SCOPED TO THE REGIME IT WAS OBSERVED IN, on purpose. Everything above was measured in a bull
+// market (BTC +10.2% over its 200D line the day this shipped), and [[cipher-backtest-verdict]]'s
+// year-by-year showed shorts IMPROVING, to +0.11R in 2026 — so "1D shorts always lose" is not
+// what the evidence says, and deleting the short engine would be fitting one month. The rule
+// applies while the regime reads bull and lifts itself when it does not, at which point fresh
+// evidence starts accruing on its own.
+//
+// AND IT DOES NOT BLIND ITS OWN MEASUREMENT. The refusal happens in the decision loop AFTER
+// rankPool.push(), which is what feeds the shadow framework, so every trade this rule blocks is
+// still recorded and still graded on forward candles. If 1D shorts start paying, the shadow
+// record will say so and this gets revoked. A filter that stops measuring what it filters can
+// never be proven wrong, which is the one property no rule in this bot is allowed to have.
+//
+// GATE_1D_SHORTS=0 turns it off; GATE_1D_SHORTS_REGIME names the regime it applies in.
+const SHORT_1D_GATE        = String(env("GATE_1D_SHORTS", "1")) !== "0";
+const SHORT_1D_GATE_REGIME = String(env("GATE_1D_SHORTS_REGIME", "bull"));
+
+// Returns a refusal reason, or null to allow the trade through.
+function gate1dShort(dir, planTf, regimeLabel) {
+  if (!SHORT_1D_GATE) return null;
+  if (dir !== "short") return null;
+  if ((planTf || "1D") !== "1D") return null;
+  if (regimeLabel !== SHORT_1D_GATE_REGIME) return null;
+  return `1D shorts are refused while the regime reads ${regimeLabel} — 19 of 19 distinct 1D `
+       + `short setups on record resolved at a full stop, and re-walking all 78 records on 1H `
+       + `agreed 78/78. Still recorded as a shadow decision, so this lifts itself if that changes.`;
+}
+
 function planValid(t) {
   const en = +t.entry, sl = +t.sl, isLong = (t.dir || "long") !== "short";
   if (!Number.isFinite(en) || en <= 0) return "no entry price";
@@ -952,9 +1003,23 @@ function directGuards(o) {
   const symbol = String(o.symbol || "").toUpperCase();
   const wl = CFG.whitelist().split(",").map(s => s.trim().toUpperCase());
   if (!wl.includes("*") && !wl.includes(symbol)) return `symbol ${symbol} not in whitelist`;
-  const qty = Number(o.orderQtyRq), refPx = Number(o.refPx || o.priceRp), sl = Number(o.stopLossRp);
+  const qty = Number(o.orderQtyRq);
   if (!(qty > 0)) return "orderQtyRq must be > 0";
   if (o.side !== "Buy" && o.side !== "Sell") return "side must be Buy or Sell";
+  // ── REDUCE-ONLY CLOSES SKIP THE OPENING-ORDER SANITY CHECKS (2026-09-08) ──────────────────────
+  // Everything below here exists to sanity-check a NEW position: is the stop on the correct side
+  // of a real entry price, is it far enough away, is the notional inside the cap. A reduce-only
+  // close (de-hedge, time-stop) carries none of that — no refPx, no stopLossRp — because it is not
+  // opening anything, only shrinking a position that already exists. Gating it on refPx meant
+  // every reduce-only close this file ever built was refused right here before it reached Phemex,
+  // logged as "refPx required to size-check the order" as if the VENUE had said no, when it was
+  // this function refusing its own valid order. Found 2026-09-08: AVAX (and ADA 08-31, UNI 09-03
+  // before it) sat holding both a long and a short for days because resolveHedges() kept building
+  // a correct reduce-only close and this gate kept rejecting it — three times, then giving up
+  // silently per coin (see DEHEDGE_GIVE_UP). reduceOnly can only ever shrink a position, never
+  // open or flip one, which is what makes skipping these checks safe for it and only it.
+  if (o.reduceOnly === true) return null;
+  const refPx = Number(o.refPx || o.priceRp), sl = Number(o.stopLossRp);
   if (!(refPx > 0)) return "refPx required to size-check the order";
   if (!(sl > 0)) return "refusing order with no stop loss";
   const isLong = o.side === "Buy";
@@ -985,11 +1050,20 @@ async function directOrder(o) {
     symbol: String(o.symbol).toUpperCase(), side: o.side, posSide: o.posSide || "Merged",
     ordType: o.ordType || "Market", orderQtyRq: String(o.orderQtyRq),
     timeInForce: o.timeInForce || "ImmediateOrCancel",
-    stopLossRp: px(o.stopLossRp), slTrigger: o.slTrigger || "ByMarkPrice",
-    reduceOnly: false, text: "cipher-auto",
+    reduceOnly: false, text: o.text || "cipher-auto",
   };
+  // ── A CLOSE MUST GO OUT AS A CLOSE (2026-10-26) ─────────────────────────────────────────────
+  // This builder used to hard-code reduceOnly:false and ALWAYS send stopLossRp: px(o.stopLossRp).
+  // A de-hedge or time-stop close carries no stop, so px(undefined) went to Phemex as the string
+  // "NaN" on an order that had been stripped of its reduceOnly flag. Every de-hedge since
+  // 2026-09-12 came back "phemex http 502" — a malformed body is exactly what a gateway answers
+  // that way. Pass the caller's reduceOnly/closeOnTrigger through, and only send a stop that is a
+  // real number. Opening orders are unchanged: directGuards() still refuses one with no stop.
+  if (o.reduceOnly === true) order.reduceOnly = true;
+  if (o.closeOnTrigger === true) order.closeOnTrigger = true;
+  if (Number(o.stopLossRp) > 0) Object.assign(order, { stopLossRp: px(o.stopLossRp), slTrigger: o.slTrigger || "ByMarkPrice" });
   if (order.ordType === "Limit") order.priceRp = px(o.priceRp);
-  if (o.takeProfitRp != null) { order.takeProfitRp = px(o.takeProfitRp); order.tpTrigger = o.tpTrigger || "ByLastPrice"; }
+  if (Number(o.takeProfitRp) > 0) { order.takeProfitRp = px(o.takeProfitRp); order.tpTrigger = o.tpTrigger || "ByLastPrice"; }
 
   // Two independent brakes, because the relay's server-side DRY_RUN is no longer in the path:
   // MODE must be armed AND DRY_RUN must not be set. Either one alone stops a real order.
@@ -1316,7 +1390,14 @@ function snapshotOpen(positions, bookMap, prev) {
                // a stop. undefined means COULD NOT READ, which is not the same as none.
                venueStop: venuePx(p.stopLossRp ?? p.stopLoss ?? p.stopLossEp),
                venueTarget: venuePx(p.takeProfitRp ?? p.takeProfit ?? p.takeProfitEp),
-               adopted: (prev && prev[k] && prev[k].adopted) || undefined };
+               adopted: (prev && prev[k] && prev[k].adopted) || undefined,
+               // which setup opened it — carried run to run so the resolved record can say (2026-09-19)
+               setup: (prev && prev[k] && prev[k].setup) || undefined,
+               setupTf: (prev && prev[k] && prev[k].setupTf) || undefined,
+               quality: (prev && prev[k] && Number.isFinite(prev[k].quality)) ? prev[k].quality : undefined,
+               // what last closed it, when the bot itself did (e.g. a breached-stop close) —
+               // read by the resolution pass on the run after (2026-10-26)
+               closedBy: (prev && prev[k] && prev[k].closedBy) || undefined };
   }
   return out;
 }
@@ -1646,11 +1727,168 @@ async function markPriceFor(symbol) {
   return null;
 }
 
+// ── THE VENUE'S OWN SPOT PRICE (2026-09-19) ────────────────────────────────────────────────
+// The buy-back has been refused with phemex 11053 TE_PRICE_TOO_LARGE on every attempt since
+// 2026-09-04. The 09-07 diagnostics came back clean: priceScale/baseVS/quoteVS/ratioScale are all 8,
+// priceEp is the reference price to the digit, quoteQtyEv is the wallet to the digit. So the
+// order is well-formed and the price formula is right (it is the same formula the working SELL
+// uses). What is left is the PRICE ITSELF: signals and this reference price come from Binance/OKX,
+// while the order goes to a TESTNET book that has been measured 38 days stale and −16% off
+// mainnet (see the venue-candles note). A buy limit far above the book's own ask is exactly what a
+// price band answers with "too large"; a sell above the book just rests, which is why sells pass.
+// This is a hypothesis, so the first job is to LOG the venue's bid/ask/last beside the price we
+// sent. The second is to cap a buy at just above the venue's ask (ACCUM_BUY_CLAMP_BPS, 0 = off),
+// which is still marketable, so it fills at the ask rather than being refused.
+function spotTickerFrom(body, priceScale) {
+  const r = body && (body.result || body.data || body);
+  if (!r || typeof r !== "object") return null;
+  const pick = (k) => {
+    const rp = Number(r[k + "Rp"]); if (rp > 0) return rp;
+    const ep = Number(r[k + "Ep"]);
+    return ep > 0 && Number.isFinite(priceScale) ? ep / 10 ** priceScale : null;
+  };
+  const out = { bid: pick("bid"), ask: pick("ask"), last: pick("last") };
+  return out.bid || out.ask || out.last ? out : null;
+}
+async function spotVenuePx(symbol, priceScale) {
+  try {
+    const r = await phemexPublic("/md/spot/ticker/24hr", "symbol=" + symbol);
+    return spotTickerFrom(r && r.data, priceScale);
+  } catch (e) { return null; }
+}
+// PURE. Cap a BUY limit at just above the venue's ask. Never raises a price, never touches a sell.
+function clampBuyPx(refPx, venue, bps) {
+  if (!(bps > 0) || !venue || !(venue.ask > 0) || !(refPx > 0)) return { px: refPx, clamped: false };
+  const cap = venue.ask * (1 + bps / 1e4);
+  return refPx > cap ? { px: cap, clamped: true } : { px: refPx, clamped: false };
+}
+
 function explainRejection(why) {
   const m = /phemex (\d+)/.exec(String(why || ""));
   const hit = m && PHEMEX_REJECTIONS[m[1]];
   if (!hit) return { label: String(why || "rejected"), klass: "execution_artifact", cause: "unknown", detail: "" };
   return { ...hit, code: m[1] };
+}
+
+// ═══════════ ASK THE VENUE HOW IT ENDED (2026-10-26) ═══════════
+// 100 of the first 162 resolutions were "closed at neither the stop nor the target" — graded by
+// comparing a price RANGE to the plan, and when the range missed both levels, written off as
+// unattributed. A range can say what price did; it cannot say what closed the position. The
+// venue's own trade history can: the closing fill's price, its order type and its clOrdID — and
+// every order this bot sends carries a clOrdID that says which part of the bot sent it.
+//
+// So when a position disappears we look up its closing fill and name the closer:
+//   cipherStop / cipherTarget  — the protective orders the sweep placed for THIS position
+//   cipherBreach               — the sweep closed it because price was already past its stop
+//   dehedge / timestop         — the bot's own de-hedge or time-stop close
+//   untagged Stop / IfTouched  — a stop/target bundled on the entry order
+//   liquidation                — the venue closed it
+//   anything else              — closed outside the bot (by hand, the app, another tool)
+// A stop that fired far from this position's own stop is an OLD stop left by an earlier position
+// (see the stacking note above protectOpenPositions) and is named as such, not graded.
+// Unknown response shapes are logged once per run so the next audit can read them.
+
+// PURE. Pull fill rows out of any of Phemex's response shapes.
+function fillRowsFrom(body, depth = 0) {
+  if (!body || typeof body !== "object" || depth > 5) return null;
+  if (Array.isArray(body)) {
+    return body.length && body.some(r => r && typeof r === "object" &&
+      (r.execPriceRp != null || r.execPrice != null || r.execPriceEp != null || r.priceRp != null)) ? body : (body.length ? null : []);
+  }
+  for (const k of ["rows", "data", "result", "trades"]) {
+    if (body[k] !== undefined) { const hit = fillRowsFrom(body[k], depth + 1); if (hit) return hit; }
+  }
+  return null;
+}
+
+// PURE. The most recent fill that CLOSED this side of the position, after it opened.
+function pickClosingFill(rows, posSide, sinceMs) {
+  const closing = posSide === "Long" ? "Sell" : "Buy";
+  const at = r => {
+    const ns = Number(r.transactTimeNs); if (ns > 0) return ns / 1e6;
+    const ms = Number(r.createdAt ?? r.execTime ?? r.transactTime ?? r.timestamp); if (ms > 0) return ms > 1e14 ? ms / 1e6 : ms;
+    return 0;
+  };
+  const cands = (rows || []).filter(r => r &&
+    (!r.posSide || String(r.posSide) === posSide) &&
+    (!r.side || String(r.side) === closing) &&
+    (!sinceMs || !at(r) || at(r) >= sinceMs - 60e3) &&
+    Number(r.execPriceRp ?? r.execPrice ?? r.priceRp) > 0);
+  if (!cands.length) return null;
+  cands.sort((a, b) => at(b) - at(a));
+  const r = cands[0];
+  return {
+    px: Number(r.execPriceRp ?? r.execPrice ?? r.priceRp),
+    qty: Math.abs(Number(r.execQtyRq ?? r.execQty ?? r.orderQtyRq) || 0) || undefined,
+    ordType: String(r.ordType || ""), clOrdID: String(r.clOrdID || ""), text: String(r.text || ""),
+    execStatus: String(r.execStatus || r.execType || ""),
+    closedPnl: Number.isFinite(Number(r.closedPnlRv)) ? Number(r.closedPnlRv) : undefined,
+    at: at(r) || undefined,
+  };
+}
+
+// PURE. Turn a fill into the four labels classifyResolution uses, plus closedBy and real R.
+function attributeClose(was, fill) {
+  const plan = was && was.plan;
+  if (!plan || !fill || !(fill.px > 0)) return null;
+  const { entry, stop, target } = plan;
+  const isLong = was.dir !== "short";
+  const risk = Math.abs(entry - stop);
+  const realR = risk > 0 ? +(((isLong ? fill.px - entry : entry - fill.px)) / risk).toFixed(3) : undefined;
+  const near = (lvl) => Number.isFinite(lvl) && risk > 0 && Math.abs(fill.px - lvl) <= 0.35 * risk;
+  const tag = `${fill.clOrdID} ${fill.text}`;
+  const base = { exit: fill.px, R: realR, closeFill: fill, gradedOn: "venue_fill" };
+  const strat = (how, closedBy, why) => ({ ...base, how, closedBy, why,
+    outcome: realR > 0 ? "win" : "loss", klass: "strategy", execution: "filled",
+    countsForStreak: true, countsForStats: true });
+  const art = (how, closedBy, why) => ({ ...base, how, closedBy, why,
+    outcome: "unattributed", klass: "execution_artifact", execution: "closed_off_plan",
+    countsForStreak: false, countsForStats: false });
+
+  if (/liq|adl/i.test(fill.ordType + " " + fill.execStatus + " " + tag))
+    return strat("liquidation", "liquidation", `the venue liquidated it at ${formatPrice(fill.px)}`);
+  if (/^cipherBreach|cipher-stop-breach/i.test(tag))
+    return strat("stop", "stop_breach_close", `price was already past the stop; the bot closed it at market at ${formatPrice(fill.px)}`);
+  if (/^cipherTarget|cipher-protective-target/i.test(tag))
+    return strat("target", "cipher_target", `its own resting target filled at ${formatPrice(fill.px)}`);
+  if (/^cipherStop|cipher-protective-stop/i.test(tag)) {
+    return near(stop)
+      ? strat("stop", "cipher_stop", `its own stop filled at ${formatPrice(fill.px)}`)
+      : art("stale_stop", "stale_stop", `a protective stop fired at ${formatPrice(fill.px)}, far from THIS position's stop ${formatPrice(stop)} — an old stop left over from an earlier position on the same side`);
+  }
+  if (/dehedge/i.test(tag)) return art("dehedge", "dehedge", `the bot closed this leg to remove a hedge, at ${formatPrice(fill.px)}`);
+  if (/timestop/i.test(tag)) return strat("time_stop", "time_stop", `the time stop closed it at ${formatPrice(fill.px)}`);
+  if (/stop/i.test(fill.ordType))
+    return near(stop) ? strat("stop", "venue_stop", `the stop bundled on the entry order filled at ${formatPrice(fill.px)}`)
+                      : art("stale_stop", "venue_stop_elsewhere", `a stop order filled at ${formatPrice(fill.px)}, not near this position's stop ${formatPrice(stop)}`);
+  if (/iftouched|takeprofit|^bo/i.test(fill.ordType))
+    return near(target) ? strat("target", "venue_target", `a target order filled at ${formatPrice(fill.px)}`)
+                        : art("closed_by_hand", "venue_target_elsewhere", `a take-profit order filled at ${formatPrice(fill.px)}, not near this position's target ${formatPrice(target)}`);
+  return art("closed_by_hand", "outside_bot", `closed by an order this bot did not send (${fill.ordType || "unknown type"}${fill.clOrdID ? ", " + fill.clOrdID.slice(0, 20) : ""}) at ${formatPrice(fill.px)} — by hand, the app, or another tool`);
+}
+
+let _fillShapeLogged = false;
+async function fetchCloseFill(symbol, posSide, sinceMs) {
+  if (!CFG.direct()) return null;
+  const tries = [
+    ["/exchange/order/v2/tradingList", `symbol=${symbol}&currency=USDT&offset=0&limit=50&withCount=false`],
+    ["/api-data/g-futures/trades", `symbol=${symbol}&limit=50` + (sinceMs ? `&start=${Math.floor(sinceMs - 60e3)}` : "")],
+  ];
+  const seen = [];
+  for (const [path, q] of tries) {
+    try {
+      const r = await phemexCall("GET", path, q, null);
+      const rows = r.status === 200 ? fillRowsFrom(r.data) : null;
+      if (rows) { const f = pickClosingFill(rows, posSide, sinceMs); if (f) return { ...f, via: path }; }
+      seen.push(`${path} → http ${r.status} ${JSON.stringify(r.data || {}).slice(0, 160)}`);
+    } catch (e) { seen.push(`${path} → ${String((e && e.message) || e).slice(0, 100)}`); }
+  }
+  if (!_fillShapeLogged) {
+    _fillShapeLogged = true;
+    await pushLog({ coin: symbol.replace(/USDT$/, ""), result: "FILL LOOKUP EMPTY",
+      skipped: `could not find the closing fill for ${symbol} ${posSide} — graded from the price range instead. What the venue returned: ${seen.join(" ;; ")}` });
+  }
+  return null;
 }
 
 function resolvedSince(prev, now, priceOf, rangeOf) {
@@ -1805,6 +2043,37 @@ function barsOpen(rec, now) {
   return Math.floor((now - rec.at) / ms);
 }
 
+// ── THE DECISION HAS TO BE INSIDE THE WINDOW (2026-09-12) ─────────────────────────────────────
+// Every grader in this file used to find its entry bar with `candles.findIndex(c => c.t >= rec.at)`
+// and treat the result as the moment of the decision. That is right whenever the fetched window
+// reaches back past `rec.at` — and silently, dangerously wrong when it does not, because then
+// EVERY candle is newer than the decision, findIndex returns 0, and the trade gets walked from
+// the START OF THE WINDOW instead: days or weeks after the signal was given.
+//
+// That is not harmless noise. In a trending market the first bar of a late window is already
+// beyond the target for a long (instant full win) or beyond the stop for a short (instant full
+// loss), so the error has a SIGN, and an arm fills up with 2.25s and −1s that no decision ever
+// earned. Its signature in the stored history is a whole bucket at exactly 2.25 or exactly −1
+// with identical halves — visible in the first entries of both the relative-strength and regime
+// arms, and the likeliest explanation for the maker arm reading +0.671R/decision over n=1501 on
+// 2026-09-12 while the realised book over the same rules ran at −0.071R/trade.
+//
+// The comment on gradeShadow asserting a decision "cannot age out of the window" is the
+// assumption that fails: 600 bars covers 100d at 4H but only 12.5d at 30m and 6.25d at 15m, and
+// the maker and time-stop arms retry records that never settle indefinitely, so records do age
+// past their window and were graded anyway. 382 of the maker arm's 600 remembered records were
+// older than a 30m window on the day this was found.
+//
+// Returning −1 makes the caller leave the record ungraded and try again on a later run. A record
+// that has aged out for good is simply retried until it falls off the end of the 600-record pool,
+// which costs a candle fetch and never a wrong number. Grading NOTHING is always recoverable;
+// grading a trade from the wrong week is not.
+function decisionBar(rec, candles) {
+  if (!candles || !candles.length) return -1;
+  if (candles[0].t > rec.at) return -1;      // window starts after the decision — cannot answer
+  return candles.findIndex(c => c.t >= rec.at);   // −1 when no bar has reached it yet
+}
+
 // What WOULD a time stop of N bars have scored on a decision we already have candles for?
 // Deliberately reuses gradeOne's walk so the two arms are scored by identical rules — the only
 // difference between them is when they give up.
@@ -1812,7 +2081,7 @@ function gradeWithTimeStop(rec, candles, maxBars) {
   const risk = Math.abs(rec.entry - rec.stop);
   if (!(risk > 0) || !candles || !candles.length) return null;
   const isLong = rec.dir !== "short";
-  const start = candles.findIndex(c => c.t >= rec.at);
+  const start = decisionBar(rec, candles);   // −1 if the window cannot reach the decision
   if (start < 0) return null;
   for (let i = start; i < candles.length; i++) {
     const c = candles[i];
@@ -1861,7 +2130,7 @@ function gradeMakerEntry(rec, candles, expiryH) {
   const risk = Math.abs(rec.entry - rec.stop);
   if (!(risk > 0) || !candles || !candles.length) return null;
   const isLong = rec.dir !== "short";
-  const start = candles.findIndex(c => c.t >= rec.at);
+  const start = decisionBar(rec, candles);   // −1 if the window cannot reach the decision
   if (start < 0) return null;
   const stopPct = risk / rec.entry;
   const takerGross = walkFromBar(rec, candles, start, rec.entry);
@@ -1922,11 +2191,60 @@ function hedgeCloseOrder(pos) {
 const DEHEDGE_KEY = "cipher_dehedge_failed";
 const DEHEDGE_GIVE_UP = 3;
 
+// ── A FIX TO THE ORDER PATH MUST UN-LATCH WHAT THE BROKEN PATH GAVE UP ON (2026-09-12) ────────
+// The give-up counter below is deliberately sticky: three refusals and the leg is left alone until
+// its size changes, because re-asking a venue that will never accept a dust stub is pure noise.
+// That is right when the VENUE refused. It is exactly wrong when the refusal came from this file.
+//
+// Every latched entry on 2026-09-12 read `"refPx required to size-check the order"` — which was
+// never the venue at all. It was directGuards() rejecting the bot's own valid reduce-only close
+// (found and fixed 2026-09-08, finally deployed 2026-09-12). So the counters had recorded a defect
+// that no longer exists; worse, the give-up message had told John the legs were dust stubs he must
+// close by hand, when the bot could have closed them itself all along. Run #575 still reported
+// "3 given up on" with the WORKING code in place, because the latch outlived the bug it recorded.
+//
+// Bump DEHEDGE_CODE_REV whenever the order-building or de-hedge path changes. On the first run
+// after a bump every counter is zeroed — entries are kept, with prevN, so a genuine repeat failure
+// still reads as history rather than starting from nothing. Bounded by design: a bump buys at most
+// DEHEDGE_GIVE_UP fresh attempts per leg and then it latches again, so a real venue refusal costs
+// three more asks, once, and never a loop.
+const DEHEDGE_REV_KEY  = "cipher_dehedge_rev";
+const DEHEDGE_CODE_REV = "2026-10-26-close-not-nan";   // directOrder no longer sends stopLossRp "NaN" / reduceOnly:false on a close
+
+// Zero the give-up counters once, after the order path changes. Mutates `failed` in place and
+// returns how many legs were un-latched, so the caller can say so out loud rather than silently.
+function unlatchDehedge(failed, storedRev) {
+  if (storedRev === DEHEDGE_CODE_REV) return 0;
+  let n = 0;
+  for (const k of Object.keys(failed || {})) {
+    const e = failed[k];
+    if (!e || typeof e !== "object" || !(Number(e.n) > 0)) continue;
+    e.prevN = Number(e.n);
+    e.n = 0;
+    e.unlatchedBy = DEHEDGE_CODE_REV;
+    e.unlatchedAt = Date.now();
+    n++;
+  }
+  return n;
+}
+
 async function resolveHedges(positions) {
   const out = { found: 0, closed: 0, failed: 0, givenUp: 0 };
   if (String(env("HEDGE_FIX", "1")) !== "1") return out;
   const failed = (await getJSON(DEHEDGE_KEY, {})) || {};
   let failedDirty = false;
+  // ── un-latch first, so a leg the OLD code gave up on gets a fair try under the new one ──────
+  // The stamp is written whether or not anything needed clearing, or this would run every run.
+  const dehedgeRev = await getJSON(DEHEDGE_REV_KEY, null);
+  if (dehedgeRev !== DEHEDGE_CODE_REV) {
+    const unlatched = unlatchDehedge(failed, dehedgeRev);
+    if (unlatched) {
+      failedDirty = true;
+      console.log(`de-hedge: ${unlatched} leg(s) un-latched — they gave up under an order path `
+        + `that has since changed (now ${DEHEDGE_CODE_REV}), so they get ${DEHEDGE_GIVE_UP} fresh attempts`);
+    }
+    try { await setJSON(DEHEDGE_REV_KEY, DEHEDGE_CODE_REV); } catch { }
+  }
   const bySym = new Map();
   for (const p of positions) {
     if (!(Math.abs(Number(p.size) || 0) > 0)) continue;
@@ -2176,48 +2494,102 @@ async function cancelOrder(symbol, orderID, clOrdID, posSide) {
 // feature — see [[cipher-open-items]] "first live run of any newly-armed feature should be
 // watched" — 2026-08-30 note.
 
-// A reduce-only order tagged Stop/StopLimit for this side of the position.
+// ═══════════ ONE STOP AND ONE TARGET PER POSITION — AND REMEMBER THEM (2026-10-26) ═══════════
+// The 09-02 sweep above had a hole that only showed once it ran for weeks. On 2026-10-26 the log
+// held 49 "STOP ATTACHED" lines in 36 hours — SOL, AVAX, ADA and UNI each re-attached 11-12 times —
+// and 95 "STOP ATTACH FAILED", most of them phemex 11031 TE_SO_NUM_EXCEEDS: the venue's cap on
+// conditional orders per symbol. Not one of 13 positions was ever "already ok".
+//
+// So the stops WERE landing, and this bot could not see them: the open-orders read does not return
+// the untriggered conditionals it had placed (or not in a shape findRestingStop recognised). Every
+// run it concluded "no stop" and added another, until the venue refused. Two consequences:
+//   1. Dozens of stale reduce-only stops per coin, some left over from positions that had already
+//      closed — at THEIR old levels. A new position on the same side can be closed by an old stop
+//      at a price that is neither its own stop nor its own target. That is a live candidate for
+//      the 98 "closed at neither the stop nor the target" records nobody could explain.
+//   2. "NO TARGET RESTING" on every position, every run — targets were never auto-placed at all.
+//
+// The fix has four parts:
+//   • A registry (PROTECT_KEY) of what THIS bot placed for each position: price, orderID, when.
+//     If we placed it and nothing says it is gone, we do not place it again. The book read is a
+//     second witness, not the only one.
+//   • A one-time reset (PROTECT_RESET_REV): cancel every untriggered conditional on each held
+//     symbol, then place exactly one stop and one target per position. Clears the stacks.
+//   • The take-profit is a resting reduce-only LIMIT at the plan target, not a conditional. A plain
+//     limit is the one order type this file has always been able to see in the open-orders read,
+//     it does not count toward the conditional-order cap, and when it fills it fills as a maker —
+//     the cheaper side of a fee bill that runs at ~2.2x gross profit.
+//   • When a position ends, its recorded orders are cancelled, so nothing is left lying in wait.
+const PROTECT_KEY = "cipher_protect";
+const PROTECT_REV_KEY = "cipher_protect_rev";
+const PROTECT_RESET_REV = "2026-10-26-unstack";
+
+const isClosingSide = (o, posSide) => !o.side || String(o.side) === (posSide === "Long" ? "Sell" : "Buy");
+const isOurs = (o, kind) => new RegExp("^cipher" + kind, "i").test(String(o.clOrdID || "")) ||
+  String(o.text || "") === "cipher-protective-" + kind.toLowerCase();
+const isConditional = o => /stop|iftouched|^bo/i.test(String(o.ordType || "")) ||
+  Number(o.stopPxRp ?? o.stopPx ?? 0) > 0;
+
+// A reduce-only (or close-on-trigger, or ours by tag) STOP for this side of the position.
 function findRestingStop(orders, posSide) {
-  return (orders || []).find(o => o && o.reduceOnly && String(o.posSide) === posSide &&
-    (String(o.ordType) === "Stop" || String(o.ordType) === "StopLimit"));
+  return (orders || []).find(o => o && String(o.posSide) === posSide && isClosingSide(o, posSide) &&
+    (o.reduceOnly || o.closeOnTrigger || isOurs(o, "Stop")) &&
+    (/stop/i.test(String(o.ordType || "")) || isOurs(o, "Stop")));
 }
-// Any OTHER reduce-only order for this side counts as "some target-side protection exists" —
-// deliberately not matching a specific ordType name, so a guess about Phemex's take-profit
-// ordType cannot cause a false "no target" alarm about a target that is really there.
+// Any OTHER reduce-only order for this side: our resting limit target, an if-touched take-profit,
+// or a bracket leg. Deliberately broad so a target that IS there is never reported missing.
 function findRestingTarget(orders, posSide) {
-  return (orders || []).find(o => o && o.reduceOnly && String(o.posSide) === posSide &&
-    !(String(o.ordType) === "Stop" || String(o.ordType) === "StopLimit"));
+  return (orders || []).find(o => o && String(o.posSide) === posSide && isClosingSide(o, posSide) &&
+    (o.reduceOnly || o.closeOnTrigger || isOurs(o, "Target")) &&
+    !(/stop/i.test(String(o.ordType || "")) && !isOurs(o, "Target")));
+}
+// Every protective stop resting for this side, for the de-stacking count.
+function restingStops(orders, posSide) {
+  return (orders || []).filter(o => o && String(o.posSide) === posSide && isClosingSide(o, posSide) &&
+    (o.reduceOnly || o.closeOnTrigger || isOurs(o, "Stop")) && isConditional(o));
 }
 
-// Places a reduce-only conditional order that closes an EXISTING position — the direct-mode
-// mirror of the relay's POST /stop. kind is "Stop" (proven shape) or "Target" (best-effort,
-// MarketIfTouched, not yet confirmed live).
+// PURE. Has the plan's level moved far enough from what we placed to warrant replacing it?
+// Half a basis point of the price: rounding differences never count, a trailed stop always does.
+function levelMoved(placedPx, planPx) {
+  const a = Number(placedPx), b = Number(planPx);
+  if (!(a > 0) || !(b > 0)) return true;
+  return Math.abs(a - b) / b > 0.00005;
+}
+
+// Places a reduce-only order that closes an EXISTING position — the direct-mode mirror of the
+// relay's POST /stop. kind "Stop" = conditional stop-market (the shape the relay already proves).
+// kind "Target" = a resting reduce-only Limit at the target (see the block comment above).
 async function directProtect({ symbol, posSide, kind, triggerPx, qty, refPx }) {
   if (CFG.kill()) return { ok: false, why: "KILL switch is ON — no orders placed." };
   if (!(qty > 0)) return { ok: false, why: "qty must be > 0" };
   if (!(triggerPx > 0)) return { ok: false, why: "triggerPx must be > 0" };
   const isLong = posSide === "Long";
-  // Same hard rule the relay's /stop enforces: protection on the wrong side of the market is not
-  // protection. Skipped (not refused) when we have no reliable current price to check against —
-  // the coin may not have been in this run's scan batch.
-  if (Number(refPx) > 0) {
-    if (kind === "Stop") {
-      if (isLong && triggerPx >= refPx) return { ok: false, why: `stop ${triggerPx} must be below market ${refPx} for a long` };
-      if (!isLong && triggerPx <= refPx) return { ok: false, why: `stop ${triggerPx} must be above market ${refPx} for a short` };
-    } else {
-      if (isLong && triggerPx <= refPx) return { ok: false, why: `target ${triggerPx} must be above market ${refPx} for a long` };
-      if (!isLong && triggerPx >= refPx) return { ok: false, why: `target ${triggerPx} must be below market ${refPx} for a short` };
-    }
+  // Protection on the wrong side of the market is not protection. A STOP already behind price is
+  // refused (the caller decides what a breached stop means). A TARGET already behind price is
+  // allowed: the limit fills at once, which is the plan's own exit being taken. Skipped when we
+  // have no reliable current price — the coin may not have been in this run's scan batch.
+  if (Number(refPx) > 0 && kind === "Stop") {
+    if (isLong && triggerPx >= refPx) return { ok: false, breached: true, why: `stop ${triggerPx} must be below market ${refPx} for a long` };
+    if (!isLong && triggerPx <= refPx) return { ok: false, breached: true, why: `stop ${triggerPx} must be above market ${refPx} for a short` };
   }
-  const dp = (String(refPx || triggerPx).split(".")[1] || "").length || 2;
+  // Decimals from the venue's own price when we have it (its ticker carries the real tick size),
+  // otherwise a size-based default — never from the plan, whose levels are raw floats.
+  // A ticker drops trailing zeros (105.20 arrives as "105.2"), so it can only RAISE the precision.
+  const dp = Math.max((Number(refPx) > 0 && (String(refPx).split(".")[1] || "").length) || 0, priceDp(triggerPx));
   const px = v => String(Number(Number(v).toFixed(dp)));
-  const order = {
-    clOrdID: (`cipher${kind}${Date.now()}`).replace(/[^a-zA-Z0-9]/g, "").slice(0, 40),
+  const order = kind === "Stop" ? {
+    clOrdID: (`cipherStop${Date.now()}`).slice(0, 40),
     symbol, side: isLong ? "Sell" : "Buy", posSide,
-    ordType: kind === "Stop" ? "Stop" : "MarketIfTouched",
-    stopPxRp: px(triggerPx), triggerType: "ByMarkPrice",
+    ordType: "Stop", stopPxRp: px(triggerPx), triggerType: "ByMarkPrice",
     orderQtyRq: String(qty), timeInForce: "ImmediateOrCancel",
-    closeOnTrigger: true, reduceOnly: true, text: "cipher-protective-" + kind.toLowerCase(),
+    closeOnTrigger: true, reduceOnly: true, text: "cipher-protective-stop",
+  } : {
+    clOrdID: (`cipherTarget${Date.now()}`).slice(0, 40),
+    symbol, side: isLong ? "Sell" : "Buy", posSide,
+    ordType: "Limit", priceRp: px(triggerPx),
+    orderQtyRq: String(qty), timeInForce: "GoodTillCancel",
+    reduceOnly: true, text: "cipher-protective-target",
   };
   if (CFG.mode() !== "armed" || String(env("DRY_RUN", "0")) === "1")
     return { ok: true, dry: true, wouldSend: order };
@@ -2225,42 +2597,218 @@ async function directProtect({ symbol, posSide, kind, triggerPx, qty, refPx }) {
   const code = r.data && r.data.code;
   if (r.status !== 200) return { ok: false, why: `phemex http ${r.status}`, sent: order, phemex: r.data };
   if (code !== 0 && code !== undefined) return { ok: false, why: `phemex ${code}: ${(r.data && r.data.msg) || "rejected"}`, sent: order, phemex: r.data };
-  return { ok: true, sent: order, phemex: r.data };
+  const orderID = (r.data && r.data.data && r.data.data.orderID) || undefined;
+  return { ok: true, sent: order, orderID, clOrdID: order.clOrdID, px: Number(px(triggerPx)), phemex: r.data };
 }
 
-// For every open, PLANNED position, make sure a real reduce-only stop is resting at the venue.
-// Silent (skip, not guess) about a symbol whose order book cannot be read this run — the same
-// no-hedge reasoning already used elsewhere: treating "could not see" as "must be fine" is how
-// positions go naked in the first place.
+// Decimal places for a price we have no reference for: enough that a sub-dollar coin keeps its
+// precision (the .toFixed(1) bug of 2026-08-10 broke every coin under ~$10).
+function priceDp(p) {
+  const v = Math.abs(Number(p));
+  if (!(v > 0)) return 2;
+  if (v >= 1000) return 1; if (v >= 100) return 2; if (v >= 10) return 3; if (v >= 1) return 4;
+  if (v >= 0.1) return 5; return 6;
+}
+
+// Close a position at market because its own stop is already behind price. Reduce-only, so it can
+// shrink the position and nothing else.
+async function directBreachClose({ symbol, posSide, qty }) {
+  if (CFG.kill()) return { ok: false, why: "KILL switch is ON — no orders placed." };
+  const order = { clOrdID: (`cipherBreach${Date.now()}`).slice(0, 40), symbol,
+    side: posSide === "Long" ? "Sell" : "Buy", posSide, ordType: "Market", orderQtyRq: String(qty),
+    timeInForce: "ImmediateOrCancel", reduceOnly: true, closeOnTrigger: true, text: "cipher-stop-breach" };
+  if (CFG.mode() !== "armed" || String(env("DRY_RUN", "0")) === "1") return { ok: true, dry: true, wouldSend: order };
+  const r = await phemexCall("POST", "/g-orders", "", order);
+  const code = r.data && r.data.code;
+  if (r.status !== 200) return { ok: false, why: `phemex http ${r.status}` };
+  if (code !== 0 && code !== undefined) return { ok: false, why: `phemex ${code}: ${(r.data && r.data.msg) || "rejected"}` };
+  return { ok: true };
+}
+
+// Cancel every UNTRIGGERED conditional order on a symbol (stops, if-touched). Leaves plain limit
+// orders — entries and our targets — alone.
+async function cancelAllConditionals(symbol) {
+  if (CFG.kill() || CFG.mode() !== "armed" || String(env("DRY_RUN", "0")) === "1") return { ok: false, why: "not armed" };
+  try {
+    const r = await phemexCall("DELETE", "/g-orders/all", `symbol=${encodeURIComponent(symbol)}&untriggered=true`, null);
+    const code = r.data && r.data.code;
+    const ok = r.status === 200 && (code === 0 || code === undefined);
+    return { ok, why: ok ? "" : `phemex http ${r.status}${code !== undefined ? ` code ${code}` : ""} ${(r.data && r.data.msg) || ""}`.trim() };
+  } catch (e) { return { ok: false, why: String((e && e.message) || e).slice(0, 160) }; }
+}
+
+// ── THE ONE-TIME RESET ───────────────────────────────────────────────────────────────────────
+// For every symbol we hold, cancel the stacked conditionals and forget what the registry thinks
+// it placed, so the sweep that follows puts back exactly one stop per position. Stamped per
+// revision; a symbol whose cancel fails is NOT stamped and is retried next run.
+async function resetStackedProtection(nowOpen, registry) {
+  const out = { symbols: 0, failed: [] };
+  if (!CFG.direct() || CFG.kill() || CFG.mode() !== "armed" || String(env("DRY_RUN", "0")) === "1") return out;
+  const stamp = (await getJSON(PROTECT_REV_KEY, null)) || {};
+  if (stamp.rev !== PROTECT_RESET_REV) { stamp.rev = PROTECT_RESET_REV; stamp.done = []; }
+  const symbols = [...new Set(Object.values(nowOpen || {}).filter(p => p && p.size > 0).map(p => `${p.coin}USDT`))]
+    .filter(s => !stamp.done.includes(s));
+  if (!symbols.length) return out;
+  for (const sym of symbols) {
+    const r = await cancelAllConditionals(sym);
+    if (r.ok) {
+      out.symbols++; stamp.done.push(sym);
+      for (const k of Object.keys(registry)) if (registry[k] && registry[k].symbol === sym) delete registry[k].stop;
+    } else out.failed.push(`${sym} (${r.why})`);
+  }
+  await setJSON(PROTECT_REV_KEY, stamp);
+  await pushLog({ result: "PROTECTION RESET",
+    skipped: `cleared stacked stop orders on ${out.symbols} symbol(s) — the old sweep could not see the stops it had placed and kept adding more until Phemex refused (TE_SO_NUM_EXCEEDS). Exactly one stop and one target per position go back on in this same run.` +
+      (out.failed.length ? ` Could not clear: ${out.failed.join(", ")} — will retry next run.` : "") });
+  return out;
+}
+
+// For every open, PLANNED position: exactly one stop and one target, both at the plan's own levels.
 async function protectOpenPositions(nowOpen, priceOf) {
-  const out = { checked: 0, placed: 0, alreadyOk: 0, failed: 0, blind: 0, noTarget: [] };
+  const out = { checked: 0, placed: 0, targets: 0, alreadyOk: 0, failed: 0, blind: 0, breached: 0, noTarget: [], replaced: 0 };
   if (!CFG.direct()) return out;               // the relay's own /stop endpoint covers relay mode
-  for (const pos of Object.values(nowOpen || {})) {
+  const registry = (await getJSON(PROTECT_KEY, {})) || {};
+  let dirty = false;
+  try {
+    const reset = await resetStackedProtection(nowOpen, registry);
+    if (reset.symbols) dirty = true;
+  } catch (e) { console.error("protection reset failed (harmless, retried next run):", e && e.message); }
+
+  let shapeLogged = false;
+  for (const [k, pos] of Object.entries(nowOpen || {})) {
     if (!pos || !pos.plan || !(pos.size > 0)) continue;
     const symbol = `${pos.coin}USDT`;
     const posSide = pos.dir === "short" ? "Short" : "Long";
     let orders;
     try { orders = await execOrdersFor(symbol); } catch (e) { out.blind++; continue; }
     out.checked++;
-    const ref = Number(priceOf && priceOf(pos.coin)) || Number(pos.avgEntry) || undefined;
-    if (!findRestingStop(orders, posSide)) {
-      const r = await directProtect({ symbol, posSide, kind: "Stop", triggerPx: pos.plan.stop, qty: pos.size, refPx: ref });
+    // A registry entry belongs to ONE position. A new position on the same key starts clean.
+    let reg = registry[k];
+    if (!reg || reg.since !== pos.since) { reg = registry[k] = { symbol, posSide, since: pos.since }; dirty = true; }
+    // The market-side check must use a MARKET price. The old sweep fell back to the position's
+    // average entry when the coin was not in this run's scan batch, so a long whose stop had been
+    // set above entry to lock in profit (DOT, adopted 2026-10-22) was refused every run as "stop
+    // must be below market 1.101" — 1.101 being its entry, not the market. And the venue is a
+    // testnet book measured well off mainnet, so its own mark comes first; the scan price is only
+    // a fallback, and with neither the check is skipped rather than guessed.
+    let ref;
+    const venueRef = async () => {
+      if (ref !== undefined) return ref;
+      let m = null; try { m = await markPriceFor(symbol); } catch { }
+      ref = Number(m) > 0 ? Number(m) : (Number(priceOf && priceOf(pos.coin)) || null);
+      return ref;
+    };
+
+    // ── STOP ────────────────────────────────────────────────────────────────────────────────
+    const seenStop = findRestingStop(orders, posSide);
+    const stopMoved = reg.stop && levelMoved(reg.stop.px, pos.plan.stop);
+    if (stopMoved && reg.stop.orderID) {
+      // The plan's stop has moved (trailed or rebuilt). Take the old one off before the new one
+      // goes on, or the stack starts again one level at a time.
+      const c = await cancelOrder(symbol, reg.stop.orderID, reg.stop.clOrdID, posSide);
+      if (c.ok) { delete reg.stop; dirty = true; out.replaced++; }
+    } else if (stopMoved) { delete reg.stop; dirty = true; }
+    if (seenStop && !reg.stop) {
+      // The book shows one we did not record (bundled with the entry, or placed before the
+      // registry existed). Adopt it rather than adding a second.
+      reg.stop = { px: pos.plan.stop, sentPx: Number(seenStop.stopPxRp ?? seenStop.stopPx) || undefined, orderID: seenStop.orderID, clOrdID: seenStop.clOrdID, at: Date.now(), source: "book" };
+      dirty = true;
+    }
+    if (reg.stop) out.alreadyOk++;
+    else {
+      const r = await directProtect({ symbol, posSide, kind: "Stop", triggerPx: pos.plan.stop, qty: pos.size, refPx: await venueRef() });
       if (r.ok && !r.dry) {
         out.placed++;
+        reg.stop = { px: pos.plan.stop, sentPx: r.px, orderID: r.orderID, clOrdID: r.clOrdID, at: Date.now(), source: "placed" }; dirty = true;
         await pushLog({ coin: pos.coin, dir: pos.dir, result: "STOP ATTACHED",
-          skipped: `no reduce-only stop was resting at the venue for an open, planned position — attached one at ${formatPrice(pos.plan.stop)}. Closes a gap where a bracket stop can be silently dropped by the exchange, or never existed at all (e.g. an adopted position), without the bot noticing.` });
+          skipped: `attached the plan's stop at ${formatPrice(pos.plan.stop)}. Recorded, so it will not be attached again while this position lives.` });
+      } else if (!r.ok && r.breached && String(env("STOP_BREACH_CLOSE", "1")) === "1") {
+        // The market is already through the plan's own stop. Hanging a stop behind price is
+        // impossible, and leaving the position open contradicts the plan. Close it — the exit the
+        // plan asked for, a little late. (DOT 2026-10-26: refused every run for days instead.)
+        const c = await directBreachClose({ symbol, posSide, qty: pos.size });
+        if (c.ok && !c.dry) {
+          out.breached++;
+          pos.closedBy = "stop_breach_close";
+          await pushLog({ coin: pos.coin, dir: pos.dir, result: "STOP BREACHED — CLOSED",
+            skipped: `the venue's price ${formatPrice(ref)} is already past the plan's stop ${formatPrice(pos.plan.stop)}, so a stop could not be placed. Closed at market, which is what the plan's stop would have done.` });
+        } else if (!c.ok) {
+          out.failed++;
+          await pushLog({ coin: pos.coin, dir: pos.dir, result: "STOP ATTACH FAILED",
+            skipped: `price is past the plan's stop ${formatPrice(pos.plan.stop)} and the close at market was refused: ${c.why}. Will retry next run.` });
+        }
+        continue;
       } else if (!r.ok) {
         out.failed++;
         await pushLog({ coin: pos.coin, dir: pos.dir, result: "STOP ATTACH FAILED",
-          skipped: `tried to attach a missing stop at ${formatPrice(pos.plan.stop)} and the venue refused: ${r.why}. Left unprotected; will retry next run.` });
+          skipped: `tried to attach the plan's stop at ${formatPrice(pos.plan.stop)} and the venue refused: ${r.why}. Will retry next run.` });
       }
-    } else out.alreadyOk++;
-    if (!findRestingTarget(orders, posSide)) out.noTarget.push(`${pos.coin} ${pos.dir}`);
+    }
+
+    // ── TARGET ──────────────────────────────────────────────────────────────────────────────
+    const seenTarget = findRestingTarget(orders, posSide);
+    const tgtMoved = reg.target && levelMoved(reg.target.px, pos.plan.target);
+    // Our targets are plain limits, which the book read DOES show. So if we recorded one and the
+    // book is readable and it is not there, it has gone (filled, cancelled, expired): forget it.
+    const ourTargetVisible = reg.target && (orders || []).some(o => o && (o.orderID === reg.target.orderID || o.clOrdID === reg.target.clOrdID));
+    if (reg.target && !ourTargetVisible && !seenTarget) { delete reg.target; dirty = true; }
+    if (tgtMoved && reg.target && reg.target.orderID) {
+      const c = await cancelOrder(symbol, reg.target.orderID, reg.target.clOrdID, posSide);
+      if (c.ok) { delete reg.target; dirty = true; }
+    }
+    if (seenTarget && !reg.target) {
+      reg.target = { px: pos.plan.target, sentPx: Number(seenTarget.priceRp ?? seenTarget.stopPxRp) || undefined, orderID: seenTarget.orderID, clOrdID: seenTarget.clOrdID, at: Date.now(), source: "book" };
+      dirty = true;
+    }
+    if (!reg.target && Number(pos.plan.target) > 0) {
+      const r = await directProtect({ symbol, posSide, kind: "Target", triggerPx: pos.plan.target, qty: pos.size, refPx: await venueRef() });
+      if (r.ok && !r.dry) {
+        out.targets++;
+        reg.target = { px: pos.plan.target, sentPx: r.px, orderID: r.orderID, clOrdID: r.clOrdID, at: Date.now(), source: "placed" }; dirty = true;
+        await pushLog({ coin: pos.coin, dir: pos.dir, result: "TARGET PLACED",
+          skipped: `resting reduce-only limit at the plan's target ${formatPrice(pos.plan.target)} — the trade can now end at its own target at the exchange, not only when the bot happens to look.` });
+      } else if (!r.ok) {
+        out.noTarget.push(`${pos.coin} ${pos.dir} (${r.why})`);
+      }
+    }
+
+    // ── WHAT DOES THE BOOK ACTUALLY RETURN? ───────────────────────────────────────────────
+    // One compact line per run, so the next audit can see whether the open-orders read shows
+    // conditional orders at all — the question the stacking bug turned on, answered from the
+    // venue rather than inferred.
+    if (!shapeLogged && Array.isArray(orders)) {
+      shapeLogged = true;
+      const shape = orders.slice(0, 6).map(o => [o.ordType, o.side, o.posSide, o.reduceOnly ? "RO" : "", o.closeOnTrigger ? "CoT" : "",
+        o.ordStatus || "", String(o.clOrdID || "").slice(0, 14)].filter(Boolean).join("/"));
+      console.log(`order book shape ${symbol}: ${orders.length} row(s) — ${shape.join(" | ") || "none"}`);
+      pos.bookShape = { at: Date.now(), symbol, rows: orders.length, shape };
+    }
   }
+  if (dirty) await setJSON(PROTECT_KEY, registry);
   if (out.noTarget.length)
     await pushLog({ result: "NO TARGET RESTING",
-      skipped: `${out.noTarget.length} open position(s) have (or now have) a stop but no take-profit resting at the venue: ${out.noTarget.join(", ")}. Not auto-placed yet — flagged for a look, see the 2026-09-02 note above this function.` });
+      skipped: `${out.noTarget.length} open position(s) could not be given a target: ${out.noTarget.join(", ")}. Retried next run.` });
   return out;
+}
+
+// When a position is gone, take its recorded stop and target off the venue so neither can fire
+// on the NEXT position opened on the same coin and side. Errors are fine — a reduce-only order on
+// a closed position may already have been cancelled by the venue.
+async function cancelProtectionFor(posKeys) {
+  if (!posKeys.length || !CFG.direct()) return 0;
+  const registry = (await getJSON(PROTECT_KEY, {})) || {};
+  let n = 0;
+  for (const k of posKeys) {
+    const reg = registry[k];
+    if (!reg) continue;
+    for (const leg of ["stop", "target"]) {
+      const o = reg[leg];
+      if (o && (o.orderID || o.clOrdID)) { const c = await cancelOrder(reg.symbol, o.orderID, o.clOrdID, reg.posSide); if (c.ok) n++; }
+    }
+    delete registry[k];
+  }
+  await setJSON(PROTECT_KEY, registry);
+  return n;
 }
 
 async function expireStaleOrders() {
@@ -3179,9 +3727,22 @@ async function spotProducts() {
   } catch (e) { console.error("spot products read failed:", e && e.message); return null; }
 }
 
-// Build a spot order. Returns { order } or { err } — never a half-built order.
+// Build a spot order. Returns { order, debug } or { err } — never a half-built order.
 //   side "Sell": we are selling BASE (BTC), so baseQtyEv carries the size
 //   side "Buy" : we are spending QUOTE (USDT), so quoteQtyEv carries the spend
+//
+// ── DIAGNOSTIC FIELDS ADDED 2026-09-07 ─────────────────────────────────────────────────────
+// Every live BUY since 2026-09-04T15:07 has been refused with `phemex 11053: TE_PRICE_TOO_LARGE`
+// — ~22 attempts in a row, at different real BTC prices, all rejected identically — while SELLs
+// on the same symbol, using the same priceEp formula, have gone through. That asymmetry rules out
+// "priceScale is just wrong" (a wrong scale would break both sides the same way) and points at
+// something that only matters for a ByQuote BUY specifically. `ratioScale` is read off the
+// product table (below) and has never been used anywhere in this function — a strong candidate
+// for "the field ByQuote actually needs and Sell/ByBase doesn't." Rather than guess at a fix with
+// no way to test it against the live venue (Phemex is unreachable from every machine this was
+// investigated on), this now returns `debug` alongside `order` — never sent to the venue, since
+// only `order` is ever passed to sendSpotOrder — so the NEXT few failures put real numbers in the
+// log instead of the same unexplained error on repeat.
 function buildSpotOrder(sym, side, { price, baseQty, quoteQty }, products) {
   const symbol = "s" + String(sym).toUpperCase().replace(/^S/, "") + "USDT";
   const p = products && products[symbol];
@@ -3190,10 +3751,16 @@ function buildSpotOrder(sym, side, { price, baseQty, quoteQty }, products) {
     return { err: `incomplete scales for ${symbol} — refusing to send` };
   if (side !== "Buy" && side !== "Sell") return { err: "side must be Buy or Sell" };
   if (!(price > 0)) return { err: "spot order needs a price" };
+  const priceEp = Math.round(price * 10 ** p.priceScale);
   const order = {
     symbol, side, ordType: "Limit", timeInForce: "GoodTillCancel",
-    priceEp: Math.round(price * 10 ** p.priceScale),
+    priceEp,
     clOrdID: ("accum" + sym + Date.now()).replace(/[^a-zA-Z0-9]/g, "").slice(0, 30),
+  };
+  const debug = {
+    priceScale: p.priceScale, baseValueScale: p.baseValueScale, quoteValueScale: p.quoteValueScale,
+    ratioScale: p.ratioScale, baseTickSize: p.baseTickSize, quoteTickSize: p.quoteTickSize,
+    priceEp,
   };
   // qtyType is REQUIRED and tells the venue which of the two quantity fields to read. Missing it
   // was a real defect, caught 2026-08-19 by reading Phemex's own spot docs rather than trusting
@@ -3208,14 +3775,27 @@ function buildSpotOrder(sym, side, { price, baseQty, quoteQty }, products) {
     if (!(baseQty > 0)) return { err: "sell needs a base quantity" };
     order.qtyType = "ByBase";
     order.baseQtyEv = Math.floor(baseQty * 10 ** p.baseValueScale);
+    debug.baseQtyEv = order.baseQtyEv;
     if (!(order.baseQtyEv > 0)) return { err: "base quantity rounds to zero at this scale" };
   } else {
     if (!(quoteQty > 0)) return { err: "buy needs a quote amount" };
     order.qtyType = "ByQuote";
     order.quoteQtyEv = Math.floor(quoteQty * 10 ** p.quoteValueScale);
+    debug.quoteQtyEv = order.quoteQtyEv;
     if (!(order.quoteQtyEv > 0)) return { err: "quote amount rounds to zero at this scale" };
   }
-  return { order };
+  return { order, debug };
+}
+
+// Render a buildSpotOrder debug object as a short, log-friendly string. Never touches `order`.
+function fmtSpotDebug(debug) {
+  if (!debug) return "";
+  return ` [priceScale=${debug.priceScale} baseVS=${debug.baseValueScale} quoteVS=${debug.quoteValueScale}` +
+         ` ratioScale=${debug.ratioScale} priceEp=${debug.priceEp}` +
+         (debug.baseQtyEv != null ? ` baseQtyEv=${debug.baseQtyEv}` : "") +
+         (debug.quoteQtyEv != null ? ` quoteQtyEv=${debug.quoteQtyEv}` : "") +
+         (debug.baseTickSize != null ? ` baseTick=${debug.baseTickSize}` : "") +
+         (debug.quoteTickSize != null ? ` quoteTick=${debug.quoteTickSize}` : "") + "]";
 }
 
 // PREFLIGHT — read-only, answers "can this actually trade spot here?" from the runner itself.
@@ -3798,6 +4378,21 @@ const SHADOW_MAX_RECORDS  = 600;   // keep the state file sane
 const SHADOW_GRADE_AFTER_H = 4;    // don't try to resolve a trade that has had no time to move
 const SHADOW_TIMEOUT_BARS = 40;    // same time cap the app's backtester uses
 
+// Bump this whenever a change alters what a grade MEANS. maker_entry and time_stop keep running
+// totals forever (sum / n / seen), so a guard that stops new bad gradings cannot repair the bad
+// ones already inside those sums — on 2026-09-12 the taker arm read +0.671R/decision over n=1501,
+// roughly ten times anything the realised book has ever produced. The stamp lives on each arm's
+// own slot, so the wipe happens once per arm and the arms then refill under current rules only.
+const SHADOW_GRADER_REV = "2026-09-12-window-guard";
+
+// True exactly once per slot per revision, and only when there is something to throw away.
+function staleArms(slot) {
+  if (slot.graderRev === SHADOW_GRADER_REV) return false;
+  const had = !!(slot.arms && Object.keys(slot.arms).length);
+  slot.graderRev = SHADOW_GRADER_REV;
+  return had;
+}
+
 async function loadShadow() { return (await getJSON(SHADOW_KEY, {})) || {}; }
 async function saveShadow(sh) { await setJSON(SHADOW_KEY, sh); }
 
@@ -3807,11 +4402,38 @@ function shadowSlot(sh, id) {
 }
 
 // A decision, with everything needed to grade it later. `arm` is "baseline" or "variant".
+// Duplicate offers refused this run — reported on the rank_vs_threshold summary line.
+let SHADOW_DUPS_THIS_RUN = 0;
+
 function shadowRecord(sh, id, arm, t, meta) {
   const slot = shadowSlot(sh, id);
+  const rtf = t.planTf || t.tf || "1D";
+  const rentry = +t.entry, rstop = +t.sl;
+  // ── ONE RECORD PER DECISION, NOT ONE PER RUN (2026-09-12) ────────────────────────────────────
+  // The scanner re-offers the same candidate every run for as long as the structure holds, and
+  // every offer used to become its own record. Measured on 2026-09-12: a single ADA 1D short was
+  // on file FOURTEEN times across 23 hours, every copy scored −1, and the 322 graded records in
+  // the state file were only **183 distinct setups** — the 91 records on 1D were just 19.
+  //
+  // Duplicates are not extra evidence. An identical entry and stop resolve identically, so they
+  // inflate every n, and because the copies are perfectly correlated they also shrink every
+  // confidence interval towards a precision the data does not contain. The promotion gate reads
+  // exactly those counts (n ≥ SHADOW_MIN_RESOLVED, both halves the same sign), so thirty
+  // "records" could be six setups seen five times each — which is how a lever gets promoted on
+  // evidence that was never there. It is also the likeliest reason the relative-strength ladder
+  // looked monotonic on record counts and then inverted.
+  //
+  // An exact repeat of arm+coin+dir+tf+entry+stop is the same idea being re-offered, never a
+  // second independent one: these levels come off live structure as floats and do not recur by
+  // coincidence. So it is counted ONCE for as long as it stays on file. The arm is part of the
+  // identity on purpose — baseline and variant are meant to score the same decision, and
+  // dropping the variant's copy would break the comparison the experiment exists to make.
+  const dup = slot.records.find(r => r.arm === arm && r.coin === t.coin && r.dir === t.dir
+                                  && (r.tf || "1D") === rtf && r.entry === rentry && r.stop === rstop);
+  if (dup) { SHADOW_DUPS_THIS_RUN++; return; }
   slot.records.push({
-    at: Date.now(), arm, coin: t.coin, dir: t.dir, tf: t.planTf || t.tf || "1D",
-    entry: +t.entry, stop: +t.sl, target: +(t.tp2 ?? t.tp1),
+    at: Date.now(), arm, coin: t.coin, dir: t.dir, tf: rtf,
+    entry: rentry, stop: rstop, target: +(t.tp2 ?? t.tp1),
     quality: meta && meta.quality, note: meta && meta.note,
     reg: (meta && meta.reg) || null,            // "bull" | "bear" at the moment of the decision
     rs: (meta && meta.rs) != null ? meta.rs : null,  // 1 = trading the field's leader in your direction
@@ -3825,26 +4447,40 @@ function shadowRecord(sh, id, arm, t, meta) {
 // Walk real candles forward from the decision and score it in R. Stop is checked BEFORE target
 // within a candle — the pessimistic reading, same as the app's backtester. Anything still open
 // after the time cap is marked to market.
-function gradeOne(rec, candles) {
+// The single candle walk every grader in this file uses. Returns { R, how, ambiguous } — `how` is
+// "stop" | "target" | "timeout" — or null while the decision is still open. One implementation on
+// purpose: two arms compared by two different walks are not compared at all.
+// `capBars` overrides the time cap, in bars OF THE CANDLES PASSED IN, so the same decision can be
+// re-walked at a finer resolution over the same wall-clock horizon.
+function walkDecision(rec, candles, capBars) {
   const risk = Math.abs(rec.entry - rec.stop);
   if (!(risk > 0) || !candles || !candles.length) return null;
   const isLong = rec.dir !== "short";
-  const start = candles.findIndex(c => c.t >= rec.at);
+  const start = decisionBar(rec, candles);   // −1 if the window cannot reach the decision
   if (start < 0) return null;
+  const cap = capBars || SHADOW_TIMEOUT_BARS * (rec.tfMult || 4);
   for (let i = start; i < candles.length; i++) {
     const c = candles[i];
     const hitStop = isLong ? c.l <= rec.stop : c.h >= rec.stop;
     const hitTgt  = isLong ? c.h >= rec.target : c.l <= rec.target;
     if (hitStop && hitTgt) rec.ambiguous = (rec.ambiguous || 0) + 1;   // counted, never hidden
-    if (hitStop) return -1;
-    if (hitTgt) return +Math.abs(rec.target - rec.entry) / risk;
+    // Stop before target inside one bar — the pessimistic reading. Correct at a resolution where
+    // a single bar cannot hold both; a lie at one where it can. That is what SECOND_OPINION_TF
+    // exists to measure rather than assume.
+    if (hitStop) return { R: -1, how: "stop", ambiguous: hitTgt };
+    if (hitTgt) return { R: +Math.abs(rec.target - rec.entry) / risk, how: "target", ambiguous: false };
     // The cap is 40 bars OF THE SIGNAL'S timeframe. Graded on a finer one, that is 4x as many
     // bars — otherwise a 4H idea would be marked to market after less than a day.
-    if (i - start >= SHADOW_TIMEOUT_BARS * (rec.tfMult || 4)) {
-      return (isLong ? c.c - rec.entry : rec.entry - c.c) / risk;   // marked to market
+    if (i - start >= cap) {
+      return { R: (isLong ? c.c - rec.entry : rec.entry - c.c) / risk, how: "timeout", ambiguous: false };
     }
   }
   return null;                                  // not enough candles yet — leave it open
+}
+
+function gradeOne(rec, candles) {
+  const g = walkDecision(rec, candles);
+  return g ? g.R : null;
 }
 
 // ── GRADE ON A FINER TIMEFRAME THAN THE SIGNAL (2026-08-18) ──────────────────────────────────
@@ -3859,11 +4495,32 @@ function gradeOne(rec, candles) {
 // The same reasoning the confirmation watcher already uses.
 const GRADE_TF_BELOW = { "1D": "4H", "4H": "1H", "1H": "30m", "30m": "15m", "15m": "15m" };
 
+// ── SECOND OPINION ON THE WIDEST SIGNALS (2026-09-12) ────────────────────────────────────────
+// The 2026-08-18 fix above moved grading one timeframe DOWN because a bar wide enough to contain
+// both the stop and the target always scores as a loss (the stop is checked first). It was
+// verified on 4H signals — and never checked on 1D ones, whose stops are roughly twice as wide:
+// median 6.6% against 3.6%, with the target out at 14.8%. A 4H crypto bar spans that often.
+//
+// The live evidence on 2026-09-12: every one of the 19 distinct 1D setups on file had scored
+// EXACTLY −1. Nineteen for nineteen, zero variance. Strip them out and the whole graded book
+// moves from −0.130R to −0.030R and the "shorts are the problem" reading loses most of its
+// weight — so whether that block is the market or the measurement decides what gets changed next.
+//
+// This re-walks each already-graded 1D decision on 1H bars under identical rules and an equal
+// wall-clock cap, then logs how often the finer resolution disagrees. It is advisory: `R` is
+// never touched, nothing is filtered, no gate reads `R2`. If 1H keeps saying "stop", 1D shorts
+// are a real finding and can be acted on. If it says "target" where 4H said "stop", the 4H grade
+// is an artefact and every conclusion drawn from those records has to go.
+const SECOND_OPINION_TF   = { "1D": "1H" };   // signal timeframe → finer timeframe to re-check on
+const SECOND_OPINION_MULT = { "1D": 24 };     // finer bars per signal bar, to keep the cap equal
+
 async function gradeShadow(sh) {
   const cutoff = Date.now() - SHADOW_GRADE_AFTER_H * 3600e3;
   const need = new Map();                        // coin|tf → the records waiting on it
   for (const id of Object.keys(sh)) {
-    for (const rec of sh[id].records) {
+    const slot = sh[id];
+    if (!slot || !Array.isArray(slot.records)) continue;   // not a grading slot — skip, never throw
+    for (const rec of slot.records) {
       if (rec.R !== null || rec.at > cutoff) continue;
       const gtf = GRADE_TF_BELOW[rec.tf || "1D"] || "1H";
       const k = rec.coin + "|" + gtf;
@@ -3884,7 +4541,47 @@ async function gradeShadow(sh) {
       if (R !== null) { rec.R = +R.toFixed(3); rec.gtf = gtf; graded++; }
     }
   }
+  await secondOpinion(sh);
   return graded;
+}
+
+// Re-walk graded decisions whose timeframe has a SECOND_OPINION_TF, at that finer resolution.
+// Measures the grader against itself; changes nothing it reads.
+async function secondOpinion(sh) {
+  const need = new Map();
+  for (const id of Object.keys(sh)) {
+    const slot = sh[id];
+    if (!slot || !Array.isArray(slot.records)) continue;
+    for (const rec of slot.records) {
+      const ftf = SECOND_OPINION_TF[rec.tf || ""];
+      if (!ftf || rec.R === null || rec.R === undefined || rec.R2 !== undefined) continue;
+      const k = rec.coin + "|" + ftf;
+      if (!need.has(k)) need.set(k, []);
+      need.get(k).push(rec);
+    }
+  }
+  if (!need.size) return;
+  const cmp = { n: 0, agree: 0, flip: 0, sum: 0, sum2: 0, stop2: 0, tgt2: 0, to2: 0 };
+  for (const [k, recs] of need) {
+    const [coin, ftf] = k.split("|");
+    let candles = null;
+    try { candles = await fetchCandles(coin, ftf, 600); } catch { }
+    if (!candles) continue;
+    for (const rec of recs) {
+      const cap = SHADOW_TIMEOUT_BARS * (SECOND_OPINION_MULT[rec.tf] || 24);
+      const g = walkDecision(rec, candles, cap);
+      if (!g) continue;                          // finer window can't reach it — try a later run
+      rec.R2 = +g.R.toFixed(3); rec.how2 = g.how; rec.gtf2 = ftf;
+      cmp.n++; cmp.sum += rec.R; cmp.sum2 += rec.R2;
+      if ((rec.R > 0) === (rec.R2 > 0)) cmp.agree++;
+      else if (rec.R <= 0 && rec.R2 > 0) cmp.flip++;      // graded a loss, finer says a win
+      if (g.how === "stop") cmp.stop2++; else if (g.how === "target") cmp.tgt2++; else cmp.to2++;
+    }
+  }
+  if (cmp.n) console.log(`shadow second opinion: ${cmp.n} re-walked finer · graded mean `
+    + `${(cmp.sum / cmp.n).toFixed(3)}R · finer mean ${(cmp.sum2 / cmp.n).toFixed(3)}R · agree `
+    + `${cmp.agree}/${cmp.n} · graded-loss-but-finer-win ${cmp.flip} · finer outcomes: `
+    + `${cmp.stop2} stop / ${cmp.tgt2} target / ${cmp.to2} timeout`);
 }
 
 function armStats(records, arm) {
@@ -4218,6 +4915,7 @@ async function runAccumulator(book = primaryAccumBook()) {
                   execNote = r.ok ? `SPOT SELL PLACED (${built.order.clOrdID})`
                           : r.dry ? `dry run — would have sent a SPOT sell (${r.why})`
                                   : `spot sell refused: ${r.error}`;
+                  execNote += fmtSpotDebug(built.debug);   // DIAGNOSTIC, see buildSpotOrder — 2026-09-07
                 }
               } catch (err) { execNote = "spot path errored (no order sent): " + (err && err.message); }
               await pushLog({ coin, result: "ACCUM SELL",
@@ -4251,6 +4949,7 @@ async function runAccumulator(book = primaryAccumBook()) {
                     execNote = r2.ok ? `SPOT BUY PLACED (${built.order.clOrdID})`
                              : r2.dry ? `dry run — would have sent a SPOT buy (${r2.why})`
                                       : `spot buy refused: ${r2.error}`;
+                    execNote += fmtSpotDebug(built.debug);   // DIAGNOSTIC, see buildSpotOrder — 2026-09-07
                     if (ladderArmed && !r2.ok) ladderUnplaced = r2.dry ? r2.why : r2.error;
                   }
                 }
@@ -4572,9 +5271,22 @@ async function runAccumulator(book = primaryAccumBook()) {
                 const sellQty = sellable != null ? Math.min(e.units, sellable) : e.units;
                 const walletQuote = PF && Number.isFinite(PF.quoteBalance) ? PF.quoteBalance : null;
                 const buyQty = walletQuote != null ? Math.min(e.cash, walletQuote) : e.cash;
+                // A BUY is priced against the venue's own book, not only against Binance (see
+                // spotVenuePx). The venue's bid/ask/last always go in the log line.
+                let venueNote = "";
+                let buyPx = e.px;
+                if (!isSell) {
+                  const symS = "s" + String(coin).toUpperCase() + "USDT";
+                  const vp = await spotVenuePx(symS, prods && prods[symS] && prods[symS].priceScale);
+                  const cl = clampBuyPx(e.px, vp, num("ACCUM_BUY_CLAMP_BPS", 50));
+                  buyPx = cl.px;
+                  venueNote = vp
+                    ? ` [venue bid=${vp.bid} ask=${vp.ask} last=${vp.last}${cl.clamped ? `; limit clamped ${formatPrice(e.px)} -> ${formatPrice(cl.px)}` : ""}]`
+                    : " [venue ticker unreadable]";
+                }
                 const built = isSell
                   ? buildSpotOrder(coin, "Sell", { price: e.px, baseQty: sellQty }, prods)
-                  : buildSpotOrder(coin, "Buy", { price: e.px, quoteQty: buyQty }, prods);
+                  : buildSpotOrder(coin, "Buy", { price: buyPx, quoteQty: buyQty }, prods);
                 if (built.err) {
                   execNote = `Spot order NOT built: ${built.err}`;
                   if (armedExec) placeFailed = built.err;
@@ -4584,6 +5296,9 @@ async function runAccumulator(book = primaryAccumBook()) {
                   execNote = sr.ok ? `SPOT ${isSell ? "SELL" : "BUY"} PLACED (${built.order.clOrdID})`
                            : sr.dry ? `dry run — would have sent a SPOT ${isSell ? "sell" : "buy"} (${sr.why})`
                                     : `spot ${isSell ? "sell" : "buy"} refused: ${sr.error}`;
+                  // DIAGNOSTIC (2026-09-07): the scales/priceEp actually used, never sent to the
+                  // venue — see the big comment above buildSpotOrder for why this was added.
+                  execNote += fmtSpotDebug(built.debug) + venueNote;
                   // Armed and NOT placed is the one outcome the book must never absorb. A dry
                   // note here means a brake fired (kill, cap) while we believed we were live.
                   if (armedExec && !sr.ok) placeFailed = sr.dry ? sr.why : sr.error;
@@ -4882,6 +5597,7 @@ export default async function cipherAgent() {
   // otherwise a single pass can stack far past CORR_MAX before the next run notices. Found when
   // the ported detectors made one run place 10 orders (2026-08-11).
   const openedThisRun = [];   // { book, dir }
+  let confluenceOff = 0;      // coins the switched-off confluence path would have fired on this run
   const sameDir = (book, dir) => {
     const fromExchange = positions.filter(p => {
       const coin = String(p.symbol || "").replace(/USDT$/, "").toUpperCase();
@@ -4966,6 +5682,7 @@ export default async function cipherAgent() {
     // Detectors carry no score, so they use the configured minimum — the guards below still bind.
     let sig = scoreCoin(tfData);
     if (sig && sig.score < CFG.minScore()) sig = null;
+    if (sig && !CFG.confluence()) { confluenceOff++; sig = null; }   // off by default — see CFG.confluence
     if (!sig) {
       // Look at EVERY timeframe and detector, then take the STRONGEST hit — not whichever
       // happened to be checked first. Taking the first match meant a 15m wobble could outrank a
@@ -5011,7 +5728,7 @@ export default async function cipherAgent() {
         sig = { bias: best.m.dir, score: CFG.minScore(),
                 ev: [best.m.label || best.label, ...(best.m.ev || [])].slice(0, 4),
                 price: best.c[best.c.length - 1].c, planTf: best.tf, detector: best.label,
-                alt: hits.length > 1 ? hits.length - 1 : 0 };
+                alt: hits.length > 1 ? hits.length - 1 : 0, quality: +best.q.toFixed(2) };
         }
       }
     }
@@ -5030,6 +5747,12 @@ export default async function cipherAgent() {
     if (held.has(book + "|" + coin)) { await pushLog({ coin, dir: sig.bias, book, score: sig.score, skipped: `already holding ${coin} in the ${book} book` }); continue; }
     if (sameDir(book, sig.bias) >= bcfg.corrMax()) { await pushLog({ coin, dir: sig.bias, book, score: sig.score, skipped: `correlation guard — already ${sameDir(book, sig.bias)} ${sig.bias} positions in the ${book} book (max ${bcfg.corrMax()})` }); continue; }
     if (placedInBook[book] + placedToday >= CFG.dayCap() || placedInBook[book] >= bcfg.dayCap()) { await pushLog({ coin, dir: sig.bias, book, score: sig.score, skipped: `daily cap reached for the ${book} book (${bcfg.dayCap()})` }); continue; }
+    // The only filter in this bot that is allowed to refuse a trade on evidence — see gate1dShort.
+    // Placed after rankPool.push() above, so the decision it blocks is still measured.
+    {
+      const why1d = gate1dShort(sig.bias, sig.planTf, REGIME.label);
+      if (why1d) { await pushLog({ coin, dir: sig.bias, book, score: sig.score, skipped: "REFUSED — " + why1d }); continue; }
+    }
 
     const planBars = bars[sig.planTf] || await fetchCandles(coin, sig.planTf || "1D", 260);
     const plan = planBars ? buildTradePlan(planBars, sig.bias, sig.price) : null;
@@ -5047,6 +5770,14 @@ export default async function cipherAgent() {
 
     const t = { coin, dir: sig.bias, entry: plan.entry, sl: plan.stop, tp1: plan.targets[0], tp2: plan.targets[1], score: sig.score,
                 stopKind: plan.stopKind, trend: plan.trend, zone: plan.zone };
+    // WHICH SETUP MADE THIS TRADE (2026-09-19). Until now the record said what was traded, never why,
+    // so live results could not be split by setup. Carried onto the placed record, the open position
+    // and the resolved record. "confluence" is the score path; otherwise the detector name.
+    const setupName = sig.detector || "confluence", setupTf = sig.planTf || "1D";
+    // The quality score that let this trade through (MIN_QUALITY), carried onto every record so
+    // "do 6s beat 5s?" can be answered from LIVE trades, not only from the shadow tests (2026-10-26).
+    // The confluence path has no quality score; it is recorded as absent, not as zero.
+    const quality = Number.isFinite(sig.quality) ? sig.quality : undefined;
     lastPrice[coin] = sig.price;
     const bad = planValid(t);
     if (bad) { await pushLog({ ...t, skipped: "REFUSED — " + bad }); continue; }
@@ -5081,7 +5812,7 @@ export default async function cipherAgent() {
 
     fired[key] = Date.now();
     if (mode === "dry") {
-      openedThisRun.push({ book, dir: sig.bias, coin, plan: { entry: t.entry, stop: t.sl, target: t.tp2 ?? t.tp1 } });
+      openedThisRun.push({ book, dir: sig.bias, coin, setup: setupName, setupTf, quality, plan: { entry: t.entry, stop: t.sl, target: t.tp2 ?? t.tp1 } });
       noteOpened(book, coin, sig.bias);    // a dry run must model the same book the armed one would
       held.add(book + "|" + coin); placedInBook[book]++;
       await pushLog({ ...t, qty: built.meta.qty, risk: built.meta.riskActual, clamped: built.meta.clamped || undefined, mode, result: "dry-run OK", thesis: sig.ev.join("; ") + " · plan from " + (sig.planTf || "1D") + (sig.detector ? " · " + sig.detector + " detector" + (sig.alt ? " (best of " + (sig.alt + 1) + " hits)" : "") : " · confluence") });
@@ -5132,7 +5863,7 @@ export default async function cipherAgent() {
       countsForStats: ok ? true : false, thesis: sig.ev.join("; ") + " · plan from " + (sig.planTf || "1D") + (sig.detector ? " · " + sig.detector + " detector" + (sig.alt ? " (best of " + (sig.alt + 1) + " hits)" : "") : " · confluence") });
     // The ledger gets the order attempt too, so a rejection rate can be measured over months
     // rather than over whatever happens to still be in the last 300 log lines.
-    await pushLedger({ kind: ok ? "placed" : "rejected", coin: t.coin, dir: t.dir, book,
+    await pushLedger({ kind: ok ? "placed" : "rejected", coin: t.coin, dir: t.dir, book, setup: setupName, setupTf, quality,
       entry: t.entry, stop: t.sl, target: t.tp1, qty: built.meta.qty, risk: built.meta.riskActual,
       mode, via: EXEC(), orderID: oid || undefined,
       dryRun: ok ? !!r.data.dryRun : undefined,
@@ -5154,9 +5885,11 @@ export default async function cipherAgent() {
     if (!ok && r.status >= 500) delete fired[key];
     if (ok) { try { await rememberResting(built.meta, built.order, coin, sig.bias, oid); } catch {}
       placed++; placedToday++; placedInBook[book]++;
-      openedThisRun.push({ book, dir: sig.bias, coin, plan: { entry: t.entry, stop: t.sl, target: t.tp2 ?? t.tp1 } });
+      openedThisRun.push({ book, dir: sig.bias, coin, setup: setupName, setupTf, quality, plan: { entry: t.entry, stop: t.sl, target: t.tp2 ?? t.tp1 } });
       held.add(book + "|" + coin); noteOpened(book, coin, sig.bias); }
   }
+
+  if (!CFG.confluence()) console.log(`confluence path OFF (CONFLUENCE=1 turns it on): it would have fired on ${confluenceOff} coin(s) this run`);
 
   // ── SHADOW: record this run's decisions, grade older ones, let the evidence decide ──────────
   try {
@@ -5188,6 +5921,10 @@ export default async function cipherAgent() {
     // window. No extra trades, no extra risk — just a second question asked of the same data:
     // would giving up after N bars have made more R than holding on?
     const tsSlot = shadowSlot(SHADOW, "time_stop");
+    if (staleArms(tsSlot)) {
+      tsSlot.arms = {};
+      console.log(`shadow time_stop: totals discarded — built by the pre-guard grader (now ${SHADOW_GRADER_REV})`);
+    }
     tsSlot.arms = tsSlot.arms || {};
     const src = (SHADOW.rank_vs_threshold && SHADOW.rank_vs_threshold.records) || [];
     const byKey = new Map();
@@ -5226,6 +5963,11 @@ export default async function cipherAgent() {
     // have returned, net of fees, against the marketable limit the bot actually sends? Graded on
     // the timeframe below the signal so a fill and a stop can be told apart within the bar.
     const meSlot = shadowSlot(SHADOW, "maker_entry");
+    if (staleArms(meSlot)) {
+      meSlot.arms = { taker: { sum: 0, n: 0 }, maker: { sum: 0, n: 0, filled: 0, missed: 0 } };
+      meSlot.seen = [];
+      console.log(`shadow maker_entry: totals discarded — built by the pre-guard grader (now ${SHADOW_GRADER_REV})`);
+    }
     meSlot.arms = meSlot.arms || { taker: { sum: 0, n: 0 }, maker: { sum: 0, n: 0, filled: 0, missed: 0 } };
     meSlot.seen = meSlot.seen || [];
     const meNeed = new Map();
@@ -5259,7 +6001,7 @@ export default async function cipherAgent() {
 
     const v = shadowJudge(SHADOW, "rank_vs_threshold");
     await saveShadow(SHADOW);
-    console.log(`shadow rank_vs_threshold: baseline ${v.base.n} trades @ ${v.base.meanR}R · variant ${v.varr.n} @ ${v.varr.meanR}R · edge ${v.edge >= 0 ? "+" : ""}${v.edge}R${v.ready ? "" : " (still gathering)"}${v.changed ? " — " + v.changed.toUpperCase() : ""}${gradedN ? ` · graded ${gradedN} this run` : ""}`);
+    console.log(`shadow rank_vs_threshold: baseline ${v.base.n} trades @ ${v.base.meanR}R · variant ${v.varr.n} @ ${v.varr.meanR}R · edge ${v.edge >= 0 ? "+" : ""}${v.edge}R${v.ready ? "" : " (still gathering)"}${v.changed ? " — " + v.changed.toUpperCase() : ""}${gradedN ? ` · graded ${gradedN} this run` : ""}${SHADOW_DUPS_THIS_RUN ? ` · ${SHADOW_DUPS_THIS_RUN} duplicate offer(s) not re-recorded` : ""}`);
     if (v.changed) await pushLog({ shadow: "rank_vs_threshold", result: v.changed.toUpperCase(),
       skipped: `ranking ${v.changed}: variant ${v.varr.meanR}R vs baseline ${v.base.meanR}R over ${v.varr.n}/${v.base.n} resolved trades` });
 
@@ -5391,6 +6133,9 @@ export default async function cipherAgent() {
       const k = posKey(o.coin, o.dir);
       if (!nowOpen[k]) nowOpen[k] = { coin: o.coin, dir: o.dir, size: 0, book: o.book, since: Date.now() };
       nowOpen[k].plan = o.plan || nowOpen[k].plan || null;
+      nowOpen[k].setup = o.setup || nowOpen[k].setup;
+      nowOpen[k].setupTf = o.setupTf || nowOpen[k].setupTf;
+      if (Number.isFinite(o.quality)) nowOpen[k].quality = o.quality;
       nowOpen[k].book = o.book;
     }
     // Anything held with no plan gets adopted — see adoptOrphans. Bookkeeping only, no orders.
@@ -5485,12 +6230,42 @@ export default async function cipherAgent() {
       // authority than one graded on the venue, and the ledger has to be able to say which it was
       // — otherwise the next person reading the record cannot tell a fact from an approximation.
       .map(r => ({ ...r, gradedOn: gradedOn[r.coin] || "none" }));
+    // ── THEN ASK THE VENUE WHAT ACTUALLY CLOSED IT (2026-10-26) ─────────────────────────────
+    // The range verdict above stays as the fallback. Where Phemex's trade history has the closing
+    // fill, that fill decides: its price is the real exit and its clOrdID names the closer. Capped
+    // per run so a mass close cannot turn one run into fifty API calls.
+    let fillLookups = 0;
+    for (let i = 0; i < resolved.length; i++) {
+      const r = resolved[i];
+      if (!r.plan || fillLookups >= num("FILL_LOOKUPS_PER_RUN", 8)) continue;
+      fillLookups++;
+      let fill = null;
+      try { fill = await fetchCloseFill(`${r.coin}USDT`, r.dir === "short" ? "Short" : "Long", Number(r.since) || 0); } catch { }
+      const a = attributeClose(r, fill);
+      if (a) resolved[i] = { ...r, ...a };
+      else if (r.closedBy === "stop_breach_close" && Number.isFinite(r.exit)) {
+        // We closed it ourselves last run because the stop was already behind price.
+        const risk = Math.abs(r.plan.entry - r.plan.stop);
+        resolved[i] = { ...r, how: "stop", closedBy: "stop_breach_close", outcome: "loss", klass: "strategy",
+          execution: "filled_snapshot_only", countsForStreak: true, countsForStats: true,
+          R: risk > 0 ? +(((r.dir === "short" ? r.plan.entry - r.exit : r.exit - r.plan.entry)) / risk).toFixed(3) : -1,
+          why: "the bot closed it at market because price was already past its stop (no fill found, R from the last price)" };
+        if (resolved[i].R > 0) resolved[i].outcome = "win";
+      }
+    }
+    // Take each ended position's recorded stop and target off the venue, so neither can fire on
+    // the next position opened on the same coin and side.
+    try {
+      const pulled = await cancelProtectionFor(resolved.map(r => posKey(r.coin, r.dir)));
+      if (pulled) console.log(`protection: cancelled ${pulled} leftover stop/target order(s) for ${resolved.length} closed position(s)`);
+    } catch (e) { console.error("leftover-order cleanup failed (harmless, retried by the next reset):", e && e.message); }
     const queue = [];
     for (const r of resolved) {
       const line = `${r.coin} ${r.dir} ${r.how}${Number.isFinite(r.exit) ? " at " + formatPrice(r.exit) : ""}`;
       // The four labels go ON the record, not just into the sentence. A panel that has to read
       // English to know whether something was a win will eventually read it wrong.
       await pushLog({ coin: r.coin, dir: r.dir, book: r.book || undefined, gradedOn: r.gradedOn,
+        closedBy: r.closedBy || undefined, quality: Number.isFinite(r.quality) ? r.quality : undefined,
         how: r.how, outcome: r.outcome, klass: r.klass, execution: r.execution,
         R: Number.isFinite(r.R) ? r.R : undefined,
         entry: r.plan && Number.isFinite(r.plan.entry) ? r.plan.entry : undefined,
@@ -5509,6 +6284,13 @@ export default async function cipherAgent() {
         target: r.plan && Number.isFinite(r.plan.target) ? r.plan.target : undefined,
         exit: Number.isFinite(r.exit) ? r.exit : undefined,
         opened: r.since || undefined,
+        setup: r.setup || undefined, setupTf: r.setupTf || undefined,
+        quality: Number.isFinite(r.quality) ? r.quality : undefined,
+        closedBy: r.closedBy || undefined, gradedOn: r.gradedOn || undefined,
+        fill: r.closeFill ? { px: r.closeFill.px, ordType: r.closeFill.ordType || undefined,
+          clOrdID: r.closeFill.clOrdID ? r.closeFill.clOrdID.slice(0, 24) : undefined,
+          pnl: r.closeFill.closedPnl, at: r.closeFill.at } : undefined,
+        why: r.why ? String(r.why).slice(0, 200) : undefined,
         countsForStats: !!r.countsForStats, countsForStreak: !!r.countsForStreak });
       delete bookMap[posKey(r.coin, r.dir)];
       if (r.how === "target") queue.push(r.coin);
