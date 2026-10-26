@@ -151,9 +151,9 @@ ok("it closes the SMALLER leg", dh && dh.posSide === "Short" && dh.side === "Buy
 console.log("\n7. A position closes — the venue's fill says how");
 const prev = { cipher_open: SOL_OPEN, cipher_protect: { "SOL|short": { symbol:"SOLUSDT", posSide:"Short", since: SINCE,
   stop:{ px:109.67, orderID:"S1", clOrdID:"cipherStop1" }, target:{ px:100.89, orderID:"T1", clOrdID:"cipherTarget1" } } } };
-const fillAt = (px, clOrdID, ordType="Limit") => ({ SOLUSDT: [{ symbol:"SOLUSDT", side:"Buy", posSide:"Short", execPriceRp:String(px), execQtyRq:"2.4",
-  ordType, clOrdID, transactTimeNs: String((Date.now()-36e5)*1e6), closedPnlRv:"14.6" }] });
-const r7 = await run({ label:"filled-target", state: prev, positions: [], fills: fillAt(100.89, "cipherTarget177") });
+const fillAt = (px, clOrdID, ordType="Limit", orderID="") => ({ SOLUSDT: [{ symbol:"SOLUSDT", side:"Buy", posSide:"Short", execPriceRp:String(px), execQtyRq:"2.4",
+  ordType, clOrdID, orderID, transactTimeNs: String((Date.now()-36e5)*1e6), closedPnlRv:"14.6" }] });
+const r7 = await run({ label:"filled-target", state: prev, positions: [], fills: fillAt(100.89, "cipherTarget1", "Limit", "T1") });
 const res7 = r7.ledger.find(e => e.kind === "resolved" && e.coin === "SOL");
 ok("resolved as its own target", res7 && res7.how === "target" && res7.closedBy === "cipher_target", JSON.stringify(res7));
 ok("counts toward the stats", res7 && res7.countsForStats === true && res7.outcome === "win");
@@ -169,6 +169,18 @@ const res8 = r8.ledger.find(e => e.kind === "resolved" && e.coin === "SOL");
 ok("named a stale stop, not this trade's loss", res8 && res8.how === "stale_stop" && res8.countsForStats === false, JSON.stringify(res8));
 ok("its real R is still recorded for the audit", res8 && Number.isFinite(res8.R));
 
+console.log("\n8b. AUDIT: its OWN stop, gapped well past the level — still a counted loss");
+const r8b = await run({ label:"gapped", state: prev, positions: [], fills: fillAt(111.5, "cipherStop1", "Stop", "S1") });
+const res8b = r8b.ledger.find(e => e.kind === "resolved" && e.coin === "SOL");
+ok("matched to its own stop by orderID", res8b && res8b.closedBy === "cipher_stop" && res8b.how === "stop", JSON.stringify(res8b));
+ok("counted, with the real (worse than -1) R", res8b && res8b.countsForStats === true && res8b.R < -1.5, res8b && res8b.R);
+ok("and the gap is named in the record", res8b && /past the level/.test(res8b.why || ""));
+
+console.log("\n8c. AUDIT: a target order from an EARLIER position");
+const r8c = await run({ label:"stale-tgt", state: prev, positions: [], fills: fillAt(100.5, "cipherTarget9999", "Limit", "OLD7") });
+const res8c = r8c.ledger.find(e => e.kind === "resolved" && e.coin === "SOL");
+ok("not credited as this trade's win", res8c && res8c.closedBy === "stale_target" && res8c.countsForStats === false, JSON.stringify(res8c));
+
 console.log("\n9. Closed by something the bot did not send");
 const r9 = await run({ label:"manual", state: prev, positions: [], fills: fillAt(104.39, "web-1234", "Market") });
 const res9 = r9.ledger.find(e => e.kind === "resolved" && e.coin === "SOL");
@@ -178,6 +190,41 @@ console.log("\n10. No fill to be found — falls back to the range, and says wha
 const r10 = await run({ label:"nofill", state: prev, positions: [], fills: {} });
 ok("still resolved (range fallback)", r10.ledger.some(e => e.kind === "resolved" && e.coin === "SOL"));
 ok("the empty lookup is logged once, with the venue's answer", r10.log.filter(e => e.result === "FILL LOOKUP EMPTY").length === 1);
+
+console.log("\n10b. AUDIT: same coin and side REOPENED between runs (entry moved)");
+const reopenPos = [{ symbol:"SOLUSDT", posSide:"Short", side:"Sell", size:3.0, avgEntryPriceRp:"104.00" }];
+const r10b = await run({ label:"reopen", state: prev, positions: reopenPos, marks:{ SOLUSDT: 103.5 }, fills: fillAt(100.89, "cipherTarget1", "Limit", "T1") });
+const res10b = r10b.ledger.find(e => e.kind === "resolved" && e.coin === "SOL");
+ok("the OLD trade resolves (it used to be silently merged into the new one)", !!res10b && res10b.closedBy === "cipher_target", JSON.stringify(res10b));
+ok("the old trade's stop and target are pulled", r10b.cancels.some(q => q.includes("orderID=S1")) && r10b.cancels.some(q => q.includes("orderID=T1")), JSON.stringify(r10b.cancels));
+const newSol = r10b.st.cipher_open["SOL|short"];
+ok("the new position starts clean (new since, not the old setup)", newSol && newSol.since > SINCE && newSol.setup === undefined, JSON.stringify(newSol && { since: newSol.since, setup: newSol.setup }));
+ok("and gets its own fresh stop + target", stops(r10b).length === 1 && targets(r10b).length === 1, JSON.stringify({ s: stops(r10b).length, t: targets(r10b).length }));
+ok("the old record is gone from the registry; the new one is live", r10b.st.cipher_protect["SOL|short"] && r10b.st.cipher_protect["SOL|short"].since === newSol.since && !r10b.st.cipher_protect[`SOL|short#${SINCE}`], JSON.stringify(Object.keys(r10b.st.cipher_protect)));
+
+console.log("\n10c. AUDIT: a leftover order is pulled at the START of the run, before any new trade");
+const r10c = await run({ label:"early-pull", state: prev, positions: [], fills: {} });
+const firstCancel = r10c.cancels.findIndex(q => q.includes("orderID=S1") || q.includes("orderID=T1"));
+ok("the finished position's orders are cancelled", firstCancel >= 0, JSON.stringify(r10c.cancels));
+ok("and only once (not again at the end of the run)", r10c.cancels.filter(q => q.includes("orderID=S1")).length === 1, JSON.stringify(r10c.cancels));
+
+console.log("\n10d. AUDIT: the de-hedged leg is NOT given a stop or target in the same run");
+const r10d = await run({ label:"dehedge-noprotect", positions: [
+  { symbol:"ADAUSDT", posSide:"Long", side:"Buy", size:2007, avgEntryPriceRp:"0.2049", markPriceRp:"0.205" },
+  { symbol:"ADAUSDT", posSide:"Short", side:"Sell", size:321, avgEntryPriceRp:"0.21", markPriceRp:"0.205" }], marks:{ ADAUSDT: 0.205 },
+  state:{ cipher_open:{ "ADA|long": { coin:"ADA", dir:"long", size:2007, book:"fast", plan:{ entry:0.2049, stop:0.1999, target:0.2161 }, since: SINCE, avgEntry:0.2049 },
+                        "ADA|short": { coin:"ADA", dir:"short", size:321, book:"swing", plan:{ entry:0.21, stop:0.22, target:0.19 }, since: SINCE, avgEntry:0.21 } } } });
+ok("the closed short leg gets no protective orders", !r10d.sent.some(o => /^cipher(Stop|Target)/.test(o.clOrdID || "") && o.posSide === "Short"), JSON.stringify(r10d.sent.map(o => o.clOrdID + "/" + o.posSide)));
+ok("the remaining long still does", r10d.sent.some(o => /^cipherStop/.test(o.clOrdID || "") && o.posSide === "Long"));
+
+console.log("\n10e. AUDIT: no Phemex mark → never a market close on the reference price");
+const r10e = await run({ label:"nomark", state:{ cipher_open: DOT_OPEN }, positions: DOT_POS, marks:{} });
+ok("no breach close without the venue's own price", !r10e.sent.some(o => /^cipherBreach/.test(o.clOrdID || "")));
+ok("the stop is sent instead (the venue will say if it is already past)", stops(r10e).length === 1);
+
+console.log("\n10f. AUDIT: recorded orders are checked by orderID — log only");
+ok("a check line is saved to state", !!(r10e.st.cipher_protect_check && r10e.st.cipher_protect_check.checks.length), JSON.stringify(r10e.st.cipher_protect_check));
+ok("and nothing was re-placed because of it", stops(r10e).length === 1 && targets(r10e).length === 1);
 
 console.log("\n11. KILL switch");
 const r11 = await run({ label:"kill", state:{ cipher_open: SOL_OPEN }, positions: SOL_POS, marks:{ SOLUSDT: 105.2 }, kill: true });
@@ -192,6 +239,8 @@ ok("a conditional with only closeOnTrigger counts as a resting stop",
    !!findRestingStop([{ posSide:"Short", side:"Buy", ordType:"Stop", closeOnTrigger:true }], "Short"));
 ok("an OPENING stop order on the other side does not",
    !findRestingStop([{ posSide:"Short", side:"Sell", ordType:"Stop", closeOnTrigger:true }], "Short"));
+ok("AUDIT: a fill with no readable time is not attributed to this position",
+   pickClosingFill([{ side:"Buy", posSide:"Short", execPriceRp:"100" }], "Short", SINCE) === null);
 ok("pickClosingFill ignores the opening fill",
    pickClosingFill([{ side:"Sell", posSide:"Short", execPriceRp:"107", transactTimeNs: String(Date.now()*1e6) }], "Short", SINCE) === null);
 const liq = attributeClose({ dir:"long", plan:{ entry:100, stop:97, target:107 } }, { px: 80, ordType:"Liq", clOrdID:"", text:"", execStatus:"" });

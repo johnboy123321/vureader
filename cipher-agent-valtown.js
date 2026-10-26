@@ -1812,7 +1812,9 @@ function pickClosingFill(rows, posSide, sinceMs) {
   const cands = (rows || []).filter(r => r &&
     (!r.posSide || String(r.posSide) === posSide) &&
     (!r.side || String(r.side) === closing) &&
-    (!sinceMs || !at(r) || at(r) >= sinceMs - 60e3) &&
+    // A fill with no readable time cannot be shown to belong to THIS position (audit 2026-10-26):
+    // with a since to check against, it is left out rather than waved through.
+    (!sinceMs || (at(r) > 0 && at(r) >= sinceMs - 60e3)) &&
     Number(r.execPriceRp ?? r.execPrice ?? r.priceRp) > 0);
   if (!cands.length) return null;
   cands.sort((a, b) => at(b) - at(a));
@@ -1821,6 +1823,7 @@ function pickClosingFill(rows, posSide, sinceMs) {
     px: Number(r.execPriceRp ?? r.execPrice ?? r.priceRp),
     qty: Math.abs(Number(r.execQtyRq ?? r.execQty ?? r.orderQtyRq) || 0) || undefined,
     ordType: String(r.ordType || ""), clOrdID: String(r.clOrdID || ""), text: String(r.text || ""),
+    orderID: String(r.orderID || ""),
     execStatus: String(r.execStatus || r.execType || ""),
     closedPnl: Number.isFinite(Number(r.closedPnlRv)) ? Number(r.closedPnlRv) : undefined,
     at: at(r) || undefined,
@@ -1828,7 +1831,7 @@ function pickClosingFill(rows, posSide, sinceMs) {
 }
 
 // PURE. Turn a fill into the four labels classifyResolution uses, plus closedBy and real R.
-function attributeClose(was, fill) {
+function attributeClose(was, fill, reg) {
   const plan = was && was.plan;
   if (!plan || !fill || !(fill.px > 0)) return null;
   const { entry, stop, target } = plan;
@@ -1849,18 +1852,34 @@ function attributeClose(was, fill) {
     return strat("liquidation", "liquidation", `the venue liquidated it at ${formatPrice(fill.px)}`);
   if (/^cipherBreach|cipher-stop-breach/i.test(tag))
     return strat("stop", "stop_breach_close", `price was already past the stop; the bot closed it at market at ${formatPrice(fill.px)}`);
-  if (/^cipherTarget|cipher-protective-target/i.test(tag))
+  // ── WHICH ORDER, NOT HOW CLOSE (audit 2026-10-26) ─────────────────────────────────────────
+  // Judging "own stop or a stale one" by distance from the stop level dropped every GAPPED stop
+  // from the stats — a stop that filled 1.6R past its level because price jumped through it read
+  // as somebody else's order, so the worst losses quietly vanished and the record looked better
+  // than it was. The registry knows the exact orders placed for THIS position: match on those.
+  const isReg = (leg) => !!(reg && reg[leg] && ((fill.orderID && reg[leg].orderID && fill.orderID === String(reg[leg].orderID)) ||
+                                                (fill.clOrdID && reg[leg].clOrdID && fill.clOrdID === String(reg[leg].clOrdID))));
+  const gap = (lvl) => risk > 0 && Number.isFinite(lvl) ? Math.abs(fill.px - lvl) / risk : 0;
+  if (isReg("stop"))
+    return strat("stop", "cipher_stop", `its own stop filled at ${formatPrice(fill.px)}` + (gap(stop) > 0.1 ? ` — ${gap(stop).toFixed(2)}R past the level (price gapped through it)` : ""));
+  if (isReg("target"))
     return strat("target", "cipher_target", `its own resting target filled at ${formatPrice(fill.px)}`);
+  if (/^cipherTarget|cipher-protective-target/i.test(tag))
+    return reg && reg.target ? art("closed_by_hand", "stale_target", `a target order from an EARLIER position filled at ${formatPrice(fill.px)}`)
+                             : strat("target", "cipher_target", `its own resting target filled at ${formatPrice(fill.px)}`);
   if (/^cipherStop|cipher-protective-stop/i.test(tag)) {
-    return near(stop)
-      ? strat("stop", "cipher_stop", `its own stop filled at ${formatPrice(fill.px)}`)
-      : art("stale_stop", "stale_stop", `a protective stop fired at ${formatPrice(fill.px)}, far from THIS position's stop ${formatPrice(stop)} — an old stop left over from an earlier position on the same side`);
+    // Registry has this position's stop and it is not the one that filled → genuinely an old one.
+    if (reg && reg.stop) return art("stale_stop", "stale_stop", `a protective stop that was NOT this position's fired at ${formatPrice(fill.px)} — an old stop left over from an earlier position on the same side`);
+    // No registry record (positions from before it existed): our own stop, gapped or not. Over-
+    // counting a stale stop as a loss is the honest direction to be wrong in; hiding a real loss is not.
+    return strat("stop", "cipher_stop", `a stop this bot placed filled at ${formatPrice(fill.px)}` + (gap(stop) > 0.35 ? ` (${gap(stop).toFixed(2)}R from the plan's level — gapped, or an older stop; no record to tell which)` : ""));
   }
   if (/dehedge/i.test(tag)) return art("dehedge", "dehedge", `the bot closed this leg to remove a hedge, at ${formatPrice(fill.px)}`);
   if (/timestop/i.test(tag)) return strat("time_stop", "time_stop", `the time stop closed it at ${formatPrice(fill.px)}`);
+  // An untagged stop is the one bundled on this position's own entry order (or one set by hand on
+  // it). Either way it closed THIS position at a loss-side level — counted, gapped or not.
   if (/stop/i.test(fill.ordType))
-    return near(stop) ? strat("stop", "venue_stop", `the stop bundled on the entry order filled at ${formatPrice(fill.px)}`)
-                      : art("stale_stop", "venue_stop_elsewhere", `a stop order filled at ${formatPrice(fill.px)}, not near this position's stop ${formatPrice(stop)}`);
+    return strat("stop", "venue_stop", `the stop bundled on the entry order filled at ${formatPrice(fill.px)}` + (gap(stop) > 0.1 ? ` — ${gap(stop).toFixed(2)}R from the plan's level` : ""));
   if (/iftouched|takeprofit|^bo/i.test(fill.ordType))
     return near(target) ? strat("target", "venue_target", `a target order filled at ${formatPrice(fill.px)}`)
                         : art("closed_by_hand", "venue_target_elsewhere", `a take-profit order filled at ${formatPrice(fill.px)}, not near this position's target ${formatPrice(target)}`);
@@ -2229,7 +2248,7 @@ function unlatchDehedge(failed, storedRev) {
 }
 
 async function resolveHedges(positions) {
-  const out = { found: 0, closed: 0, failed: 0, givenUp: 0 };
+  const out = { found: 0, closed: 0, failed: 0, givenUp: 0, closedLegs: [] };
   if (String(env("HEDGE_FIX", "1")) !== "1") return out;
   const failed = (await getJSON(DEHEDGE_KEY, {})) || {};
   let failedDirty = false;
@@ -2290,7 +2309,7 @@ async function resolveHedges(positions) {
       ok = r && r.status === 200 && r.data && !r.data.error;
       if (!ok) why = String((r && r.data && (r.data.error || r.data.msg)) || ("http " + (r && r.status))).slice(0, 160);
     } catch (e) { ok = false; why = String(e && e.message || e).slice(0, 160); }
-    if (ok) out.closed++; else out.failed++;
+    if (ok) { out.closed++; out.closedLegs.push(smaller); } else out.failed++;
     const coin = sym.replace(/USDT$/, "");
     const leg = `${smaller.posSide}, ${Math.abs(Number(smaller.size))}`;
 
@@ -2684,7 +2703,12 @@ async function protectOpenPositions(nowOpen, priceOf) {
     out.checked++;
     // A registry entry belongs to ONE position. A new position on the same key starts clean.
     let reg = registry[k];
-    if (!reg || reg.since !== pos.since) { reg = registry[k] = { symbol, posSide, since: pos.since }; dirty = true; }
+    if (!reg || reg.since !== pos.since) {
+      // A new position on a reused key. Keep the old record under an archive slot so the resolution
+      // pass can still match the old trade's closing fill to its orders, and still cancel them.
+      if (reg && (reg.stop || reg.target)) registry[`${k}#${reg.since}`] = reg;
+      reg = registry[k] = { symbol, posSide, since: pos.since }; dirty = true;
+    }
     // The market-side check must use a MARKET price. The old sweep fell back to the position's
     // average entry when the coin was not in this run's scan batch, so a long whose stop had been
     // set above entry to lock in profit (DOT, adopted 2026-10-22) was refused every run as "stop
@@ -2695,7 +2719,11 @@ async function protectOpenPositions(nowOpen, priceOf) {
     const venueRef = async () => {
       if (ref !== undefined) return ref;
       let m = null; try { m = await markPriceFor(symbol); } catch { }
-      ref = Number(m) > 0 ? Number(m) : (Number(priceOf && priceOf(pos.coin)) || null);
+      // Venue mark ONLY (audit 2026-10-26). The scan price is Binance/OKX — mainnet — and the
+      // testnet book has been measured well off it, so a fallback here could read a healthy
+      // position as "past its stop" and close it at market. With no mark, the stop is simply sent:
+      // if price really is past it, Phemex answers 11042/11043 and THAT triggers the close.
+      ref = Number(m) > 0 ? Number(m) : null;
       return ref;
     };
 
@@ -2796,6 +2824,39 @@ async function protectOpenPositions(nowOpen, priceOf) {
       pos.bookShape = { at: Date.now(), symbol, rows: orders.length, shape, keys };
     }
   }
+  // ── ARE THE ORDERS WE RECORDED STILL THERE? — LOG ONLY (audit 2026-10-26) ─────────────────
+  // The registry trusts what it placed, because the open-orders read cannot show it. That leaves
+  // one blind spot: a stop cancelled by hand would never be noticed. Ask the venue about a few
+  // recorded orders each run, by orderID, and RECORD the answers. Nothing acts on them yet: the
+  // endpoint has not been seen working on this account, and a wrong reading that triggered a
+  // re-place would restart the stacking this registry exists to stop. Once the log shows real
+  // statuses, "cancelled" can be wired to re-place.
+  try {
+    const checks = [];
+    const legs = [];
+    for (const [k, reg] of Object.entries(registry)) {
+      if (!reg || k.includes("#") || reg.pulled) continue;
+      for (const leg of ["stop", "target"]) if (reg[leg] && reg[leg].orderID) legs.push({ k, leg, reg, o: reg[leg] });
+    }
+    legs.sort((a, b) => (a.o.checkedAt || 0) - (b.o.checkedAt || 0));
+    for (const { k, leg, reg, o } of legs.slice(0, num("ORDER_CHECKS_PER_RUN", 4))) {
+      let status = "", why = "";
+      try {
+        const r = await phemexCall("GET", "/api-data/g-futures/orders/by-order-id", `symbol=${reg.symbol}&orderID=${encodeURIComponent(o.orderID)}`, null);
+        const rows = (r.data && r.data.data && (r.data.data.rows || r.data.data)) || [];
+        const row = Array.isArray(rows) ? rows[0] : rows;
+        status = (row && (row.ordStatus || row.orderStatus)) || "";
+        if (!status) why = `http ${r.status} ${JSON.stringify(r.data || {}).slice(0, 120)}`;
+      } catch (e) { why = String((e && e.message) || e).slice(0, 120); }
+      o.checkedAt = Date.now(); o.venueStatus = status || undefined; dirty = true;
+      checks.push(`${k} ${leg}: ${status || "unreadable (" + why + ")"}`);
+    }
+    if (checks.length) {
+      console.log(`order check (log only): ${checks.join(" · ")}`);
+      await setJSON("cipher_protect_check", { at: new Date().toISOString(), checks });
+    }
+  } catch (e) { console.error("order check failed (log only, harmless):", e && e.message); }
+
   if (dirty) await setJSON(PROTECT_KEY, registry);
   if (out.noTarget.length)
     await pushLog({ result: "NO TARGET RESTING",
@@ -2806,21 +2867,44 @@ async function protectOpenPositions(nowOpen, priceOf) {
 // When a position is gone, take its recorded stop and target off the venue so neither can fire
 // on the NEXT position opened on the same coin and side. Errors are fine — a reduce-only order on
 // a closed position may already have been cancelled by the venue.
-async function cancelProtectionFor(posKeys) {
+async function cancelProtectionFor(posKeys, { keep = false } = {}) {
   if (!posKeys.length || !CFG.direct()) return 0;
   const registry = (await getJSON(PROTECT_KEY, {})) || {};
   let n = 0;
   for (const k of posKeys) {
     const reg = registry[k];
     if (!reg) continue;
-    for (const leg of ["stop", "target"]) {
-      const o = reg[leg];
-      if (o && (o.orderID || o.clOrdID)) { const c = await cancelOrder(reg.symbol, o.orderID, o.clOrdID, reg.posSide); if (c.ok) n++; }
+    if (!reg.pulled) {
+      for (const leg of ["stop", "target"]) {
+        const o = reg[leg];
+        if (o && (o.orderID || o.clOrdID)) { const c = await cancelOrder(reg.symbol, o.orderID, o.clOrdID, reg.posSide); if (c.ok) n++; }
+      }
     }
-    delete registry[k];
+    // keep = pulled from the venue early, but the record stays until the resolution pass has used
+    // it to say which order closed the trade.
+    if (keep) reg.pulled = Date.now(); else delete registry[k];
   }
   await setJSON(PROTECT_KEY, registry);
   return n;
+}
+
+// PURE. Is the position under this key a DIFFERENT trade from the one we saw last run?
+// The bot never adds to a position, so its average entry only moves when the position was
+// closed and a new one opened on the same coin and side in between (audit 2026-10-26: a late-
+// filling entry order is the likely way). Treated as a close plus a new open.
+function positionReopened(was, cur, tol = 0.003) {
+  const a = Number(was && was.avgEntry), b = Number(cur && cur.avgEntry);
+  if (!(a > 0) || !(b > 0)) return false;
+  return Math.abs(a - b) / a > tol;
+}
+// The registry record for a finished position: its own key, or the archive slot the sweep moved
+// it to when the same key was reused by a new position.
+function regKeyFor(k, since, registry) {
+  const r = registry && registry[k];
+  if (r && r.since === since) return k;
+  // Never fall back to the live key: that record belongs to whatever is open there NOW, and
+  // cancelling it would strip a live position of its stop.
+  return registry && registry[`${k}#${since}`] ? `${k}#${since}` : null;
 }
 
 async function expireStaleOrders() {
@@ -5571,10 +5655,38 @@ export default async function cipherAgent() {
   if (mode === "armed" && canSeeBook) {
     try {
       const hf = await resolveHedges(positions);
+      // ── A LEG WE JUST CLOSED IS NOT A POSITION ANY MORE (2026-10-26, run #826) ──────────────
+      // `positions` was read before the de-hedge, so the protection sweep later in this run gave
+      // the SOL long it had just closed a fresh stop and target — two orders guarding nothing.
+      // Drop closed legs from this run's picture of the book.
+      for (const leg of hf.closedLegs || []) { const i = positions.indexOf(leg); if (i >= 0) positions.splice(i, 1); }
       if (hf.found) console.log(`hedges found on ${hf.found} coin(s) — ${hf.closed} smaller leg(s) closed`
         + (hf.failed ? `, ${hf.failed} failed` : "")
         + (hf.givenUp ? `, ${hf.givenUp} given up on (waiting for you to close by hand)` : ""));
     } catch (e) { console.error("de-hedge pass failed (harmless, reduce-only):", e && e.message); }
+  }
+
+  // ── PULL A FINISHED TRADE'S LEFTOVER ORDER BEFORE TRADING AGAIN (audit 2026-10-26) ──────────
+  // A stop and its target are not linked at the venue: when one fills, the other stays live. The
+  // resolution pass cancels it — but at the END of the run, after this run's entries. A new
+  // position on the same coin and side opened in between could be closed by the old leftover.
+  // So cancel the recorded orders of every position that has gone (or been replaced) right here,
+  // and keep the record for the resolution pass to attribute the close.
+  if (mode === "armed" && canSeeBook && CFG.direct()) {
+    try {
+      const nowByKey = {};
+      for (const p of positions) {
+        const coin = String(p.symbol || "").replace(/USDT$/, "").toUpperCase();
+        let d = String(p.posSide || p.side || "").toLowerCase();
+        if (d !== "long" && d !== "short") d = Number(p.size) < 0 ? "short" : "long";
+        if (Math.abs(Number(p.size) || 0) > 0) nowByKey[posKey(coin, d)] = { avgEntry: +(p.avgEntryPriceRp ?? p.avgEntryPrice) || undefined };
+      }
+      const finished = Object.keys(prevOpen || {}).filter(k => !nowByKey[k] || positionReopened(prevOpen[k], nowByKey[k]));
+      if (finished.length) {
+        const n = await cancelProtectionFor(finished, { keep: true });
+        if (n) console.log(`protection: pulled ${n} leftover stop/target order(s) from ${finished.length} finished position(s) before trading`);
+      }
+    } catch (e) { console.error("early leftover-order pull failed (the resolution pass retries it):", e && e.message); }
   }
 
   // ── WHAT THE VENUE HAS ALREADY REFUSED ────────────────────────────────────────────────────
@@ -6139,6 +6251,21 @@ export default async function cipherAgent() {
   // ── Resolutions → the reverse look ─────────────────────────────────────────────────────────
   try {
     const nowOpen = snapshotOpen(positions, bookMap, prevOpen);
+    // ── SAME KEY, DIFFERENT TRADE (audit 2026-10-26) ──────────────────────────────────────────
+    // A position closed and reopened on the same coin and side between two runs used to inherit
+    // the old one's since, plan, setup and orders — the old trade never resolved and its stop
+    // stayed armed against the new one. Split them: the old one resolves below, the new one
+    // starts clean (and is adopted or given this run's plan like any other).
+    const reopened = {};
+    for (const k of Object.keys(nowOpen)) {
+      const was = prevOpen && prevOpen[k];
+      if (!was || !positionReopened(was, nowOpen[k])) continue;
+      reopened[k] = was;
+      nowOpen[k] = { ...nowOpen[k], since: Date.now(), plan: null, setup: undefined, setupTf: undefined,
+                     quality: undefined, adopted: undefined, closedBy: undefined, unprotected: undefined };
+      console.log(`reopened: ${k} — average entry moved ${formatPrice(was.avgEntry)} → ${formatPrice(nowOpen[k].avgEntry)}; the old trade is resolved and the new one starts clean`);
+    }
+    const gone = k => !nowOpen[k] || !!reopened[k];
     // Attach the plan to anything opened this run, so the NEXT run can tell how it ended. Without
     // this a resolution is just "gone" — with it we can say target, stop, or neither.
     for (const o of openedThisRun) {
@@ -6198,7 +6325,7 @@ export default async function cipherAgent() {
     // two can never again be mistaken for each other.
     const ranges = {}, exitPx = {}, gradedOn = {};
     for (const k of Object.keys(prevOpen || {})) {
-      if (nowOpen[k]) continue;
+      if (!gone(k)) continue;
       const coin = prevOpen[k].coin;
       if (ranges[coin] || exitPx[coin]) continue;
       const since = Number(prevOpen[k].lastSeen) || (Date.now() - 6 * 36e5);
@@ -6234,10 +6361,11 @@ export default async function cipherAgent() {
       const scanned = priceOf(c);
       return Number.isFinite(Number(scanned)) && Number(scanned) > 0 ? Number(scanned) : exitPx[c];
     };
-    const blind = Object.keys(prevOpen || {}).filter(k => !nowOpen[k])
+    const blind = Object.keys(prevOpen || {}).filter(gone)
       .map(k => prevOpen[k].coin).filter(c => !Number.isFinite(priceForResolution(c)));
     if (blind.length) console.warn(`resolution: no price for ${[...new Set(blind)].join(", ")} — those cannot be graded and will say so`);
-    const resolved = resolvedSince(prevOpen, nowOpen, priceForResolution, c => ranges[c] || null)
+    const stillOpen = Object.fromEntries(Object.entries(nowOpen).filter(([k]) => !reopened[k]));
+    const resolved = resolvedSince(prevOpen, stillOpen, priceForResolution, c => ranges[c] || null)
       // Which market judged this. A resolution graded on the reference book carries strictly less
       // authority than one graded on the venue, and the ledger has to be able to say which it was
       // — otherwise the next person reading the record cannot tell a fact from an approximation.
@@ -6246,14 +6374,17 @@ export default async function cipherAgent() {
     // The range verdict above stays as the fallback. Where Phemex's trade history has the closing
     // fill, that fill decides: its price is the real exit and its clOrdID names the closer. Capped
     // per run so a mass close cannot turn one run into fifty API calls.
-    let fillLookups = 0;
+    let fillLookups = 0, fillsFound = 0;
+    const protectReg = (await getJSON(PROTECT_KEY, {})) || {};
+    const regKeys = resolved.map(r => regKeyFor(posKey(r.coin, r.dir), r.since, protectReg));
     for (let i = 0; i < resolved.length; i++) {
       const r = resolved[i];
       if (!r.plan || fillLookups >= num("FILL_LOOKUPS_PER_RUN", 8)) continue;
       fillLookups++;
       let fill = null;
       try { fill = await fetchCloseFill(`${r.coin}USDT`, r.dir === "short" ? "Short" : "Long", Number(r.since) || 0); } catch { }
-      const a = attributeClose(r, fill);
+      if (fill) fillsFound++;
+      const a = attributeClose(r, fill, regKeys[i] ? protectReg[regKeys[i]] : null);
       if (a) resolved[i] = { ...r, ...a };
       else if (r.closedBy === "stop_breach_close" && Number.isFinite(r.exit)) {
         // We closed it ourselves last run because the stop was already behind price.
@@ -6268,7 +6399,8 @@ export default async function cipherAgent() {
     // Take each ended position's recorded stop and target off the venue, so neither can fire on
     // the next position opened on the same coin and side.
     try {
-      const pulled = await cancelProtectionFor(resolved.map(r => posKey(r.coin, r.dir)));
+      if (fillLookups) console.log(`fill lookups: ${fillsFound} of ${fillLookups} closing fill(s) found at the venue — the rest were graded from the price range`);
+      const pulled = await cancelProtectionFor(regKeys.filter(Boolean));
       if (pulled) console.log(`protection: cancelled ${pulled} leftover stop/target order(s) for ${resolved.length} closed position(s)`);
     } catch (e) { console.error("leftover-order cleanup failed (harmless, retried by the next reset):", e && e.message); }
     const queue = [];

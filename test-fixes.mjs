@@ -135,7 +135,7 @@ console.log('\nZ. WHY ONLY TWO GRADED TRADES (2026-08-21)');
   ok('and the fetched one is the fallback', /: exitPx\[c\];/.test(src));
   ok('coins it still cannot price are named in the log', /no price for \$\{\[\.\.\.new Set\(blind\)\]/.test(src));
   ok('the resolver is handed the combined price, not the scan-only one',
-     /resolvedSince\(prevOpen, nowOpen, priceForResolution/.test(src));
+     /resolvedSince\(prevOpen, (nowOpen|stillOpen), priceForResolution/.test(src));
 }
 
 console.log(`\n${pass} passed, ${fail} failed`);
