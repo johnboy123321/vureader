@@ -2717,6 +2717,12 @@ async function protectOpenPositions(nowOpen, priceOf) {
     if (reg.stop) out.alreadyOk++;
     else {
       const r = await directProtect({ symbol, posSide, kind: "Stop", triggerPx: pos.plan.stop, qty: pos.size, refPx: await venueRef() });
+      // ── THE VENUE CAN SAY "ALREADY PAST" TOO (2026-10-26, run #826) ─────────────────────────
+      // APT short: no mark price could be read, so the side check was skipped and the stop went
+      // out — and Phemex answered 11043 TE_RISING_TRIGGER_DIRECTLY: price is already above the
+      // trigger. That is the same fact as our own "breached" verdict, just learned from the venue,
+      // so it gets the same answer: the plan's exit, taken at market.
+      if (!r.ok && !r.breached && /TE_(RISING|FALLING)_TRIGGER_DIRECTLY|phemex 1104[23]\b/i.test(String(r.why || ""))) r.breached = true;
       if (r.ok && !r.dry) {
         out.placed++;
         reg.stop = { px: pos.plan.stop, sentPx: r.px, orderID: r.orderID, clOrdID: r.clOrdID, at: Date.now(), source: "placed" }; dirty = true;
@@ -2750,8 +2756,11 @@ async function protectOpenPositions(nowOpen, priceOf) {
     const tgtMoved = reg.target && levelMoved(reg.target.px, pos.plan.target);
     // Our targets are plain limits, which the book read DOES show. So if we recorded one and the
     // book is readable and it is not there, it has gone (filled, cancelled, expired): forget it.
-    const ourTargetVisible = reg.target && (orders || []).some(o => o && (o.orderID === reg.target.orderID || o.clOrdID === reg.target.clOrdID));
-    if (reg.target && !ourTargetVisible && !seenTarget) { delete reg.target; dirty = true; }
+    // Run #826 showed the open-orders rows arrive WITHOUT ordType, posSide or reduceOnly — which
+    // is why the old sweep never once saw its own stops. So "not visible in the book" proves
+    // nothing about a target either: a recorded target is only forgotten when its position ends
+    // (cancelProtectionFor) or the plan's target moves (below). Never on invisibility, or targets
+    // would stack exactly the way the stops did.
     if (tgtMoved && reg.target && reg.target.orderID) {
       const c = await cancelOrder(symbol, reg.target.orderID, reg.target.clOrdID, posSide);
       if (c.ok) { delete reg.target; dirty = true; }
@@ -2781,7 +2790,10 @@ async function protectOpenPositions(nowOpen, priceOf) {
       const shape = orders.slice(0, 6).map(o => [o.ordType, o.side, o.posSide, o.reduceOnly ? "RO" : "", o.closeOnTrigger ? "CoT" : "",
         o.ordStatus || "", String(o.clOrdID || "").slice(0, 14)].filter(Boolean).join("/"));
       console.log(`order book shape ${symbol}: ${orders.length} row(s) — ${shape.join(" | ") || "none"}`);
-      pos.bookShape = { at: Date.now(), symbol, rows: orders.length, shape };
+      // and the field NAMES the venue actually sends, so the matcher can be fitted to reality
+      const keys = orders[0] ? Object.keys(orders[0]).sort().join(",").slice(0, 400) : "";
+      if (keys) console.log(`order row fields: ${keys}`);
+      pos.bookShape = { at: Date.now(), symbol, rows: orders.length, shape, keys };
     }
   }
   if (dirty) await setJSON(PROTECT_KEY, registry);

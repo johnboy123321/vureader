@@ -21,7 +21,7 @@ const candles = n => { const out=[]; let p=100;
   for (let i=0;i<n;i++){ p=p*(1+0.0008); out.push([Date.now()-(n-i)*864e5,p*0.9995,p*1.008,p*0.992,p,1500]); } return out; };
 
 let seq = 0;
-async function run({ label, positions = [], activeRows = {}, marks = {}, fills = {}, state, keep, kill, whitelist = "SOLUSDT,DOTUSDT,ADAUSDT" }) {
+async function run({ label, positions = [], activeRows = {}, marks = {}, fills = {}, state, keep, kill, postReply, whitelist = "SOLUSDT,DOTUSDT,ADAUSDT,APTUSDT" }) {
   const file = `/tmp/cipher-test/agent-tp-${label}-${++seq}.mjs`;
   fs.writeFileSync(file, base);
   const STATE = `/tmp/cipher-test/state-tp-${keep || label}.json`;
@@ -47,7 +47,9 @@ async function run({ label, positions = [], activeRows = {}, marks = {}, fills =
       if (/tradingList|g-futures\/trades/.test(u)) { fillCalls.push(sym); return reply({ code:0, data:{ rows: fills[sym] || [] } }); }
       if (opts.method === "DELETE" && /\/g-orders\/all/.test(u)) { cancelAll.push(sym + (qs.get("untriggered") === "true" ? ":untriggered" : "")); return reply({ code:0 }); }
       if (opts.method === "DELETE" && /\/g-orders\/cancel/.test(u)) { cancels.push(u.split("?")[1] || ""); return reply({ code:0 }); }
-      if (opts.method === "POST") { const b = JSON.parse(opts.body); sent.push({ ...b, _raw: opts.body }); return reply({ code:0, data:{ orderID:"m"+sent.length } }); }
+      if (opts.method === "POST") { const b = JSON.parse(opts.body); sent.push({ ...b, _raw: opts.body });
+        const custom = postReply && postReply(b); if (custom) return reply(custom);
+        return reply({ code:0, data:{ orderID:"m"+sent.length } }); }
       return reply({ code:0, data:{ rows: [] } });
     }
     if (/ticker/i.test(u)) return reply(["BTC","ETH","SOL","XRP","BNB","ADA","DOGE","LINK","AVAX","DOT"]
@@ -96,6 +98,11 @@ ok("no second reset", r2.cancelAll.length === 0, JSON.stringify(r2.cancelAll));
 const attachedCount = r => r.log.filter(e => e.result === "STOP ATTACHED").length;
 ok("no STOP ATTACHED spam (log count unchanged run to run)", attachedCount(r2) === attachedCount(r1), attachedCount(r1) + " → " + attachedCount(r2));
 
+console.log("\n2b. Third run — even the TARGET is invisible (run #826: rows carry no ordType/posSide)");
+const r2b = await run({ label:"third", keep:"seq", positions: SOL_POS, marks:{ SOLUSDT: 105.0 }, activeRows:{} });
+ok("the target is NOT re-placed just because the book does not show it", targets(r2b).length === 0, targets(r2b).length);
+ok("nor the stop", stops(r2b).length === 0, stops(r2b).length);
+
 console.log("\n3. The plan's stop trails — the old order is cancelled, not stacked beside");
 const st3 = JSON.parse(fs.readFileSync("/tmp/cipher-test/state-tp-seq.json", "utf8"));
 st3.cipher_open["SOL|short"].plan.stop = 107.5;
@@ -120,6 +127,15 @@ ok("the position is closed at market instead", !!breach && breach.ordType === "M
 ok("and that close is reduce-only — it can only shrink the position", breach && breach.reduceOnly === true);
 ok("logged plainly", r5.log.some(e => e.coin === "DOT" && e.result === "STOP BREACHED — CLOSED"));
 ok("marked for the resolution pass", r5.st.cipher_open["DOT|long"] && r5.st.cipher_open["DOT|long"].closedBy === "stop_breach_close");
+
+console.log("\n5b. APT: no mark readable, and the VENUE says the stop is already behind price (11043)");
+const APT_POS = [{ symbol:"APTUSDT", posSide:"Short", side:"Sell", size:507, avgEntryPriceRp:"0.6124" }];
+const APT_OPEN = { "APT|short": { coin:"APT", dir:"short", size:507, book:"fast", plan:{ entry:0.6124, stop:0.6321086289204303, target:0.5680555849290321 }, since: SINCE, avgEntry:0.6124 } };
+const r5b = await run({ label:"apt", state:{ cipher_open: APT_OPEN }, positions: APT_POS, marks:{},
+  postReply: b => /^cipherStop/.test(b.clOrdID || "") ? { code: 11043, msg: "TE_RISING_TRIGGER_DIRECTLY" } : null });
+const aptClose = r5b.sent.find(o => /^cipherBreach/.test(o.clOrdID || ""));
+ok("the venue's 'already past' answer leads to a close at market", !!aptClose && aptClose.side === "Buy" && aptClose.posSide === "Short" && aptClose.reduceOnly === true, JSON.stringify(r5b.sent.map(o=>o.clOrdID)));
+ok("logged as STOP BREACHED — CLOSED, not as a failure to retry forever", r5b.log.some(e => e.coin === "APT" && e.result === "STOP BREACHED — CLOSED") && !r5b.log.some(e => e.coin === "APT" && e.result === "STOP ATTACH FAILED"));
 
 console.log("\n6. De-hedge close: reduce-only, and no \"NaN\" anywhere in the body");
 const HEDGE = [{ symbol:"ADAUSDT", posSide:"Long", side:"Buy", size:2007, avgEntryPriceRp:"0.2049", markPriceRp:"0.205" },
