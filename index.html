@@ -11570,7 +11570,7 @@ body.jarvis #cipherExecPill { display:none !important; }
 #jv .hud-top { position:absolute; top:22px; left:70px; right:70px; display:flex; justify-content:space-between; align-items:flex-start; letter-spacing:2px; font-weight:600; font-size:13px; color:var(--jv2); text-transform:uppercase; pointer-events:none; }
 #jv .hud-top b { font-size:20px; letter-spacing:6px; background:var(--jvg); -webkit-background-clip:text; background-clip:text; color:transparent; filter:drop-shadow(0 0 10px rgba(139,92,246,.7)); }
 #jv .hud-top .r { text-align:right; } #jv .hud-top .sub { color:var(--dim); font-size:11px; letter-spacing:1.5px; margin-top:3px; }
-#jv .classic { position:absolute; top:58px; right:70px; pointer-events:auto; background:transparent; color:var(--jv2); border:1px solid var(--jvdim); border-radius:6px; padding:3px 10px; font:600 11px 'Rajdhani',sans-serif; letter-spacing:1.5px; cursor:pointer; }
+#jv .classic { position:absolute; top:58px; right:70px; white-space:nowrap; pointer-events:auto; background:transparent; color:var(--jv2); border:1px solid var(--jvdim); border-radius:6px; padding:3px 10px; font:600 11px 'Rajdhani',sans-serif; letter-spacing:1.5px; cursor:pointer; }
 #jv .stage { position:absolute; left:50%; top:44%; width:0; height:0; }
 #jv canvas#jv-orb { position:absolute; transform:translate(-50%,-50%); left:0; top:0; cursor:pointer; }
 #jv .orb-label { position:absolute; left:0; top:0; transform:translate(-50%,-50%); text-align:center; pointer-events:none; letter-spacing:5px; font-weight:700; color:#fff; text-shadow:0 0 14px var(--jv); }
@@ -11586,7 +11586,7 @@ body.jarvis #cipherExecPill { display:none !important; }
 #jv .node.fly { transition: transform .45s cubic-bezier(.2,.8,.2,1), opacity .45s; opacity:0; }
 #jv .spoke { position:absolute; left:0; top:0; height:1px; transform-origin:0 0; background: linear-gradient(90deg, rgba(255,62,165,.0), rgba(255,62,165,.25) 40%, rgba(94,231,255,.4)); pointer-events:none; }
 #jv .talk { position:absolute; left:50%; bottom:22px; transform:translateX(-50%); width:min(760px, calc(100vw - 32px)); }
-#jv .caption { max-height:22vh; overflow-y:auto; margin-bottom:10px; padding:10px 14px; font:500 15px/1.45 system-ui, sans-serif; color:#ece4ff; text-align:center;
+#jv .caption { display:none !important; max-height:22vh; overflow-y:auto; margin-bottom:10px; padding:10px 14px; font:500 15px/1.45 system-ui, sans-serif; color:#ece4ff; text-align:center;
   text-shadow:0 0 8px rgba(0,0,0,.8); user-select:text; -webkit-user-select:text; scrollbar-width:thin; }
 #jv .caption .you { color:var(--jva); font-size:13px; letter-spacing:.5px; margin-bottom:4px; opacity:.85; }
 #jv .caption strong { color:#fff; }
@@ -11597,6 +11597,13 @@ body.jarvis #cipherExecPill { display:none !important; }
 #jv .bar input::placeholder { color:rgba(196,180,240,.45); }
 #jv .bar button { width:42px; height:42px; flex:0 0 42px; border-radius:12px; border:1px solid var(--jvdim); background:rgba(139,92,246,.08); color:var(--jv2); display:flex; align-items:center; justify-content:center; cursor:pointer; }
 #jv .bar button svg { width:20px; height:20px; stroke:currentColor; fill:none; stroke-width:1.8; stroke-linecap:round; stroke-linejoin:round; }
+#jv .bar button.ok { display:none; width:auto; padding:0 14px; font:700 13px 'Rajdhani',sans-serif; letter-spacing:1.5px; color:#fff; }
+#jv .bar.ask button.ok { display:flex; }
+#jv .bar.ask #jv-mic, #jv .bar.ask #jv-send { display:none; }
+@media (max-width:640px){ #jv .bar.ask #jv-spk { display:none; } #jv .bar button.ok { padding:0 12px; } }
+#jv .bar #jv-go { background:var(--jvg); border-color:transparent; }
+#jv .bar input.note::placeholder { color:#ffd1ec; opacity:1; }
+#jv .bar input.asking::placeholder { color:#fff; opacity:1; }
 #jv .bar button.on { background:var(--jvg); color:#fff; border-color:transparent; }
 #jv .bar button.rec { background:var(--jvm); color:#fff; border-color:var(--jvm); box-shadow:0 0 18px rgba(255,62,165,.8); }
 #jv-back { display:none; position:fixed; left:16px; bottom:16px; z-index:45; width:46px; height:46px; border-radius:50%; border:1.5px solid #ff3ea5; cursor:pointer;
@@ -11609,6 +11616,79 @@ body.jarvis #accum-panel-shell > *, body.jarvis .settings-box, body.jarvis #krow
   border:1px solid rgba(139,92,246,.6) !important; box-shadow:0 0 0 1px rgba(255,62,165,.15), 0 0 44px rgba(139,92,246,.35), 0 0 90px rgba(255,62,165,.10), inset 0 0 40px rgba(94,231,255,.05) !important;
   background: linear-gradient(180deg, rgba(24,10,58,.96), rgba(10,4,28,.97)) !important; animation: jvZoom .38s cubic-bezier(.2,.8,.2,1); }
 body.jarvis .kb-title, body.jarvis .s-title { font-family:'Rajdhani',sans-serif; letter-spacing:2px; text-transform:uppercase; color:#fff; text-shadow:0 0 10px rgba(139,92,246,.8); }
+
+#jv-stars { position:absolute; inset:0; pointer-events:none; display:none; }
+#jv .nebula { position:absolute; inset:0; pointer-events:none; display:none; }
+#jv .hud-btns { position:absolute; top:58px; right:70px; display:flex; gap:6px; }
+#jv .hud-btns .classic { position:static; }
+/* panel headers: title left, other buttons right, close button last */
+/* Some headers carry two .s-close buttons (close + refresh): close goes last, the rest sit right. */
+.kb-title, .s-title { display:flex !important; align-items:center; gap:10px; }
+.kb-title > button:first-of-type, .s-title > button:first-of-type { margin-left:auto; }
+.kb-title > .s-close:first-of-type:not(:only-of-type) { order:99; margin-left:0; }
+.kb-title > .s-close:first-of-type:not(:only-of-type) + button { margin-left:auto; }
+.kb-title > button, .s-title > button { position:static !important; }
+
+/* ── MONO: black, white and greys ── */
+body.jarvis[data-jvt="mono"] {
+  --bg:#050505; --surface:#111; --raised:#1a1a1a; --glass:rgba(255,255,255,.04); --glass-b:rgba(255,255,255,.16);
+  --text:#f2f2f2; --muted:rgba(235,235,235,.7); --dim:rgba(220,220,220,.42);
+  --accent:#e8e8e8; --accent-soft:rgba(255,255,255,.1); --accent-border:rgba(255,255,255,.4); --amber:#e8e8e8; --dark-amber:#9a9a9a;
+  --jv:#d0d0d0; --jv2:#ffffff; --jvdim:rgba(255,255,255,.25); --jvm:#ffffff; --jva:#bdbdbd;
+  --jvg: linear-gradient(135deg, #ffffff 0%, #8a8a8a 100%);
+}
+body.jarvis[data-jvt="mono"] #jv { background: radial-gradient(ellipse at 50% 45%, #2a2a2a 0%, #121212 40%, #050505 75%, #000 100%); }
+body.jarvis[data-jvt="mono"] #jv .grid { opacity:.08; background-image: linear-gradient(rgba(255,255,255,.4) 1px, transparent 1px), linear-gradient(90deg, rgba(255,255,255,.4) 1px, transparent 1px); }
+body.jarvis[data-jvt="mono"] #jv .node .disc { background: radial-gradient(circle, rgba(255,255,255,.10), rgba(8,8,8,.95) 70%) padding-box, linear-gradient(135deg,#fff,#666) border-box; box-shadow:0 0 12px rgba(255,255,255,.18); }
+body.jarvis[data-jvt="mono"] #jv .node svg { stroke:#fff; }
+body.jarvis[data-jvt="mono"] #jv .node:hover .disc { box-shadow:0 0 22px rgba(255,255,255,.45); }
+body.jarvis[data-jvt="mono"] #jv .node:hover svg { stroke:#fff; }
+body.jarvis[data-jvt="mono"] #jv .node .nl { text-shadow:none; color:#eee; }
+body.jarvis[data-jvt="mono"] #jv .node .ns { color:#9a9a9a; }
+body.jarvis[data-jvt="mono"] #jv .spoke { background: linear-gradient(90deg, rgba(255,255,255,0), rgba(255,255,255,.22)); }
+body.jarvis[data-jvt="mono"] #jv .corner { border-color:#bbb !important; }
+body.jarvis[data-jvt="mono"] #jv .hud-top b { filter:none; }
+body.jarvis[data-jvt="mono"] #jv .bar { background:rgba(10,10,10,.85); box-shadow:0 0 18px rgba(255,255,255,.06); }
+body.jarvis[data-jvt="mono"] #jv .bar #jv-go, body.jarvis[data-jvt="mono"] #jv .bar button.on { background:#fff; color:#000; }
+body.jarvis[data-jvt="mono"] #jv .bar button.rec { background:#fff; color:#000; border-color:#fff; box-shadow:0 0 16px rgba(255,255,255,.6); }
+body.jarvis[data-jvt="mono"] #jv .orb-label, body.jarvis[data-jvt="mono"] .kb-title, body.jarvis[data-jvt="mono"] .s-title { text-shadow:none !important; }
+body.jarvis[data-jvt="mono"] #jv .bar input.note::placeholder { color:#fff; }
+body.jarvis[data-jvt="mono"] #kb-panel .kb-box, body.jarvis[data-jvt="mono"] #log-panel .kb-box, body.jarvis[data-jvt="mono"] #scan-panel .kb-box, body.jarvis[data-jvt="mono"] #trades-panel .kb-box,
+body.jarvis[data-jvt="mono"] #macro-panel .kb-box, body.jarvis[data-jvt="mono"] #lab-panel .kb-box, body.jarvis[data-jvt="mono"] #bot-panel .kb-box, body.jarvis[data-jvt="mono"] #help-panel .kb-box,
+body.jarvis[data-jvt="mono"] #accum-panel-shell > *, body.jarvis[data-jvt="mono"] .settings-box {
+  border-color:rgba(255,255,255,.35) !important; box-shadow:0 0 40px rgba(255,255,255,.08) !important; background:linear-gradient(180deg,#141414,#070707) !important; }
+
+/* ── DEEP SPACE: starfield, faint nebula, starlight blue and warm sun ── */
+body.jarvis[data-jvt="space"] {
+  --bg:#02040a; --surface:#070c18; --raised:#0c1426; --glass:rgba(160,190,255,.04); --glass-b:rgba(160,190,255,.16);
+  --text:#e9f0ff; --muted:rgba(210,224,255,.72); --dim:rgba(190,206,240,.42);
+  --accent:#8fb2ff; --accent-soft:rgba(143,178,255,.12); --accent-border:rgba(143,178,255,.45); --amber:#ffd49a; --dark-amber:#c99b5e;
+  --jv:#7fa6ff; --jv2:#cfe1ff; --jvdim:rgba(143,178,255,.28); --jvm:#ffd49a; --jva:#ffd49a;
+  --jvg: linear-gradient(135deg, #cfe1ff 0%, #7fa6ff 55%, #ffd49a 100%);
+}
+body.jarvis[data-jvt="space"] #jv { background: #01020a; }
+body.jarvis[data-jvt="space"] #jv-stars, body.jarvis[data-jvt="space"] #jv .nebula { display:block; }
+body.jarvis[data-jvt="space"] #jv .nebula { background:
+  radial-gradient(ellipse 60% 40% at 22% 30%, rgba(60,40,140,.22), transparent 70%),
+  radial-gradient(ellipse 50% 35% at 80% 70%, rgba(20,90,130,.20), transparent 70%),
+  radial-gradient(ellipse 35% 30% at 65% 18%, rgba(140,60,90,.10), transparent 70%),
+  radial-gradient(circle at 50% 45%, rgba(40,70,160,.18), transparent 45%); }
+body.jarvis[data-jvt="space"] #jv .grid { display:none; }
+body.jarvis[data-jvt="space"] #jv .node .disc { background: radial-gradient(circle, rgba(127,166,255,.16), rgba(2,5,14,.92) 70%) padding-box, linear-gradient(135deg,#cfe1ff,#3f5fb0 60%,#ffd49a) border-box; box-shadow:0 0 14px rgba(127,166,255,.35); }
+body.jarvis[data-jvt="space"] #jv .node svg { stroke:#d6e6ff; }
+body.jarvis[data-jvt="space"] #jv .node:hover .disc { box-shadow:0 0 26px rgba(255,212,154,.55); }
+body.jarvis[data-jvt="space"] #jv .node:hover svg { stroke:#ffe2b8; }
+body.jarvis[data-jvt="space"] #jv .node .nl { text-shadow:0 0 8px rgba(127,166,255,.6); }
+body.jarvis[data-jvt="space"] #jv .spoke { background: linear-gradient(90deg, rgba(127,166,255,0), rgba(127,166,255,.22)); }
+body.jarvis[data-jvt="space"] #jv .corner { border-color:rgba(207,225,255,.45) !important; }
+body.jarvis[data-jvt="space"] #jv .bar { background:rgba(3,7,18,.78); box-shadow:0 0 22px rgba(127,166,255,.12); }
+body.jarvis[data-jvt="space"] #jv .bar button.rec { background:#ffd49a; color:#1a1206; border-color:#ffd49a; box-shadow:0 0 18px rgba(255,212,154,.7); }
+body.jarvis[data-jvt="space"] #kb-panel .kb-box, body.jarvis[data-jvt="space"] #log-panel .kb-box, body.jarvis[data-jvt="space"] #scan-panel .kb-box, body.jarvis[data-jvt="space"] #trades-panel .kb-box,
+body.jarvis[data-jvt="space"] #macro-panel .kb-box, body.jarvis[data-jvt="space"] #lab-panel .kb-box, body.jarvis[data-jvt="space"] #bot-panel .kb-box, body.jarvis[data-jvt="space"] #help-panel .kb-box,
+body.jarvis[data-jvt="space"] #accum-panel-shell > *, body.jarvis[data-jvt="space"] .settings-box {
+  border-color:rgba(143,178,255,.4) !important; box-shadow:0 0 50px rgba(60,90,200,.25), 0 0 100px rgba(255,212,154,.05) !important; background:linear-gradient(180deg, rgba(8,14,32,.96), rgba(2,4,12,.97)) !important; }
+@media (max-width: 640px) { #jv .hud-btns { right:22px; top:50px; } }
+
 @keyframes jvZoom { from { transform: scale(.35); opacity:0; filter: blur(6px); } to { transform: scale(1); opacity:1; filter:none; } }
 @media (max-width: 640px) {
   #jv .hud-top { left:22px; right:22px; top:18px; font-size:11px; } #jv .hud-top b { font-size:16px; letter-spacing:4px; }
@@ -11620,10 +11700,12 @@ body.jarvis .kb-title, body.jarvis .s-title { font-family:'Rajdhani',sans-serif;
 }
 </style>
 <div id="jv" aria-label="Cipher">
+  <canvas id="jv-stars"></canvas>
+  <div class="nebula"></div>
   <div class="grid"></div>
   <div class="corner c1"></div><div class="corner c2"></div><div class="corner c3"></div><div class="corner c4"></div>
   <div class="hud-top"><div><b>CIPHER</b><div class="sub" id="jv-sys">systems online</div></div><div class="r"><div id="jv-clock">--:--</div><div class="sub" id="jv-date"></div></div></div>
-  <button class="classic" type="button" id="jv-classic">CLASSIC</button>
+  <div class="hud-btns"><button class="classic" type="button" id="jv-theme" title="Change the look">NEON</button><button class="classic" type="button" id="jv-classic">CLASSIC</button></div>
   <div class="stage" id="jv-stage">
     <canvas id="jv-orb"></canvas>
     <div class="orb-label" id="jv-orb-label">CIPHER<small id="jv-state">ONLINE</small></div>
@@ -11634,6 +11716,7 @@ body.jarvis .kb-title, body.jarvis .s-title { font-family:'Rajdhani',sans-serif;
       <button type="button" id="jv-spk" title="Voice replies"><svg viewBox="0 0 24 24"><path d="M11 5L6 9H3v6h3l5 4z"/><path d="M15.5 8.5a5 5 0 0 1 0 7M18.5 5.5a9 9 0 0 1 0 13"/></svg></button>
       <input id="jv-in" type="text" placeholder="Talk to Cipher, or type…" autocomplete="off" autocorrect="off" spellcheck="false">
       <button type="button" id="jv-mic" title="Talk"><svg viewBox="0 0 24 24"><rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5 11a7 7 0 0 0 14 0M12 18v3"/></svg></button>
+      <button type="button" class="ok" id="jv-go" title="Do it">GO</button><button type="button" class="ok" id="jv-no" title="Cancel">NO</button>
       <button type="button" id="jv-send" title="Send"><svg viewBox="0 0 24 24"><path d="M5 12h14M13 6l6 6-6 6"/></svg></button>
     </div>
   </div>
@@ -11663,7 +11746,7 @@ body.jarvis .kb-title, body.jarvis .s-title { font-family:'Rajdhani',sans-serif;
   const NODES = [
     { id:'bot', label:'Bot trades', icon:I.bot, open:()=>call('toggleBot'), panel:'bot-panel', words:/bot|trades? panel|trading/, sub:()=>dockLine('dock-bot') },
     { id:'accum', label:'Accumulator', icon:I.accum, open:()=>call('toggleAccum'), panel:'accum-panel-shell', words:/accum/, sub:()=>dockLine('dock-accum') },
-    { id:'pos', label:'Positions', icon:I.pos, open:()=>ask('what am I in'), words:/position/ },
+    { id:'pos', label:'Positions', icon:I.pos, open:()=>{ call('toggleBot'); setTimeout(() => { const el = document.querySelector('#bot-positions'); if (el) el.scrollIntoView({ block:'start', behavior:'smooth' }); }, 350); if (V() && V().voiceOn()) ask('what am I in'); }, panel:'bot-panel', words:/position/ },
     { id:'scan', label:'Scanner', icon:I.scan, open:()=>call('toggleScan'), panel:'scan-panel', words:/scan|setups?/ },
     { id:'alerts', label:'Alerts', icon:I.alerts, open:()=>call('toggleTrades'), panel:'trades-panel', words:/alert|watch ?list|pending/ },
     { id:'log', label:'Chart log', icon:I.log, open:()=>call('toggleLog'), panel:'log-panel', words:/chart log|log|history/ },
@@ -11748,6 +11831,49 @@ body.jarvis .kb-title, body.jarvis .s-title { font-family:'Rajdhani',sans-serif;
   }
   document.addEventListener('pointerdown', wireAnalyser, { capture:true });
   const wave = new Float32Array(96);
+  // ── themes: the orb's colours per theme (the page's colours are CSS, keyed on data-jvt) ──
+  const PAL = {
+    neon:  { core0:'255,190,240', core1:'255,62,165',  core2:'139,92,246', ring:'139,92,246', ringB:'94,231,255',  ringC:'255,62,165',  tick:'94,231,255',  tickMajor:'255,181,71',  glow:'#ff3ea5', wave:['#5ee7ff','#a78bfa','#ff3ea5'], barA:'94,231,255',  barB:'255,62,165' },
+    mono:  { core0:'255,255,255', core1:'210,210,210', core2:'110,110,110', ring:'200,200,200', ringB:'255,255,255', ringC:'140,140,140', tick:'190,190,190', tickMajor:'255,255,255', glow:'#ffffff', wave:['#ffffff','#9a9a9a','#ffffff'], barA:'220,220,220', barB:'255,255,255' },
+    space: { core0:'255,246,226', core1:'255,196,128', core2:'70,110,220',  ring:'120,160,255', ringB:'205,228,255', ringC:'255,200,140', tick:'160,190,250', tickMajor:'255,214,150', glow:'#9ec5ff', wave:['#d6e8ff','#7fa6ff','#ffd49a'], barA:'170,200,255', barB:'255,214,150' },
+  };
+  const THEMES = ['neon', 'mono', 'space'], THEME_NAME = { neon:'NEON', mono:'MONO', space:'DEEP SPACE' };
+  let theme = THEMES.includes(LSG('mc_jv_theme', 'neon')) ? LSG('mc_jv_theme', 'neon') : 'neon';
+  function setTheme(tname){
+    theme = THEMES.includes(tname) ? tname : 'neon'; LSS('mc_jv_theme', theme);
+    document.body.setAttribute('data-jvt', theme);
+    const b = $('jv-theme'); if (b) b.textContent = THEME_NAME[theme];
+  }
+
+  // ── deep space: a starfield that drifts and twinkles behind everything ──
+  const stars = [], sc = $('jv-stars'), sx = sc.getContext('2d');
+  function seedStars(){
+    const w = innerWidth, h = innerHeight, dpr = Math.min(2, devicePixelRatio || 1);
+    sc.width = w * dpr; sc.height = h * dpr; sc.style.width = w + 'px'; sc.style.height = h + 'px'; sx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    stars.length = 0;
+    const n = Math.round(w * h / 2600);
+    for (let i = 0; i < n; i++) stars.push({ x: Math.random() * w, y: Math.random() * h, r: Math.random() < .08 ? 1.1 + Math.random() * .9 : .3 + Math.random() * .7,
+      tw: Math.random() * Math.PI * 2, sp: .4 + Math.random() * 1.6, z: .2 + Math.random() * .8, warm: Math.random() < .15 });
+  }
+  addEventListener('resize', seedStars);
+  let shoot = null;
+  function drawStars(t, dt){
+    const w = innerWidth, h = innerHeight;
+    sx.clearRect(0, 0, w, h);
+    for (const s of stars) {
+      s.x -= dt * 0.004 * s.z; if (s.x < -2) { s.x = w + 2; s.y = Math.random() * h; }
+      const a = .35 + .65 * Math.abs(Math.sin(t / 1000 * s.sp + s.tw)) * s.z;
+      sx.fillStyle = s.warm ? `rgba(255,220,180,${a})` : `rgba(220,232,255,${a})`;
+      sx.beginPath(); sx.arc(s.x, s.y, s.r, 0, Math.PI * 2); sx.fill();
+    }
+    if (!shoot && Math.random() < dt / 9000) shoot = { x: Math.random() * w * .8 + w * .2, y: Math.random() * h * .4, life: 0 };
+    if (shoot) {
+      shoot.life += dt; const k = shoot.life / 900, x = shoot.x - k * 260, y = shoot.y + k * 120;
+      const gr = sx.createLinearGradient(x, y, x + 90, y - 42); gr.addColorStop(0, `rgba(255,255,255,${.8 * (1 - k)})`); gr.addColorStop(1, 'rgba(255,255,255,0)');
+      sx.strokeStyle = gr; sx.lineWidth = 1.4; sx.beginPath(); sx.moveTo(x, y); sx.lineTo(x + 90, y - 42); sx.stroke();
+      if (k >= 1) shoot = null;
+    }
+  }
   function draw(t){
     const st = V() ? V().state() : {};
     let target = 0;
@@ -11762,25 +11888,26 @@ body.jarvis .kb-title, body.jarvis .s-title { font-family:'Rajdhani',sans-serif;
     const spin = t / (busy ? 900 : 4000);
     // glow core
     const g = ctx.createRadialGradient(c, c, 0, c, c, orbR * 0.75);
-    g.addColorStop(0, `rgba(255,190,240,${0.6 + level * 0.4})`); g.addColorStop(0.3, `rgba(255,62,165,${0.35 + level * 0.3})`); g.addColorStop(0.6, 'rgba(139,92,246,.30)'); g.addColorStop(1, 'rgba(139,92,246,0)');
+    const P = PAL[theme] || PAL.neon;
+    g.addColorStop(0, `rgba(${P.core0},${0.6 + level * 0.4})`); g.addColorStop(0.3, `rgba(${P.core1},${0.35 + level * 0.3})`); g.addColorStop(0.6, `rgba(${P.core2},.30)`); g.addColorStop(1, `rgba(${P.core2},0)`);
     ctx.fillStyle = g; ctx.beginPath(); ctx.arc(c, c, orbR * 0.75, 0, Math.PI * 2); ctx.fill();
-    const ring = (r, w, a, dash, rot, col) => { ctx.save(); ctx.translate(c, c); ctx.rotate(rot); ctx.strokeStyle = `rgba(${col || '139,92,246'},${a})`; ctx.lineWidth = w; ctx.setLineDash(dash || []); ctx.beginPath(); ctx.arc(0, 0, r, 0, Math.PI * 2); ctx.stroke(); ctx.restore(); };
+    const ring = (r, w, a, dash, rot, col) => { ctx.save(); ctx.translate(c, c); ctx.rotate(rot); ctx.strokeStyle = `rgba(${col || P.ring},${a})`; ctx.lineWidth = w; ctx.setLineDash(dash || []); ctx.beginPath(); ctx.arc(0, 0, r, 0, Math.PI * 2); ctx.stroke(); ctx.restore(); };
     ring(orbR * 0.42, 2, .9, [], 0);
-    ring(orbR * 0.55, 1, .6, [2, 6], spin * 1.6, '94,231,255');
+    ring(orbR * 0.55, 1, .6, [2, 6], spin * 1.6, P.ringB);
     ring(orbR * 0.98, 1.5, .5, [orbR * 0.5, orbR * 0.18], -spin);
-    ring(orbR * 1.12, 3, .35, [4, 14], spin * 0.6, '255,62,165');
+    ring(orbR * 1.12, 3, .35, [4, 14], spin * 0.6, P.ringC);
     ring(orbR * 1.28, 1, .3, [1, 5], -spin * 0.3);
     // segmented arc ticks
     ctx.save(); ctx.translate(c, c); ctx.rotate(spin * 0.8);
     for (let i = 0; i < 60; i++) { const a = i / 60 * Math.PI * 2, r1 = orbR * 1.18, r2 = r1 + (i % 5 ? 4 : 9);
-      ctx.strokeStyle = i % 5 ? 'rgba(94,231,255,.4)' : 'rgba(255,181,71,.7)'; ctx.lineWidth = 1; ctx.beginPath(); ctx.moveTo(Math.cos(a) * r1, Math.sin(a) * r1); ctx.lineTo(Math.cos(a) * r2, Math.sin(a) * r2); ctx.stroke(); }
+      ctx.strokeStyle = i % 5 ? `rgba(${P.tick},.4)` : `rgba(${P.tickMajor},.7)`; ctx.lineWidth = 1; ctx.beginPath(); ctx.moveTo(Math.cos(a) * r1, Math.sin(a) * r1); ctx.lineTo(Math.cos(a) * r2, Math.sin(a) * r2); ctx.stroke(); }
     ctx.restore();
     // the voice wave: a ring that ripples with the level
     const base = orbR * 0.74, N = wave.length;
     for (let i = 0; i < N; i++) { const n = Math.sin(i * 0.9 + t / 90) * Math.sin(i * 0.37 - t / 140) + (Math.random() - .5) * .6; wave[i] += ((n * level) - wave[i]) * 0.35; }
     ctx.save(); ctx.translate(c, c);
-    ctx.shadowColor = '#ff3ea5'; ctx.shadowBlur = 10 + level * 24;
-    { const lg = ctx.createLinearGradient(-orbR, -orbR, orbR, orbR); lg.addColorStop(0, '#5ee7ff'); lg.addColorStop(0.5, '#a78bfa'); lg.addColorStop(1, '#ff3ea5'); ctx.strokeStyle = lg; ctx.globalAlpha = 0.65 + level * 0.35; }
+    ctx.shadowColor = P.glow; ctx.shadowBlur = 10 + level * 24;
+    { const lg = ctx.createLinearGradient(-orbR, -orbR, orbR, orbR); lg.addColorStop(0, P.wave[0]); lg.addColorStop(0.5, P.wave[1]); lg.addColorStop(1, P.wave[2]); ctx.strokeStyle = lg; ctx.globalAlpha = 0.65 + level * 0.35; }
     ctx.lineWidth = 2 + level * 1.5;
     ctx.beginPath();
     for (let i = 0; i <= N; i++) { const k = i % N, a = k / N * Math.PI * 2, r = base + wave[k] * orbR * 0.32; const x = Math.cos(a) * r, y = Math.sin(a) * r; i ? ctx.lineTo(x, y) : ctx.moveTo(x, y); }
@@ -11788,7 +11915,7 @@ body.jarvis .kb-title, body.jarvis .s-title { font-family:'Rajdhani',sans-serif;
     // radial bars outside the wave
     ctx.shadowBlur = 0; ctx.globalAlpha = 1;
     for (let i = 0; i < N; i += 2) { const a = i / N * Math.PI * 2, h = Math.abs(wave[i]) * orbR * 0.28;
-      if (h < 1) continue; ctx.strokeStyle = i % 4 ? 'rgba(94,231,255,.6)' : 'rgba(255,62,165,.7)'; ctx.lineWidth = 2; ctx.beginPath();
+      if (h < 1) continue; ctx.strokeStyle = i % 4 ? `rgba(${P.barA},.6)` : `rgba(${P.barB},.7)`; ctx.lineWidth = 2; ctx.beginPath();
       ctx.moveTo(Math.cos(a) * (orbR * 0.86), Math.sin(a) * (orbR * 0.86)); ctx.lineTo(Math.cos(a) * (orbR * 0.86 + h), Math.sin(a) * (orbR * 0.86 + h)); ctx.stroke(); }
     ctx.restore();
     $('jv-state').textContent = st.pending ? 'AWAITING YOUR GO' : st.speaking ? 'SPEAKING' : st.listening ? 'LISTENING' : st.transcribing ? 'HEARING' : st.thinking ? 'THINKING' : 'ONLINE';
@@ -11796,22 +11923,35 @@ body.jarvis .kb-title, body.jarvis .s-title { font-family:'Rajdhani',sans-serif;
 
   // ── the talk section ──
   let lastUser = '';
-  function caption(html, you){ const cap = $('jv-cap'); cap.innerHTML = (you ? `<div class="you">${esc2(you)}</div>` : '') + html; cap.scrollTop = 0; }
+  function caption(){ /* the HUD shows no conversation — everything lives in the talk box */ }
+  // A short line shown in the talk box itself (placeholder), for a few seconds.
+  let note = '', noteUntil = 0, askText = '';
+  function boxNote(text, ms){ note = String(text || '').replace(/\*\*/g, '').replace(/\s+/g, ' ').trim().slice(0, 110); noteUntil = Date.now() + (ms || 6000); }
+  function paintBox(st){
+    const inp = $('jv-in'), bar = inp.parentNode;
+    const asking = !!(st.pending && askText);
+    bar.classList.toggle('ask', asking);
+    let ph = 'Talk to Cipher, or type…', cls = '';
+    if (asking) { ph = innerWidth < 640 ? askText.replace(/, at market\.?$/, '') + '?' : askText + '  Say yes or tap GO'; cls = 'asking'; }
+    else if (st.listening) ph = 'Listening…';
+    else if (st.transcribing) ph = 'Hearing you…';
+    else if (Date.now() < noteUntil) { ph = note; cls = 'note'; }
+    else if (st.thinking) ph = 'Thinking…';
+    else if (st.speaking) ph = 'Speaking — tap the orb to talk';
+    if (inp.placeholder !== ph) inp.placeholder = ph;
+    inp.classList.toggle('asking', cls === 'asking'); inp.classList.toggle('note', cls === 'note');
+  }
   const esc2 = (s) => String(s).replace(/[&<>"]/g, (m) => ({ '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;' }[m]));
   const fmt = (s) => esc2(s).replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>').replace(/\n/g, '<br>');
   const _add = window.addAIMsg;
   window.addAIMsg = function(text){
     const r = _add.apply(this, arguments);
     if (document.body.classList.contains('jarvis') && Date.now() - lastSendAt < 240000) {
-      caption(fmt(text), lastUser);
-      // Confirmation buttons follow the operator's question into the HUD.
-      if (/\bGo\?\s*$/.test(String(text))) {
-        const cap = $('jv-cap'), d = document.createElement('div');
-        d.innerHTML = '<button class="go" type="button">GO</button><button type="button">CANCEL</button>';
-        d.children[0].onclick = () => { d.remove(); ask('yes'); };
-        d.children[1].onclick = () => { d.remove(); ask('no'); };
-        cap.appendChild(d);
-      }
+      const plain = String(text || '').replace(/\*\*/g, '').trim();
+      // The operator's question goes in the box; a problem shows there briefly. Nothing else.
+      if (/\bGo\?\s*$/.test(plain)) askText = plain.replace(/\s*Go\?\s*$/, '');
+      else if (/^(not done|cancelled|could not|couldn|error|operator error|which coin|no open|that named|the relay)|invalid|check your api key|elevenlabs did not/i.test(plain)) boxNote(plain.split('\n')[0], 9000);
+      else if (/^(closed|order accepted|stop resting|target resting|cancelled \d|sent, but)/i.test(plain)) boxNote(plain.split('\n')[0], 7000);
     }
     return r;
   };
@@ -11831,8 +11971,10 @@ body.jarvis .kb-title, body.jarvis .s-title { font-family:'Rajdhani',sans-serif;
     if (text && document.body.classList.contains('jarvis')) {
       const t = text.toLowerCase().replace(/[.!?]$/, '').trim();
       const nav = t.match(/^(?:open|show|show me|bring up|go to|display|pull up)\s+(?:the\s+|my\s+)?(.+)$/);
-      if (nav) { const n = NODES.find(x => x.words.test(nav[1])); if (n) { input.value = ''; caption(fmt(n.label + '.'), text); select(n); return; } }
-      if (/^(close (that|this|it|the panel|panel|window)|back|home|hide (that|it|panel))$/.test(t)) { input.value = ''; closePanels(); caption(fmt('Back to the HUD.'), text); return; }
+      if (nav) { const n = NODES.find(x => x.words.test(nav[1])); if (n) { input.value = ''; boxNote(n.label, 2500); select(n); return; } }
+      const th = t.match(/^(?:theme|switch to|go|use)?\s*(neon|mono|black and white|deep space|space)(?: theme| mode| look)?$/);
+      if (th) { input.value = ''; setTheme(/mono|black/.test(th[1]) ? 'mono' : /space/.test(th[1]) ? 'space' : 'neon'); boxNote(THEME_NAME[theme], 2500); return; }
+      if (/^(close (that|this|it|the panel|panel|window)|back|home|hide (that|it|panel))$/.test(t)) { input.value = ''; closePanels(); return; }
     }
     return _send.apply(this, arguments);
   };
@@ -11841,20 +11983,26 @@ body.jarvis .kb-title, body.jarvis .s-title { font-family:'Rajdhani',sans-serif;
   $('jv-mic').onclick = () => { if (V()) V().toggleMic(); };
   $('jv-spk').onclick = () => { const b = $('spk-btn'); if (b) b.click(); };
   $('jv-orb').onclick = () => { if (V()) V().toggleMic(); };
+  $('jv-go').onclick = () => { askText = ''; ask('yes'); };
+  $('jv-no').onclick = () => { askText = ''; ask('no'); };
 
   // ── mode switch ──
   function setJarvis(on){ document.body.classList.toggle('jarvis', !!on); LSS('mc_jarvis', on ? '1' : '0'); if (on) layout(); }
   $('jv-classic').onclick = () => setJarvis(false);
+  $('jv-theme').onclick = () => setTheme(THEMES[(THEMES.indexOf(theme) + 1) % THEMES.length]);
   $('jv-back').onclick = () => setJarvis(true);
-  window.CipherJarvis = { setJarvis, select: (id) => { const n = NODES.find(x => x.id === id); if (n) select(n); }, nodes: NODES };
+  window.CipherJarvis = { setTheme, setJarvis, select: (id) => { const n = NODES.find(x => x.id === id); if (n) select(n); }, nodes: NODES };
 
   // ── frame loop + slow refreshers ──
   function frame(t){
     if (document.body.classList.contains('jarvis')) {
       const dt = Math.min(64, t - last); last = t;
       placeNodes(dt); draw(t);
+      if (theme === 'space') drawStars(t, dt);
       const st = V() ? V().state() : {};
       $('jv-mic').classList.toggle('rec', !!st.listening);
+      if (!st.pending) askText = '';
+      paintBox(st);
       $('jv-spk').classList.toggle('on', !!(V() && V().voiceOn()));
       // A feature panel is open: dim the ring behind it.
       const po = panelOpen(); $('jv-stage').style.opacity = po ? '.25' : '1';
@@ -11869,9 +12017,9 @@ body.jarvis .kb-title, body.jarvis .s-title { font-family:'Rajdhani',sans-serif;
     const bot = dockLine('dock-bot'); $('jv-sys').textContent = bot ? 'bot · ' + bot : 'systems online';
   }
   function start(){
-    layout(); slow(); setInterval(slow, 5000);
+    layout(); seedStars(); setTheme(theme); slow(); setInterval(slow, 5000);
     if (LSG('mc_jarvis', '1') === '1') setJarvis(true);
-    caption('<span style="opacity:.75">Tap the orb or the mic and talk. Tap a ring node, or say "open accumulator".</span>');
+
     requestAnimationFrame(frame);
   }
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', start); else start();
