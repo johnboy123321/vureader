@@ -1260,6 +1260,36 @@ async function pushLog(entry) {
 // day and this is genuinely useful for judging the last year. They are different questions.
 const LEDGER_KEY = "cipher_ledger";
 const LEDGER_MAX = 5000;
+// ── ONE-TIME RELABEL: A RESULT WITHOUT A FILL IS NOT A RESULT (2026-10-27) ─────────────────────────
+// Every resolved record before today was graded from a price range, because the fill matcher could
+// not read Phemex's numeric trade rows (see normFillRow). 62 of them were still counted — −6.56R
+// that rests on no fill at all. They are relabelled countsForStats:false ONCE, keeping the old
+// flag in countedBefore so the change can be reversed, and nothing else on the record is touched.
+const LEDGER_RELABEL_KEY = "cipher_ledger_relabel", LEDGER_RELABEL_REV = "2026-10-27-no-fill";
+// PURE. Returns how many records it changed.
+function relabelNoFill(led) {
+  let n = 0;
+  for (const r of led || []) {
+    if (!r || r.kind !== "resolved" || !r.countsForStats) continue;
+    if (r.gradedOn === "venue_fill" || r.fill) continue;
+    r.countsForStats = false; r.countedBefore = true;
+    r.statsExcluded = "no venue fill — range-graded guess (relabelled 2026-10-27)";
+    n++;
+  }
+  return n;
+}
+async function relabelLedgerOnce() {
+  try {
+    const stamp = await getJSON(LEDGER_RELABEL_KEY, null);
+    if (stamp && stamp.rev === LEDGER_RELABEL_REV) return;
+    const led = (await getJSON(LEDGER_KEY, [])) || [];
+    const n = relabelNoFill(led);
+    await setJSON(LEDGER_KEY, led);
+    await setJSON(LEDGER_RELABEL_KEY, { rev: LEDGER_RELABEL_REV, at: new Date().toISOString(), changed: n });
+    await pushLog({ result: "LEDGER RELABELLED", skipped: `${n} resolved record(s) graded from the price range with no venue fill no longer count toward the stats. Their old flag is kept as countedBefore. From now on only fill-graded trades count.` });
+  } catch (e) { console.error("ledger relabel failed (harmless, retried next run):", e && e.message); }
+}
+
 async function pushLedger(entry) {
   try {
     const led = await getJSON(LEDGER_KEY, []);
@@ -1424,10 +1454,30 @@ function snapshotOpen(positions, bookMap, prev) {
 // structure (entry = the exchange's average entry price when it reports one), file the position
 // under the swing book. No order is placed and nothing on the exchange moves — the plan simply
 // gives the resolution pass, the correlation guard and any future time stop something to hold.
-async function adoptOrphans(nowOpen, bookMap) {
+// ── A PLAN THAT DESCRIBES A DIFFERENT POSITION (2026-10-27) ──────────────────────────────────────
+// APT short: plan entry 0.6124, the venue's average entry 0.925 — 16R apart. The plan was written
+// for a different fill, so its stop sat on the PROFIT side of the real position and behind the
+// market, the stop could never attach, and every run tried (and failed) to close it at market.
+// How far the venue's average entry is from the plan's entry, in units of the plan's own risk.
+function planDriftR(pos) {
+  const p = pos && pos.plan, ae = Number(pos && pos.avgEntry);
+  if (!p || !(ae > 0)) return 0;
+  const risk = Math.abs(Number(p.entry) - Number(p.stop));
+  return risk > 0 ? Math.abs(ae - Number(p.entry)) / risk : 0;
+}
+
+async function adoptOrphans(nowOpen, bookMap, skip) {
   const adopted = [];
   for (const [k, pos] of Object.entries(nowOpen || {})) {
-    if (pos.plan || !(pos.size > 0)) continue;
+    if (!(pos.size > 0)) continue;
+    if (typeof skip === "function" && skip(k)) {
+      console.log(`adopt: ${k} is on OPERATOR HOLD — not adopted this cycle`);
+      continue;
+    }
+    const drift = planDriftR(pos);
+    const planOff = !!pos.plan && drift > num("PLAN_DRIFT_R", 1.5);
+    if (pos.plan && !planOff) continue;
+    const oldPlan = pos.plan;
     let bars = null;
     try { bars = await fetchCandles(pos.coin, "1D", 260); } catch { }
     if (!bars || !bars.length) continue;
@@ -1437,6 +1487,13 @@ async function adoptOrphans(nowOpen, bookMap) {
     // average entry, so "closed in profit / at a loss" is judged against reality.
     const cur = bars[bars.length - 1].c;
     const plan = buildTradePlan(bars, pos.dir, cur);
+    if (planOff && !plan) {
+      // Could not build a replacement: keep the old plan rather than leave the position with none,
+      // but say so — this position's stop is not one the bot believes in.
+      await pushLog({ coin: pos.coin, dir: pos.dir, result: "PLAN DOES NOT MATCH POSITION",
+        skipped: `the plan's entry ${formatPrice(oldPlan.entry)} is ${drift.toFixed(1)}R from the venue's average entry ${formatPrice(pos.avgEntry)}, so it was written for a different fill — and no replacement could be built from today's structure (stop > 3 ATR). Kept as is; check this position by hand.` });
+      continue;
+    }
     // ── A FAILED ADOPTION MUST NOT BE SILENT (2026-08-20) ───────────────────────────────────
     // Found by John: a SOL long appeared at 07:59 that this bot never opened, and sat for
     // thirteen hours with no stop, no target and no book — because buildTradePlan returned null
@@ -1475,14 +1532,22 @@ async function adoptOrphans(nowOpen, bookMap) {
       }
       continue;
     }
-    const ref = Number.isFinite(pos.avgEntry) && pos.avgEntry > 0 ? pos.avgEntry : cur;
-    pos.plan = { entry: ref, stop: plan.stop, target: plan.targets[1] ?? plan.targets[0] };
+    // ── ONE PRICE FOR THE WHOLE PLAN (2026-10-27) ───────────────────────────────────────────
+    // The stop and target are measured from TODAY's price, so the plan's entry must be today's
+    // price too. It used to be the venue's old average entry, which made the plan's own R
+    // meaningless: LTC adopted with a 17% stop and a 0.25R target, ATOM 11% and 0.16R. The real
+    // average entry is still kept on the position (avgEntry), and an adopted trade is never
+    // counted in the strategy's stats — the bot did not choose its entry.
+    pos.plan = { entry: cur, stop: plan.stop, target: plan.targets[1] ?? plan.targets[0] };
     pos.book = pos.book || "swing";
     pos.adopted = Date.now();
     bookMap[k] = pos.book;
     adopted.push(pos);
-    await pushLog({ coin: pos.coin, dir: pos.dir, book: pos.book, result: "ADOPTED",
-      skipped: `held with no plan (predates the books feature) — given a ${plan.stopKind} stop ${formatPrice(pos.plan.stop)} and target ${formatPrice(pos.plan.target)} from today's daily structure, entry marked at ${formatPrice(ref)}, filed under the swing book. Bookkeeping only: no order placed.` });
+    await pushLog({ coin: pos.coin, dir: pos.dir, book: pos.book, result: planOff ? "RE-PLANNED" : "ADOPTED",
+      skipped: (planOff
+        ? `its plan (entry ${formatPrice(oldPlan.entry)}, stop ${formatPrice(oldPlan.stop)}) was ${drift.toFixed(1)}R from the venue's average entry ${formatPrice(pos.avgEntry)} — written for a different fill. Replaced`
+        : `held with no plan (predates the books feature) — given`) +
+        ` a ${plan.stopKind} stop ${formatPrice(pos.plan.stop)} and target ${formatPrice(pos.plan.target)} from today's daily structure at ${formatPrice(cur)} (venue average entry ${formatPrice(pos.avgEntry)}), ${pos.book} book. Not counted in the strategy's stats. The stop sweep below attaches it.` });
   }
   return adopted;
 }
@@ -1868,6 +1933,53 @@ function pickClosingFill(rows, posSide, sinceMs, symbol) {
   };
 }
 
+// PURE. The record for a position an operator order closed: real exit, real R, counted nowhere.
+function operatorResolution(fill, realR) {
+  return { exit: fill.px, R: realR, closeFill: fill, gradedOn: "venue_fill",
+    how: "operator", closedBy: "operator", outcome: "unattributed", klass: "execution_artifact", execution: "operator_close",
+    countsForStreak: false, countsForStats: false,
+    why: `closed by the operator (${String(fill.clOrdID || "operator order").slice(0, 24)}) at ${formatPrice(fill.px)} — an operator decision, not the strategy's` };
+}
+
+// Did an OPERATOR order close this side since the position opened? Order history carries the
+// clOrdID that trade history does not, so ask it. null = no operator close found (or unreadable).
+let lastOperatorLookup = "";
+async function fetchOperatorClose(symbol, posSide, sinceMs) {
+  if (!CFG.direct()) return null;
+  const since = Number(sinceMs) > 0 ? Number(sinceMs) : Date.now() - 7 * 864e5;
+  const closing = posSide === "Long" ? "Sell" : "Buy";
+  const start = Math.floor(since - 60e3);
+  const tries = [
+    ["/exchange/order/v2/orderList", `symbol=${symbol}&currency=USDT&offset=0&limit=100&withCount=false&start=${start}`],
+    ["/api-data/g-futures/orders", `symbol=${symbol}&limit=100&start=${start}`],
+  ];
+  const at = r => { const ns = Number(r.transactTimeNs ?? r.actionTimeNs); if (ns > 0) return ns / 1e6;
+    const ms = Number(r.updatedAt ?? r.createdAt ?? r.transactTime ?? r.timestamp); return ms > 0 ? (ms > 1e14 ? ms / 1e6 : ms) : 0; };
+  const seen = [];
+  for (const [path, q] of tries) {
+    let r = null;
+    try { r = await phemexCall("GET", path, q, null); } catch (e) { seen.push(`${path} → ${String((e && e.message) || e).slice(0, 80)}`); continue; }
+    const d = r && r.data && r.data.data;
+    const rows = Array.isArray(d) ? d : (d && Array.isArray(d.rows) ? d.rows : null);
+    seen.push(`${path} → http ${r && r.status}${rows ? `, ${rows.length} row(s)` : ""}`);
+    if (!(r && r.status === 200) || !rows) continue;
+    const hit = rows.filter(o => o && isOperator(o) && fillSymOk(o, symbol) &&
+        (!o.posSide || posName(o.posSide) === posSide || posName(o.posSide) === "Merged") &&
+        sideName(o.side) === closing &&
+        (Number(o.cumQtyRq ?? o.cumQty ?? 0) > 0 || /filled/i.test(String(o.ordStatus || ""))) &&
+        at(o) >= start)
+      .sort((a, b) => at(b) - at(a))[0];
+    if (hit) {
+      const px = Number(hit.avgPriceRp ?? hit.avgPrice ?? hit.execPriceRp ?? hit.priceRp ?? hit.stopPxRp) || undefined;
+      lastOperatorLookup = seen.join(" ;; ");
+      return { px, qty: Number(hit.cumQtyRq ?? hit.cumQty) || undefined, clOrdID: String(hit.clOrdID), orderID: String(hit.orderID || ""),
+               ordType: String(hit.ordType ?? hit.orderType ?? ""), at: at(hit) || undefined, via: path };
+    }
+  }
+  lastOperatorLookup = seen.join(" ;; ");
+  return null;
+}
+
 // PURE. Turn a fill into the four labels classifyResolution uses, plus closedBy and real R.
 function attributeClose(was, fill, reg) {
   const plan = was && was.plan;
@@ -1888,6 +2000,10 @@ function attributeClose(was, fill, reg) {
 
   if (/liq|adl/i.test(fill.ordType + " " + fill.execStatus + " " + tag))
     return strat("liquidation", "liquidation", `the venue liquidated it at ${formatPrice(fill.px)}`);
+  // An operator order closed it (clOrdID gray…, or an operator stop/target this position recorded).
+  const opMatch = (reg && (reg.operator || []).some(h => (fill.orderID && h.orderID && fill.orderID === String(h.orderID)) ||
+                                                         (fill.clOrdID && h.clOrdID && fill.clOrdID === String(h.clOrdID))));
+  if (/^gray/i.test(String(fill.clOrdID || "")) || opMatch) return operatorResolution(fill, realR);
   if (/^cipherBreach|cipher-stop-breach/i.test(tag))
     return strat("stop", "stop_breach_close", `price was already past the stop; the bot closed it at market at ${formatPrice(fill.px)}`);
   // ── WHICH ORDER, NOT HOW CLOSE (audit 2026-10-26) ─────────────────────────────────────────
@@ -2673,6 +2789,33 @@ function restingStops(orders, posSide) {
     (o.reduceOnly || o.closeOnTrigger || isOurs(o, "Stop")) && isConditional(o));
 }
 
+// ═══════════ OPERATOR ORDERS (GRAY) — 2026-10-27 ═══════════════════════════════════════════════
+// John's operator (Gray) can close, stop and target positions on the testnet account by voice.
+// Every order it sends carries a clOrdID starting "gray" (grayStop…, grayTarget…, grayClose…).
+// The rule: an operator order is the operator's decision, and the bot does not argue with it.
+//   • a gray stop/target IS this position's protection — never cancelled, never stacked on, never
+//     "fixed" back to the plan's level. The bot's own stop/target on that side comes off, so
+//     exactly one rests and the operator's level is the one that can fire.
+//   • a position closed by a gray order is recorded closedBy "operator", not counted anywhere.
+//   • that coin and side is left alone (no entry, no adoption) for OPERATOR_HOLD_MIN (one cycle).
+// Book rows arrive WITHOUT posSide (run #826), so side + clOrdID decide; posSide only when present.
+const isOperator = o => /^gray/i.test(String((o && o.clOrdID) || ""));
+const sideName = v => { const t = String(v ?? ""); return FILL_SIDE[t] || t; };
+const posName = v => { const t = String(v ?? ""); return FILL_POS[t] || t; };
+const operatorIsStop = o => /^grayStop/i.test(String(o.clOrdID)) ||
+  (!/^gray(Target|Tp|Close)/i.test(String(o.clOrdID)) && Number(o.stopPxRp ?? o.stopPx ?? 0) > 0);
+const operatorIsTarget = o => /^gray(Target|Tp)/i.test(String(o.clOrdID)) ||
+  (!/^gray(Stop|Close)/i.test(String(o.clOrdID)) && !(Number(o.stopPxRp ?? o.stopPx ?? 0) > 0) && Number(o.priceRp ?? o.price ?? 0) > 0);
+// PURE. The operator's resting stop or target for this side, if any.
+function findOperatorLeg(orders, posSide, leg) {
+  const closing = posSide === "Long" ? "Sell" : "Buy";
+  return (orders || []).find(o => o && isOperator(o) &&
+    (!o.posSide || posName(o.posSide) === posSide) &&
+    (o.side == null || o.side === "" || sideName(o.side) === closing) &&
+    (leg === "stop" ? operatorIsStop(o) : operatorIsTarget(o)));
+}
+const operatorLegPx = o => Number(o.stopPxRp ?? o.stopPx ?? 0) > 0 ? Number(o.stopPxRp ?? o.stopPx) : Number(o.priceRp ?? o.price) || undefined;
+
 // PURE. Has the plan's level moved far enough from what we placed to warrant replacing it?
 // Half a basis point of the price: rounding differences never count, a trailed stop always does.
 function levelMoved(placedPx, planPx) {
@@ -2835,6 +2978,48 @@ async function protectOpenPositions(nowOpen, priceOf) {
     // Pulled by the early pass (the position looked finished) but still open: those orders were
     // CANCELLED, so the record must not go on claiming the position is covered (audit, 2nd pass).
     if (reg.pulled) { delete reg.stop; delete reg.target; delete reg.pulled; dirty = true; }
+
+    // ── OPERATOR LEGS FIRST (2026-10-27) ─────────────────────────────────────────────────────
+    for (const leg of ["stop", "target"]) {
+      const op = findOperatorLeg(orders, posSide, leg);
+      const had = reg[leg];
+      if (op) {
+        // Our own order on this leg is superseded: take it off so the operator's is the only one.
+        // Every non-gray closing order of this kind that is ours, from the registry or the book.
+        const mine = [];
+        if (had && had.source !== "operator" && had.orderID) mine.push({ orderID: had.orderID, clOrdID: had.clOrdID });
+        for (const o of orders || []) if (o && !isOperator(o) && new RegExp("^cipher" + (leg === "stop" ? "Stop" : "Target"), "i").test(String(o.clOrdID || "")) &&
+          (o.side == null || sideName(o.side) === (posSide === "Long" ? "Sell" : "Buy")) && !mine.some(m => m.orderID === o.orderID)) mine.push({ orderID: o.orderID, clOrdID: o.clOrdID });
+        const pulledMine = [];
+        for (const m of mine) {
+          const c = await cancelOrder(symbol, m.orderID, m.clOrdID, posSide);
+          if (c.ok) pulledMine.push(m.clOrdID || m.orderID);
+          (reg.history = reg.history || []).push({ leg, orderID: m.orderID, clOrdID: m.clOrdID, supersededBy: "operator" });
+        }
+        const isNew = !had || had.source !== "operator" || String(had.orderID) !== String(op.orderID);
+        reg[leg] = { px: operatorLegPx(op), sentPx: operatorLegPx(op), qty: Number(op.orderQtyRq ?? op.orderQty) || undefined,
+          orderID: op.orderID, clOrdID: op.clOrdID, at: (had && !isNew && had.at) || Date.now(), source: "operator" };
+        dirty = true;
+        if (isNew) {
+          out.operator = (out.operator || 0) + 1;
+          (reg.operator = reg.operator || []).push({ leg, orderID: op.orderID, clOrdID: op.clOrdID, px: operatorLegPx(op), at: Date.now() });
+          await pushLog({ coin: pos.coin, dir: pos.dir, result: `OPERATOR: ${pos.coin} ${leg} seen`, operator: true,
+            skipped: `operator ${leg} ${String(op.clOrdID).slice(0, 24)} at ${formatPrice(operatorLegPx(op))} is now this position's ${leg}. The bot will not cancel, stack on or move it.` +
+              (pulledMine.length ? ` Took the bot's own ${leg} off (${pulledMine.length}) so only the operator's rests.` : "") });
+        }
+      } else if (had && had.source === "operator") {
+        // Gone from the book. One unreadable view can hide a conditional, so it takes TWO runs in a
+        // row before the bot believes it and puts the plan's own order back.
+        had.missing = (had.missing || 0) + 1; dirty = true;
+        if (had.missing >= 2) {
+          delete reg[leg];
+          await pushLog({ coin: pos.coin, dir: pos.dir, result: `OPERATOR: ${pos.coin} ${leg} gone`, operator: true,
+            skipped: `the operator's ${leg} ${String(had.clOrdID || "").slice(0, 24)} is no longer resting (two runs). The position is still open, so the plan's own ${leg} goes back on.` });
+        }
+      }
+    }
+    const opStop = !!(reg.stop && reg.stop.source === "operator");
+    const opTarget = !!(reg.target && reg.target.source === "operator");
     // The market-side check must use a MARKET price. The old sweep fell back to the position's
     // average entry when the coin was not in this run's scan batch, so a long whose stop had been
     // set above entry to lock in profit (DOT, adopted 2026-10-22) was refused every run as "stop
@@ -2858,7 +3043,7 @@ async function protectOpenPositions(nowOpen, priceOf) {
     // Moved = the plan's level changed OR the position's size did (a partial close): either way the
     // resting order no longer matches the position, so it is replaced.
     const sizeMoved = (leg) => leg && Number(leg.qty) > 0 && Math.abs(Number(leg.qty) - Number(pos.size)) > 1e-9;
-    const stopMoved = reg.stop && (levelMoved(reg.stop.px, pos.plan.stop) || sizeMoved(reg.stop));
+    const stopMoved = !opStop && reg.stop && (levelMoved(reg.stop.px, pos.plan.stop) || sizeMoved(reg.stop));
     if (stopMoved && reg.stop.orderID) {
       // The plan's stop has moved (trailed or rebuilt). Take the old one off before the new one
       // goes on, or the stack starts again one level at a time.
@@ -2924,7 +3109,7 @@ async function protectOpenPositions(nowOpen, priceOf) {
 
     // ── TARGET ──────────────────────────────────────────────────────────────────────────────
     const seenTarget = findRestingTarget(orders, posSide);
-    const tgtMoved = reg.target && (levelMoved(reg.target.px, pos.plan.target) || sizeMoved(reg.target));
+    const tgtMoved = !opTarget && reg.target && (levelMoved(reg.target.px, pos.plan.target) || sizeMoved(reg.target));
     // Our targets are plain limits, which the book read DOES show. So if we recorded one and the
     // book is readable and it is not there, it has gone (filled, cancelled, expired): forget it.
     // Run #826 showed the open-orders rows arrive WITHOUT ordType, posSide or reduceOnly — which
@@ -3027,6 +3212,7 @@ async function cancelProtectionFor(posKeys, { keep = false } = {}) {
     if (!reg.pulled) {
       for (const leg of ["stop", "target"]) {
         const o = reg[leg];
+        if (o && (o.source === "operator" || isOperator(o))) continue;     // the operator's order is the operator's to cancel
         if (o && (o.orderID || o.clOrdID)) { const c = await cancelOrder(reg.symbol, o.orderID, o.clOrdID, reg.posSide); if (c.ok) n++; }
       }
     }
@@ -5453,11 +5639,17 @@ async function runAccumulator(book = primaryAccumBook()) {
             if (armedExec && (shortOfCoins || shortOfCash)) {
               const detail = shortOfCoins
                 ? `the strategy's book holds ${bookUnits.toFixed(8)} ${coin} but the SPOT wallet has ${wBase.toFixed(8)} — about ${(wBase * px).toFixed(2)} USDT, under the ${minOrder} minimum`
-                : `the book holds ${bookCash.toFixed(2)} USDT but the SPOT wallet has ${wQuote.toFixed(2)}`;
-              state.liveFlip = { tf: null, want: flipTf, blocked: true,
-                why: `${detail}. Nothing can be traded until the two agree — check whether the balance was moved off the spot wallet, then re-arm to reseed from what is actually there.` };
+                : `the book holds ${bookCash.toFixed(2)} USDT but the SPOT wallet has ${wQuote.toFixed(2)} USDT` +
+                  (wBase != null ? ` and ${wBase.toFixed(8)} ${coin} (~${(wBase * px).toFixed(2)} USDT)` : "");
+              // Logged when it starts, when the numbers change, and once a day — not every run.
+              // For a month this line was 96 of every day's log entries, pushing real events out
+              // of the 300-line ring while saying nothing new (2026-10-27).
+              const prevLF = state.liveFlip || {};
+              const why = `${detail}. Nothing can be traded until the two agree — check whether the balance was moved off the spot wallet, then re-arm to reseed from what is actually there.`;
+              const relog = prevLF.why !== why || !(Date.now() - (Number(prevLF.loggedAt) || 0) < 864e5);
+              state.liveFlip = { tf: null, want: flipTf, blocked: true, why, loggedAt: relog ? Date.now() : prevLF.loggedAt };
               console.log(`live flip ${flipTf}: STOOD DOWN — ${state.liveFlip.why}`);
-              await pushLog({ coin, result: "FLIP OUT OF SYNC", skipped: state.liveFlip.why });
+              if (relog) await pushLog({ coin, result: "FLIP OUT OF SYNC", skipped: state.liveFlip.why });
               outOfSync = true;
             }
             const stackUsdt = ((Number(state.units) || 0) * px) + (Number(state.cash) || 0);
@@ -5679,16 +5871,19 @@ async function runAccumulator(book = primaryAccumBook()) {
 const HEALTH_KEY = "cipher_health";
 
 // PURE. The invariants, checked against what this run saved.
-function healthOf({ now, canSeeBook, mode, open, registry, runLog, prevBeatAt, maxGapMin = 45 }) {
+function healthOf({ now, canSeeBook, mode, open, registry, runLog, prevBeatAt, maxGapMin = 45, hold = {} }) {
   const fail = [], warn = [];
   if (!canSeeBook) fail.push("could not read open positions from Phemex — nothing was placed or protected this run");
   // Every position with size > 0 counts (2026-10-27). The one exception is a close this run that
   // was CONFIRMED gone from the venue's book — a closedBy label on its own proves nothing (APT).
   const live = Object.entries(open || {}).filter(([, p]) => p && p.size > 0 && p.plan && !(p.closedBy && p.closeConfirmed));
-  let stops = 0, targets = 0;
+  let stops = 0, targets = 0, operatorLegs = 0;
   const noStop = [], noTarget = [];
   for (const [k, p] of live) {
     const r = registry && registry[k];
+    // An operator (gray) stop or target is this position's protection (2026-10-27).
+    if (r && r.stop && r.stop.source === "operator") operatorLegs++;
+    if (r && r.target && r.target.source === "operator") operatorLegs++;
     if (r && r.stop && !r.pulled) stops++; else noStop.push(`${p.coin} ${p.dir}`);
     if (r && r.target && !r.pulled) targets++; else noTarget.push(`${p.coin} ${p.dir}`);
   }
@@ -5696,7 +5891,10 @@ function healthOf({ now, canSeeBook, mode, open, registry, runLog, prevBeatAt, m
     if (noStop.length) fail.push(`no stop on ${noStop.length} position(s): ${noStop.join(", ")}`);
     if (noTarget.length) warn.push(`no target on ${noTarget.length} position(s): ${noTarget.join(", ")}`);
   }
-  const orphans = Object.values(open || {}).filter(p => p && p.size > 0 && !p.plan);
+  const isHeld = p => (hold[posKey(p.coin, p.dir)] || 0) > now;
+  const heldOrphans = Object.values(open || {}).filter(p => p && p.size > 0 && !p.plan && isHeld(p));
+  if (heldOrphans.length) warn.push(`${heldOrphans.length} plan-less position(s) on OPERATOR HOLD, not adopted this cycle: ${heldOrphans.map(p => p.coin + " " + p.dir).join(", ")}`);
+  const orphans = Object.values(open || {}).filter(p => p && p.size > 0 && !p.plan && !isHeld(p));
   if (orphans.length) fail.push(`${orphans.length} position(s) with no plan at all: ${orphans.map(p => p.coin + " " + p.dir).join(", ")}`);
   const count = (re) => (runLog || []).filter(e => re.test(String(e.result || ""))).length;
   const n1 = count(/^STOP ATTACH FAILED/), n2 = count(/^DE-HEDGE (FAILED|GIVEN UP)/), n3 = count(/^ERR/), n4 = count(/^FILL LOOKUP EMPTY/);
@@ -5707,7 +5905,7 @@ function healthOf({ now, canSeeBook, mode, open, registry, runLog, prevBeatAt, m
   const gapMin = prevBeatAt ? Math.round((now - Date.parse(prevBeatAt)) / 6e4) : null;
   if (gapMin != null && gapMin > maxGapMin) warn.push(`${gapMin} min since the previous run (expected ≤ ${maxGapMin})`);
   return { at: new Date(now).toISOString(), status: fail.length ? "FAIL" : warn.length ? "WARN" : "OK", mode,
-           positions: live.length, stops, targets, gapMin, problems: [...fail, ...warn] };
+           positions: live.length, stops, targets, operatorLegs, gapMin, problems: [...fail, ...warn] };
 }
 
 async function writeHealth({ started, canSeeBook, mode }) {
@@ -5717,9 +5915,11 @@ async function writeHealth({ started, canSeeBook, mode }) {
     const h = healthOf({ now: Date.now(), canSeeBook, mode,
       open: await getJSON(OPEN_KEY, {}), registry: await getJSON(PROTECT_KEY, {}),
       runLog: ((await getJSON(KEY.log, [])) || []).filter(e => e && Date.parse(e.at) >= started),
-      prevBeatAt: beat && beat.at, maxGapMin: num("HEALTH_MAX_GAP_MIN", 45) });
+      prevBeatAt: beat && beat.at, maxGapMin: num("HEALTH_MAX_GAP_MIN", 45),
+      hold: (await getJSON("cipher_operator_hold", {})) || {} });
     await setJSON(HEALTH_KEY, h);
     console.log(`HEALTH: ${h.status} — ${h.positions} position(s), ${h.stops} stop(s), ${h.targets} target(s)` +
+      (h.operatorLegs ? ` (${h.operatorLegs} operator)` : "") +
       (h.gapMin != null ? `, ${h.gapMin} min since last run` : "") + (h.problems.length ? ` · ${h.problems.join(" · ")}` : ""));
     // Into the decision log only when it is not OK or it has just changed, so the 300-line ring
     // is not filled with "OK" every fifteen minutes.
@@ -5842,6 +6042,42 @@ export default async function cipherAgent() {
   // whole point: a weekly BTC long must not block a 4H BTC trade in the fast book.
   const held = new Set();
   for (const [k, set] of heldDir) if (set.size) held.add(k);
+
+  // ── OPERATOR CLOSES, FOUND BEFORE ANYTHING CAN REOPEN THEM (2026-10-27) ─────────────────────
+  // A position the operator closed must not be reopened or re-adopted for one cycle. Entries are
+  // decided BEFORE the resolution pass, so the check has to happen here, on what vanished since
+  // last run: its order history (gray clOrdID), or an operator stop/target it was resting on.
+  const OP_HOLD_KEY = "cipher_operator_hold";
+  const opHold = (await getJSON(OP_HOLD_KEY, {})) || {};
+  for (const k of Object.keys(opHold)) if (!(opHold[k] > Date.now())) delete opHold[k];
+  const operatorCloses = {};
+  if (canSeeBook && CFG.direct()) {
+    const liveKeys = new Set(positions.map(p => {
+      const c = String(p.symbol || "").replace(/USDT$/, "").toUpperCase();
+      let d = String(p.posSide || p.side || "").toLowerCase();
+      if (d !== "long" && d !== "short") d = Number(p.size) < 0 ? "short" : "long";
+      return posKey(c, d);
+    }));
+    const protectNow = (await getJSON(PROTECT_KEY, {})) || {};
+    const vanished = Object.keys(prevOpen || {}).filter(k => prevOpen[k] && prevOpen[k].size > 0 && !liveKeys.has(k))
+      .slice(0, num("OPERATOR_LOOKUPS_PER_RUN", 6));
+    for (const k of vanished) {
+      const was = prevOpen[k];
+      const rk = regKeyFor(k, was.since, protectNow);
+      const reg = rk ? protectNow[rk] : null;
+      const restedOnOperator = !!(reg && ((reg.stop && reg.stop.source === "operator") || (reg.target && reg.target.source === "operator")));
+      let op = null;
+      try { op = await fetchOperatorClose(`${was.coin}USDT`, was.dir === "short" ? "Short" : "Long", Number(was.since) || 0); } catch { }
+      if (!op && !restedOnOperator) continue;
+      opHold[k] = Date.now() + num("OPERATOR_HOLD_MIN", 20) * 6e4;
+      if (op) operatorCloses[k] = op;
+      await pushLog({ coin: was.coin, dir: was.dir, result: `OPERATOR: ${was.coin} close seen`, operator: true,
+        skipped: op ? `the operator closed ${was.coin} ${was.dir} (${op.clOrdID.slice(0, 24)}${op.px ? " at " + formatPrice(op.px) : ""}). Recorded closedBy operator, not counted. ${was.coin} ${was.dir} is left alone for ${num("OPERATOR_HOLD_MIN", 20)} min — no new entry, no adoption.`
+                    : `${was.coin} ${was.dir} is gone and was resting on an operator stop/target — treated as the operator's exit until its fill says otherwise. Left alone for ${num("OPERATOR_HOLD_MIN", 20)} min.` });
+    }
+    await setJSON(OP_HOLD_KEY, opHold);
+  }
+  const operatorHeld = (coin, dir) => (opHold[posKey(coin, dir)] || 0) > Date.now();
 
   const opposes = (book, coin, dir) => {
     const other = dir === "long" ? "short" : "long";
@@ -6081,6 +6317,7 @@ export default async function cipherAgent() {
     const key = `${coin}|${sig.bias}|${day}`;
     if (fired[key]) continue;
     if ((attempts[key] || 0) >= CFG.maxAttempts()) { await pushLog({ coin, dir: sig.bias, score: sig.score, skipped: `attempt cap — ${attempts[key]} failed sends today, resting until tomorrow` }); continue; }
+    if (operatorHeld(coin, sig.bias)) { await pushLog({ coin, dir: sig.bias, score: sig.score, skipped: `OPERATOR HOLD — the operator closed ${coin} ${sig.bias} in the last ${num("OPERATOR_HOLD_MIN", 20)} min; not reopening it this cycle` }); continue; }
     const book = bookFor(sig.planTf || "1D");
     const bcfg = BOOK_CFG[book];
     if (!canSeeBook) { await pushLog({ coin, dir: sig.bias, book, score: sig.score, skipped: "REFUSED — cannot read open positions, so cannot check for an opposing leg" }); continue; }
@@ -6468,6 +6705,7 @@ export default async function cipherAgent() {
   } catch (e) { console.error("shadow pass failed (harmless, no orders involved):", e && e.message); }
 
   // ── Resolutions → the reverse look ─────────────────────────────────────────────────────────
+  await relabelLedgerOnce();
   try {
     const nowOpen = snapshotOpen(positions, bookMap, prevOpen);
     // ── SAME KEY, DIFFERENT TRADE (audit 2026-10-26) ──────────────────────────────────────────
@@ -6497,7 +6735,7 @@ export default async function cipherAgent() {
       nowOpen[k].book = o.book;
     }
     // Anything held with no plan gets adopted — see adoptOrphans. Bookkeeping only, no orders.
-    const adopted = await adoptOrphans(nowOpen, bookMap);
+    const adopted = await adoptOrphans(nowOpen, bookMap, k => (opHold[k] || 0) > Date.now());
     if (adopted.length) console.log(`adopted ${adopted.length} plan-less position(s): ${adopted.map(p => p.coin + " " + p.dir).join(", ")} — plan and book attached, no orders placed`);
     // ── THEN MAKE SURE WHAT HAS A PLAN ACTUALLY HAS A STOP AT THE VENUE (2026-09-02) ────────────
     // Runs right after adoption so a position just given a plan this run (like SOL) gets checked
@@ -6621,6 +6859,14 @@ export default async function cipherAgent() {
           why: `${r.why || ""} — no closing fill at the venue after ${tries} lookup(s); this range verdict is information only and NOT counted`.trim() };
     for (const w of work) {
       const r = w.r;
+      const opk = posKey(r.coin, r.dir);
+      if (w.fresh && operatorCloses[opk]) {
+        const op = operatorCloses[opk];
+        const p = r.plan, risk = p ? Math.abs(p.entry - p.stop) : 0;
+        const realR = risk > 0 && op.px > 0 ? +(((r.dir !== "short" ? op.px - p.entry : p.entry - op.px)) / risk).toFixed(3) : undefined;
+        done.push({ ...r, ...operatorResolution({ ...op, px: op.px }, realR), exit: op.px || r.exit });
+        continue;
+      }
       if (!r.plan) { done.push(r); continue; }
       if (fillLookups >= lookupCap) { stillPending.push(w); continue; }     // not tried, so not a try
       fillLookups++; w.tries = (w.tries || 0) + 1;
@@ -6636,6 +6882,23 @@ export default async function cipherAgent() {
     for (const w of stillPending) if (w.fresh) delete bookMap[posKey(w.r.coin, w.r.dir)];
     await setJSON(PENDING_KEY, stillPending.slice(-50).map(({ fresh, ...w }) => w));
     const nNew = resolved.length;
+    // An ADOPTED position's entry was never the bot's decision (2026-10-27): recorded in full, but
+    // not counted as a strategy result. The streak still sees it — the breaker fails safe.
+    for (const r of done) if (r.adopted && r.countsForStats) {
+      r.countsForStats = false;
+      r.why = `${r.why || ""} — adopted position (the bot did not choose its entry), so not counted in the stats`.trim();
+    }
+    // An operator close found only now (its fill named it) still earns the hold — from next run.
+    {
+      let held2 = false;
+      for (const r of done) if (r.closedBy === "operator" && !(opHold[posKey(r.coin, r.dir)] > Date.now())) {
+        opHold[posKey(r.coin, r.dir)] = Date.now() + num("OPERATOR_HOLD_MIN", 20) * 6e4; held2 = true;
+        if (!operatorCloses[posKey(r.coin, r.dir)])
+          await pushLog({ coin: r.coin, dir: r.dir, result: `OPERATOR: ${r.coin} close seen`, operator: true,
+            skipped: `its closing fill was an operator order. Recorded closedBy operator, not counted; left alone for ${num("OPERATOR_HOLD_MIN", 20)} min.` });
+      }
+      if (held2) await setJSON(OP_HOLD_KEY, opHold);
+    }
     resolved.length = 0; resolved.push(...done);
     // Take each ended position's recorded stop and target off the venue, so neither can fire on
     // the next position opened on the same coin and side.
@@ -6659,9 +6922,10 @@ export default async function cipherAgent() {
         entry: r.plan && Number.isFinite(r.plan.entry) ? r.plan.entry : undefined,
         exit: Number.isFinite(r.exit) ? r.exit : undefined,
         countsForStats: !!r.countsForStats, countsForStreak: !!r.countsForStreak,
-        result: r.klass === "execution_artifact" ? "RESOLVED (not counted)" : "RESOLVED",
+        result: r.closedBy === "operator" ? "RESOLVED (operator, not counted)" : r.klass === "execution_artifact" ? "RESOLVED (not counted)" : "RESOLVED",
         skipped: `${line} — ${r.why}` +
-          (r.klass === "execution_artifact"
+          (r.closedBy === "operator" ? " Not counted toward the loss streak or the strategy's record."
+          : r.klass === "execution_artifact"
             ? " This is an EXECUTION ARTIFACT: it does not count toward the loss streak or the strategy's record."
             : r.how === "target" ? " Target hit, queued for a reverse look." : "") });
       await pushLedger({ kind: "resolved", coin: r.coin, dir: r.dir, book: r.book || undefined,

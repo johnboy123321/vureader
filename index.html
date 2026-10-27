@@ -3090,7 +3090,7 @@ function closeQROutside(e) {
 // so we chased caches, GitHub, Netlify and his filesystem while the copy in front of him was
 // already current. A version number that is written down twice will eventually disagree with
 // itself, and the wrong one is always the one someone reads. Derived from APP_BUILD now, once.
-const APP_BUILD = 'v4.6 · 24 Aug 2026 · a dot-flip timeframe no longer un-arms itself when its candles fail to arrive (a failed fetch was being handled as though you had switched it off), and the timeframe chips now stay lit on what you ASKED for — amber until the bot confirms it, blue once it is really trading; the tool menu now paints over the right-hand cards instead of under them (the header has a backdrop-filter, which quietly trapped the menu inside its own stacking context), and the dock numbers are no longer the browser default black-on-black — a <button> does not inherit colour; accumulator and bot trades are now a permanent bottom dock on desktop rather than panels you have to open — same numbers as the panels behind them, from the same tallyLog call, so the two cannot disagree; second accumulator books can be run measure-only on other coins from the accumulator panel; and a resolution now records WHICH market graded it, because the bot trades on Phemex and was being graded against Binance'
+const APP_BUILD = 'v4.7 · 27 Oct 2026 · Jarvis HUD: a voice orb at the centre with every feature on a turning ring around it (Classic switches back); the brain has a voice (ElevenLabs, or the browser voice) and hears you through the mic button; operator commands by voice or text — close, part-close, move stop, set target, cancel, status — each repeated back and sent only on a yes, then checked against the exchange; earlier: a dot-flip timeframe no longer un-arms itself when its candles fail to arrive (a failed fetch was being handled as though you had switched it off), and the timeframe chips now stay lit on what you ASKED for — amber until the bot confirms it, blue once it is really trading; the tool menu now paints over the right-hand cards instead of under them (the header has a backdrop-filter, which quietly trapped the menu inside its own stacking context), and the dock numbers are no longer the browser default black-on-black — a <button> does not inherit colour; accumulator and bot trades are now a permanent bottom dock on desktop rather than panels you have to open — same numbers as the panels behind them, from the same tallyLog call, so the two cannot disagree; second accumulator books can be run measure-only on other coins from the accumulator panel; and a resolution now records WHICH market graded it, because the bot trades on Phemex and was being graded against Binance'
 // ── STALE PAGE GUARD (2026-08-21) ────────────────────────────────────────────────────────────
 // GitHub Pages sets a cache header on index.html, and a phone with this saved to its home screen
 // will hold that copy for days. On 2026-08-21 John reported two bugs — "sells 0 / buy-backs 0"
@@ -11113,5 +11113,745 @@ document.addEventListener('click', function(e){
   if(document.readyState==='loading') document.addEventListener('DOMContentLoaded',renderPill); else renderPill();
 })();
 </script>
+<!-- ══ VOICE + OPERATOR (2026-10-27) ══════════════════════════════════════════════════════════
+     The brain gets a voice (ElevenLabs, browser voice as fallback) and you can talk to it: tap the
+     mic, speak, and what you said goes in as a chat message, so every chat command works by voice.
+     On top of that, operator commands act on the testnet account through the relay:
+       "close APT" · "close half of ATOM" · "move UNI's stop to 7.20" · "set ETH target to 2650"
+       "cancel SOL's target" · "how much is ETH in" · "what am I in"
+     Anything that changes a position is repeated back first and only done on a yes. Afterwards the
+     exchange is re-read and THAT is what you are told. Orders carry clOrdID "gray…", which the bot
+     treats as operator decisions (never cancelled, stacked on or reset; closes not counted). -->
+<style>
+#mic-btn.rec { background: var(--accent); color:#fff; }
+#mic-btn.busy { opacity:.55; }
+#spk-btn.on { color: var(--accent); }
+.op-card { margin-top:8px; }
+.op-card button { margin-right:8px; padding:6px 16px; border-radius:9px; border:1px solid rgba(233,230,222,.25); background:transparent; color:inherit; font-weight:700; cursor:pointer; }
+.op-card button.go { background: var(--accent); border-color: var(--accent); color:#fff; }
+</style>
+<script>
+(function(){
+  const LSG = (k, d) => { try { const v = localStorage.getItem(k); return v == null ? d : v; } catch { return d; } };
+  const LSS = (k, v) => { try { if (v === '' || v == null) localStorage.removeItem(k); else localStorage.setItem(k, v); } catch {} };
+  const K = { key:'mc_eleven_key', voice:'mc_eleven_voice', on:'mc_voice_on', log:'mc_operator_log' };
+  const DEFAULT_VOICE = 'JBFqnCBsd6RMkjVDRZzb';
+  const relayUrl = () => String(LSG('mc_exec_url','')).replace(/\/+$/,'');
+  const relayTok = () => LSG('mc_exec_token','');
+  const ICON_MIC = '<svg class="lic" style="width:17px;height:17px;" viewBox="0 0 24 24"><rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5 11a7 7 0 0 0 14 0M12 18v3"/></svg>';
+  const ICON_SPK = '<svg class="lic" style="width:17px;height:17px;" viewBox="0 0 24 24"><path d="M11 5L6 9H3v6h3l5 4z"/><path d="M15.5 8.5a5 5 0 0 1 0 7M18.5 5.5a9 9 0 0 1 0 13"/></svg>';
+  const _addAIMsg = window.addAIMsg;
+  const post = (t) => { try { window.addAIMsg(t); } catch {} };   // the outermost wrapper, so the HUD caption sees it too
+
+  // ═══ SPEAKING ═══════════════════════════════════════════════════════════════════════════════
+  // One <audio> element, unlocked on the first tap: iOS only lets an element a tap has already
+  // played play again later (after an async fetch) without another tap.
+  const player = new Audio(); player.preload = 'auto';
+  let unlocked = false;
+  const SILENT = 'data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YQAAAAA=';
+  function unlockAudio(){
+    if (unlocked) return; unlocked = true;
+    try { player.src = SILENT; player.play().catch(()=>{}); } catch {}
+    try { if (window.speechSynthesis) speechSynthesis.speak(new SpeechSynthesisUtterance('')); } catch {}
+  }
+  // Markdown and URLs read badly; cap what is spoken (the full text stays on screen).
+  function speakable(text){
+    let t = String(text || '')
+      .replace(/```[\s\S]*?```/g, ' ')
+      .replace(/https?:\/\/\S+/g, ' ')
+      .replace(/[*_#>`|]/g, ' ')
+      .replace(/\s+/g, ' ').trim();
+    const max = Number(LSG('mc_voice_max', '1400')) || 1400;
+    if (t.length > max) { const cut = t.slice(0, max); const end = Math.max(cut.lastIndexOf('. '), cut.lastIndexOf('? ')); t = (end > max * 0.5 ? cut.slice(0, end + 1) : cut) + ' The rest is on screen.'; }
+    return t;
+  }
+  let speakQ = Promise.resolve();
+  function speak(text){
+    const t = speakable(text); if (!t) return Promise.resolve();
+    speakQ = speakQ.then(() => speakNow(t)).catch(() => {});
+    return speakQ;
+  }
+  const VS = { speaking:false, engine:'', micLevel:0 };   // read by the Jarvis orb
+  async function speakNow(t){
+    VS.speaking = true;
+    try { await speakNow2(t); } finally { VS.speaking = false; }
+  }
+  async function speakNow2(t){
+    const key = LSG(K.key, '');
+    if (key) {
+      try {
+        const vid = LSG(K.voice, '') || DEFAULT_VOICE;
+        const r = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${encodeURIComponent(vid)}?output_format=mp3_44100_128`, {
+          method:'POST', headers:{ 'xi-api-key': key, 'Content-Type':'application/json', 'Accept':'audio/mpeg' },
+          body: JSON.stringify({ text: t, model_id: LSG('mc_eleven_model','eleven_flash_v2_5') }) });
+        if (!r.ok) throw new Error('ElevenLabs ' + r.status + ' ' + (await r.text()).slice(0, 120));
+        const url = URL.createObjectURL(await r.blob()); VS.engine = 'eleven';
+        await new Promise((res) => { player.onended = res; player.onerror = res; player.src = url; player.play().catch(res); });
+        URL.revokeObjectURL(url);
+        return;
+      } catch (e) { console.warn('ElevenLabs voice failed, using the browser voice:', e && e.message); }
+    }
+    if (!window.speechSynthesis) return;
+    VS.engine = 'browser';
+    await new Promise((res) => { const u = new SpeechSynthesisUtterance(t); u.lang = 'en-GB'; u.onend = res; u.onerror = res; speechSynthesis.speak(u); });
+  }
+  function stopSpeaking(){ try { player.pause(); } catch {} try { speechSynthesis.cancel(); } catch {} speakQ = Promise.resolve(); }
+
+  // Speak the reply to YOUR message, not the brain's background posts (it posts constantly).
+  let armUntil = 0;
+  const voiceOn = () => LSG(K.on, '0') === '1';
+  window.addAIMsg = function(text){
+    const r = _addAIMsg.apply(this, arguments);
+    if (Date.now() < armUntil) { armUntil = 0; speak(text); }
+    return r;
+  };
+
+  // ═══ LISTENING ══════════════════════════════════════════════════════════════════════════════
+  // ElevenLabs speech-to-text when a key is set (works inside the home-screen app), the browser's
+  // own recogniser otherwise. Stops by itself after ~1.3 s of quiet once you have spoken.
+  let rec = null, recStream = null, chunks = [], recState = 'idle', srObj = null;
+  function setMic(state){ recState = state; const b = document.getElementById('mic-btn'); if (!b) return; b.classList.toggle('rec', state === 'rec'); b.classList.toggle('busy', state === 'busy'); b.title = state === 'rec' ? 'Listening — tap to stop' : 'Talk (tap, speak, it stops when you do)'; }
+  async function toggleMic(){
+    unlockAudio(); stopSpeaking();
+    if (recState === 'rec') { stopRec(); return; }
+    if (recState === 'busy') return;
+    if (LSG(K.key,'') && navigator.mediaDevices && window.MediaRecorder) return startEleven();
+    return startBrowserSR();
+  }
+  async function startEleven(){
+    try { recStream = await navigator.mediaDevices.getUserMedia({ audio: true }); }
+    catch (e) { post('Could not use the microphone: ' + (e && e.message || e)); return; }
+    chunks = [];
+    const type = ['audio/webm;codecs=opus','audio/webm','audio/mp4','audio/ogg'].find(t => MediaRecorder.isTypeSupported && MediaRecorder.isTypeSupported(t)) || '';
+    rec = new MediaRecorder(recStream, type ? { mimeType: type } : undefined);
+    rec.ondataavailable = (e) => { if (e.data && e.data.size) chunks.push(e.data); };
+    rec.onstop = onElevenStop;
+    rec.start(250); setMic('rec');
+    watchSilence(recStream);
+  }
+  function watchSilence(stream){
+    let ctx; try { ctx = new (window.AudioContext || window.webkitAudioContext)(); } catch { return; }
+    const src = ctx.createMediaStreamSource(stream), an = ctx.createAnalyser(); an.fftSize = 1024; src.connect(an);
+    const buf = new Uint8Array(an.fftSize); let spoke = false, quietSince = 0; const started = Date.now();
+    const tick = () => {
+      if (recState !== 'rec') { try { ctx.close(); } catch {} return; }
+      an.getByteTimeDomainData(buf); let peak = 0; for (const v of buf) peak = Math.max(peak, Math.abs(v - 128));
+      const now = Date.now();
+      VS.micLevel = Math.min(1, peak / 90);
+      if (peak > 14) { spoke = true; quietSince = 0; } else if (spoke) { quietSince = quietSince || now; if (now - quietSince > 1300) return stopRec(); }
+      if (!spoke && now - started > 7000) return stopRec();      // nothing said
+      if (now - started > 30000) return stopRec();                // hard cap
+      requestAnimationFrame(tick);
+    };
+    requestAnimationFrame(tick);
+  }
+  function stopRec(){ try { if (rec && rec.state !== 'inactive') rec.stop(); } catch {} try { if (srObj) srObj.stop(); } catch {} }
+  async function onElevenStop(){
+    try { recStream && recStream.getTracks().forEach(t => t.stop()); } catch {}
+    setMic('busy');
+    const blob = new Blob(chunks, { type: (rec && rec.mimeType) || 'audio/webm' });
+    if (blob.size < 2000) { setMic('idle'); return; }
+    try {
+      const fd = new FormData();
+      fd.append('file', blob, 'speech.' + ((blob.type.split('/')[1] || 'webm').split(';')[0]));
+      fd.append('model_id', 'scribe_v1');
+      fd.append('language_code', 'en');
+      const r = await fetch('https://api.elevenlabs.io/v1/speech-to-text', { method:'POST', headers:{ 'xi-api-key': LSG(K.key,'') }, body: fd });
+      if (!r.ok) throw new Error('ElevenLabs ' + r.status + ' ' + (await r.text()).slice(0, 140));
+      const d = await r.json();
+      heard(String(d.text || '').trim());
+    } catch (e) { post('Could not transcribe that: ' + (e && e.message || e)); }
+    setMic('idle');
+  }
+  function startBrowserSR(){
+    const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (!SR) { post('Voice input needs an ElevenLabs key (Settings, Voice) on this device — the browser has no speech recogniser here.'); return; }
+    srObj = new SR(); srObj.lang = 'en-GB'; srObj.interimResults = false; srObj.maxAlternatives = 1;
+    srObj.onresult = (e) => { const t = e.results && e.results[0] && e.results[0][0] && e.results[0][0].transcript; if (t) heard(t.trim()); };
+    srObj.onerror = (e) => { if (e.error !== 'no-speech' && e.error !== 'aborted') post('Voice input error: ' + e.error); };
+    srObj.onend = () => { setMic('idle'); srObj = null; };
+    try { srObj.start(); setMic('rec'); } catch (e) { setMic('idle'); }
+  }
+  let lastHeard = '', viaVoice = false;
+  function heard(text){
+    text = cleanSpeech(text);
+    if (!text) return;
+    lastHeard = text; viaVoice = true;
+    const input = document.getElementById('txt'); if (!input) return;
+    input.value = text; try { grow(input); } catch {}
+    window.send();
+  }
+  // Speech-to-text mostly writes "seven point two" as "7.2", but not always.
+  function cleanSpeech(t){
+    return String(t || '').replace(/[“”"]/g, '').replace(/(\d)\s+point\s+(\d)/gi, '$1.$2').replace(/(\d)\s*\.\s*(\d)/g, '$1.$2').replace(/[.!?]+$/, '').trim();
+  }
+
+  // ═══ OPERATOR COMMANDS ══════════════════════════════════════════════════════════════════════
+  const NAMES = { BITCOIN:'BTC', ETHEREUM:'ETH', ETHER:'ETH', SOLANA:'SOL', RIPPLE:'XRP', CARDANO:'ADA', DOGECOIN:'DOGE',
+    CHAINLINK:'LINK', AVALANCHE:'AVAX', POLKADOT:'DOT', LITECOIN:'LTC', UNISWAP:'UNI', COSMOS:'ATOM', APTOS:'APT', ARBITRUM:'ARB',
+    OPTIMISM:'OP', TRON:'TRX', FILECOIN:'FIL', INJECTIVE:'INJ', POLYGON:'POL', TONCOIN:'TON', BINANCE:'BNB', SWEET:'SUI', SUEY:'SUI', ATOMS:'ATOM', ADDER:'ADA' };
+  async function readPositions(){
+    const url = relayUrl(); if (!url) throw new Error('No relay URL — set it in the bot panel first.');
+    const pr = await (await fetch(url + '/positions', { headers:{ Authorization:'Bearer ' + relayTok() } })).json();
+    const rows = pr && pr.data && pr.data.data && pr.data.data.positions;
+    if (!Array.isArray(rows)) throw new Error('Could not read positions from the exchange.');
+    return rows.filter(p => Math.abs(Number(p.size) || 0) > 0).map(p => ({
+      symbol: String(p.symbol), coin: String(p.symbol).replace(/USDT$/, ''), posSide: String(p.posSide || p.side),
+      size: Math.abs(Number(p.size)), sizeStr: String(p.size).replace('-', ''), mark: Number(p.markPriceRp || 0), entry: Number(p.avgEntryPriceRp || 0),
+      pnl: Number(p.unRealisedPnlRv ?? p.unrealisedPnlRv ?? 0) }));
+  }
+  // Which held coin(s) does the sentence name? Tickers ("APT"), names ("aptos"), spelled ("A P T").
+  function coinsIn(t, open){
+    const up = ' ' + String(t).toUpperCase().replace(/[^A-Z0-9 ]/g, ' ') + ' ';
+    const spaced = up.replace(/\b([A-Z]) (?=[A-Z]\b)/g, '$1');      // "A P T" → "APT"
+    const set = new Set(open.map(p => p.coin));
+    const hits = new Set();
+    for (const s of [up, spaced]) for (const w of s.split(/\s+/)) { if (set.has(w)) hits.add(w); if (NAMES[w] && set.has(NAMES[w])) hits.add(NAMES[w]); }
+    return [...hits];
+  }
+  // PURE. Returns null when the text is not an operator command, so ordinary questions go to the
+  // brain untouched. Commands must START with the verb ("close…", "move…"), so a question that
+  // merely contains "close" ("where will ETH close?") is never mistaken for one.
+  function parseOp(text){
+    const t = String(text).toLowerCase().replace(/[’']/g, "'").replace(/^\s*(please|cipher|hey cipher|ok|okay)[, ]+/, '').trim();
+    const side = /\bshort\b/.test(t) ? 'Short' : /\blong\b/.test(t) ? 'Long' : '';
+    if (/^(what am i in|what's open|what is open|my positions|positions|open positions|how am i doing|how are my positions|position status)\??$/.test(t)) return { action:'statusAll' };
+    const tgt = /\b(target|tp|take profit|take-profit)\b/.test(t), stp = /\bstop( loss)?\b/.test(t);
+    if (/^(cancel|remove|take off|delete|pull) /.test(t) && (tgt || stp)) return { action:'cancel', side, what: tgt && !stp ? 'target' : stp && !tgt ? 'stop' : 'both' };
+    if (/^(close|pull|exit|flatten|get out of|bail out of|bail on|kill)\b/.test(t) && !stp && !tgt) {
+      let part = 'all';
+      if (/\bhalf\b/.test(t)) part = 'half';
+      else { const pc = t.match(/(\d+(?:\.\d+)?)\s*(%|percent|per cent)/); if (pc) part = { pct: Number(pc[1]) }; else { const q = t.match(/^close\s+(\d+(?:\.\d+)?)\b/); if (q) part = { qty: Number(q[1]) }; } }
+      return { action:'close', side, part };
+    }
+    if ((stp || tgt) && (/^(move|set|put|place|change|raise|lower|tighten|trail|drop|bump|update|stop|target|tp)\b/.test(t) || /\b(stop|target|tp)( loss)? (to|at) \$?\d/.test(t))) {
+      const m = t.match(/\b(?:to|at)\s+\$?(\d+(?:\.\d+)?)/) || t.match(/\$?(\d+(?:\.\d+)?)\s*$/);
+      return { action: stp ? 'stop' : 'target', side, px: m ? Number(m[1]) : NaN, pxStr: m ? m[1] : null };
+    }
+    if (/^(how much is|how's|hows|how is|what's|what is|status of|pnl on|p&l on)\b/.test(t) && /\b(in|doing|position|pnl|p&l)\b/.test(t)) return { action:'status', side };
+    return null;
+  }
+  const fmtPx = (v) => { const n = Number(v); if (!(n > 0)) return '?'; return n >= 1000 ? n.toFixed(1) : n >= 1 ? String(+n.toFixed(4)) : String(+n.toPrecision(4)); };
+  const sideWord = (s) => s === 'Short' ? 'short' : 'long';
+  // Round a quantity DOWN to the precision the venue reported the position size in.
+  function qtyRound(q, sizeStr){ const dp = (String(sizeStr).split('.')[1] || '').length; const f = Math.pow(10, dp); return Math.floor(q * f + 1e-9) / f; }
+
+  let pending = null;   // { body, understood, heard, at }
+  function opLogAdd(e){ try { const l = JSON.parse(LSG(K.log, '[]')) || []; l.push({ at: new Date().toISOString(), ...e }); LSS(K.log, JSON.stringify(l.slice(-200))); } catch {} }
+
+  async function handleOperator(text){
+    // A command waiting for yes/no takes the next message.
+    if (pending) {
+      const t = text.toLowerCase().trim();
+      if (Date.now() - pending.at > 90000) { pending = null; }
+      else if (/^(yes|yeah|yep|yup|go|go ahead|do it|confirm|confirmed|ok|okay|sure|send it)\b/.test(t)) { const p = pending; pending = null; await execute(p, text); return true; }
+      else if (/^(no|nope|cancel|stop|don't|dont|abort|wait|leave it)\b/.test(t)) { const p = pending; pending = null; reply('Cancelled — nothing sent.'); opLogAdd({ heard: p.heard, understood: p.understood, confirmed: text }); return true; }
+      else { pending = null; }     // anything else drops it; the message is treated as new
+    }
+    const op = parseOp(text);
+    if (!op) return false;
+    let open;
+    try { open = await readPositions(); } catch (e) { reply(String(e.message || e)); return true; }
+
+    if (op.action === 'statusAll') {
+      if (!open.length) { reply('No open positions on the testnet account.'); return true; }
+      const tot = open.reduce((a, p) => a + p.pnl, 0);
+      const lines = open.sort((a, b) => b.pnl - a.pnl).map(p => `${p.coin} ${sideWord(p.posSide)} ${p.sizeStr}: ${p.pnl >= 0 ? 'up' : 'down'} ${Math.abs(p.pnl).toFixed(2)} USDT (in at ${fmtPx(p.entry)}, now ${fmtPx(p.mark)})`);
+      reply(`**${open.length} open position${open.length > 1 ? 's' : ''}, ${tot >= 0 ? 'up' : 'down'} ${Math.abs(tot).toFixed(2)} USDT in total.**\n` + lines.join('\n'));
+      return true;
+    }
+    const coins = coinsIn(text, open);
+    const cands = open.filter(p => coins.includes(p.coin) && (!op.side || p.posSide === op.side));
+    if (op.action === 'status') {
+      if (!coins.length) return false;          // not about a held coin: the brain's question
+      if (!cands.length) { reply(`Not in ${coins.join(', ')}${op.side ? ' ' + sideWord(op.side) : ''} right now.`); return true; }
+      reply(cands.map(p => `**${p.coin} ${sideWord(p.posSide)}** ${p.sizeStr}: ${p.pnl >= 0 ? 'up' : 'down'} ${Math.abs(p.pnl).toFixed(2)} USDT. In at ${fmtPx(p.entry)}, now ${fmtPx(p.mark)}.`).join('\n'));
+      return true;
+    }
+    if (!coins.length) { reply('Which coin? I did not hear one you hold. Open: ' + (open.map(p => p.coin + ' ' + sideWord(p.posSide)).join(', ') || 'none') + '.'); return true; }
+    if (coins.length > 1) { reply(`That named ${coins.join(' and ')}. One at a time, please.`); return true; }
+    if (!cands.length) { reply(`No open ${coins[0]}${op.side ? ' ' + sideWord(op.side) : ''} position.`); return true; }
+    if (cands.length > 1) { reply(`${coins[0]} is open both long and short. Say which: "${op.action} ${coins[0]} long" or "short".`); return true; }
+    const pos = cands[0];
+    let understood, body;
+    if (op.action === 'close') {
+      let qty = pos.size, label = 'all ' + pos.sizeStr;
+      if (op.part === 'half') { qty = qtyRound(pos.size / 2, pos.sizeStr); label = 'half, ' + qty; }
+      else if (op.part && op.part.pct) { qty = qtyRound(pos.size * Math.min(100, op.part.pct) / 100, pos.sizeStr); label = op.part.pct + '%, ' + qty; }
+      else if (op.part && op.part.qty) { qty = Math.min(op.part.qty, pos.size); label = String(qty); }
+      if (!(qty > 0)) { reply(`That works out to nothing at ${pos.coin}'s size of ${pos.sizeStr}. Say "close all ${pos.coin}" or a bigger part.`); return true; }
+      understood = `Close ${pos.coin} ${sideWord(pos.posSide)}, ${label}, at market.`;
+      body = { action:'close', symbol: pos.symbol, posSide: pos.posSide, qty: qty >= pos.size ? 'all' : qty };
+    } else if (op.action === 'stop' || op.action === 'target') {
+      if (!(op.px > 0)) { reply(`What price for ${pos.coin}'s ${op.action}? Say "move ${pos.coin} ${op.action} to" and the price.`); return true; }
+      const isLong = pos.posSide === 'Long', below = op.px < pos.mark;
+      if (pos.mark > 0 && op.action === 'stop' && (isLong ? !below : below)) { reply(`A ${sideWord(pos.posSide)} stop has to be ${isLong ? 'below' : 'above'} the market (${fmtPx(pos.mark)}). ${fmtPx(op.px)} would fire at once. Say "close ${pos.coin}" if that is what you want.`); return true; }
+      if (pos.mark > 0 && op.action === 'target' && (isLong ? below : !below)) { reply(`A ${sideWord(pos.posSide)} target has to be ${isLong ? 'above' : 'below'} the market (${fmtPx(pos.mark)}).`); return true; }
+      const away = pos.mark > 0 ? Math.abs(op.px - pos.mark) / pos.mark * 100 : null;
+      understood = `${op.action === 'stop' ? 'Stop' : 'Target'} on ${pos.coin} ${sideWord(pos.posSide)} to ${op.pxStr || fmtPx(op.px)}${away != null ? ` (${away.toFixed(1)}% from the market at ${fmtPx(pos.mark)})` : ''}, all ${pos.sizeStr}. The old ${op.action} comes off.`;
+      body = { action: op.action, symbol: pos.symbol, posSide: pos.posSide, px: op.pxStr || String(op.px) };
+    } else {
+      understood = `Cancel the ${op.what === 'both' ? 'stop and target' : op.what} on ${pos.coin} ${sideWord(pos.posSide)}.` + (op.what !== 'target' ? ' It has no stop until the bot puts its plan stop back on its next run.' : '');
+      body = { action:'cancel', symbol: pos.symbol, posSide: pos.posSide, what: op.what };
+    }
+    pending = { body, understood, heard: text, at: Date.now() };
+    askConfirm(understood);
+    return true;
+  }
+  function askConfirm(understood){
+    post(`**${understood}** Go?`);
+    try {
+      const all = document.querySelectorAll('#msgs .msg.ai .bubble'); const last = all[all.length - 1];
+      if (last) { const d = document.createElement('div'); d.className = 'op-card';
+        d.innerHTML = '<button class="go" type="button">Go</button><button class="no" type="button">Cancel</button>';
+        d.querySelector('.go').onclick = () => { d.remove(); confirmFromButton(true); };
+        d.querySelector('.no').onclick = () => { d.remove(); confirmFromButton(false); };
+        last.appendChild(d); }
+    } catch {}
+    const listenAfter = viaVoice;
+    if (voiceOn() || viaVoice) speak(understood + ' Go?').then(() => {
+      // Asked by voice: open the mic for the yes/no, so it stays hands-free.
+      if (listenAfter && pending && recState === 'idle') setTimeout(() => { if (pending && recState === 'idle') toggleMic(); }, 250);
+    });
+  }
+  async function confirmFromButton(yes){
+    if (!pending) { reply('That command expired. Say it again.'); return; }
+    const p = pending; pending = null;
+    if (yes) await execute(p, '(Go button)'); else { reply('Cancelled — nothing sent.'); opLogAdd({ heard: p.heard, understood: p.understood, confirmed: false }); }
+  }
+  async function execute(p, confirmWords){
+    let res = null, data = null;
+    try {
+      res = await fetch(relayUrl() + '/operator', { method:'POST', headers:{ 'Content-Type':'application/json', Authorization:'Bearer ' + relayTok() },
+        body: JSON.stringify({ ...p.body, confirmed: true, heard: p.heard, understood: p.understood }) });
+      data = await res.json().catch(() => ({}));
+    } catch (e) { data = { error: String(e && e.message || e) }; }
+    opLogAdd({ heard: p.heard, understood: p.understood, confirmed: confirmWords, request: p.body, status: res && res.status, reply: data });
+    if (res && res.status === 404 && data && data.error === 'not found') { reply('The relay does not have the operator endpoint yet. Paste the new phemex-relay-valtown.js into Val Town first. Nothing was sent.'); return; }
+    if (data && data.dryRun) { reply('DRY RUN is on at the relay, so nothing was sent. It would have sent: ' + JSON.stringify(data.wouldSend)); return; }
+    const a = data && data.after, coin = p.body.symbol.replace(/USDT$/, ''), sd = sideWord(p.body.posSide);
+    const orders = a && Array.isArray(a.orders) ? a.orders : [];
+    const posLine = !a ? '' : a.position === 'unreadable' ? 'I could not re-read the position to check.' : a.position === 'none' ? `The exchange shows no ${coin} ${sd} now.` : `The exchange shows ${coin} ${sd} still open, size ${a.position.size} (${a.position.pnl >= 0 ? 'up' : 'down'} ${Math.abs(+a.position.pnl).toFixed(2)} USDT).`;
+    if (!res || !res.ok || (data && data.error) || (data && data.ok === false && !data.cancelled)) {
+      reply(`**Not done.** ${(data && (data.error || (data.code != null ? 'Phemex ' + data.code + ': ' + (data.msg || 'rejected') : ''))) || 'No answer from the relay.'} ${posLine}`.trim());
+      return;
+    }
+    let msg;
+    if (p.body.action === 'close') {
+      const gone = a && a.position === 'none';
+      msg = gone ? `**Closed.** ${posLine}` : `**Order accepted.** ${posLine}` + (a && a.position && a.position.size && p.body.qty === 'all' ? ` The market order did not fill all of it (testnet liquidity is thin on some coins). Say "close ${coin}" to try again.` : '');
+    } else if (p.body.action === 'stop' || p.body.action === 'target') {
+      const mine = orders.find(o => /^gray/i.test(o.clOrdID || '') && (p.body.action === 'stop' ? o.stopPx : !o.stopPx));
+      const old = (data.replaced || []).filter(c => c.ok).length;
+      msg = mine ? `**${p.body.action === 'stop' ? 'Stop' : 'Target'} resting at ${fmtPx(mine.stopPx || mine.px)}** on ${coin} ${sd}.${old ? ` ${old} old one${old > 1 ? 's' : ''} taken off.` : ''} The bot will leave it alone.`
+                 : `**Sent, but I cannot see it resting yet.** ${posLine} Ask "how much is ${coin} in" in a moment to check.`;
+    } else {
+      const n = (data.cancelled || []).filter(c => c.ok).length;
+      msg = `**Cancelled ${n} order${n === 1 ? '' : 's'}** on ${coin} ${sd}. ${posLine}`;
+    }
+    reply(msg);
+  }
+  function reply(text){ post(text); if (voiceOn() || viaVoice) speak(text); }
+
+  // ═══ HOOK INTO send() ══════════════════════════════════════════════════════════════════════
+  const _send = window.send;
+  window.send = async function(){
+    const input = document.getElementById('txt');
+    const text = input ? input.value.trim() : '';
+    viaVoice = viaVoice && text === lastHeard;
+    const wasVoice = viaVoice;
+    const noImages = (typeof pendingImages === 'undefined') || !pendingImages.length;
+    if (text && noImages && (pending || parseOp(text))) {
+      addUserMsg(text, []); input.value = ''; try { grow(input); } catch {}
+      try { document.getElementById('prompts').style.display = 'none'; } catch {}
+      let handled = false;
+      try { handled = await handleOperator(text); } catch (e) { reply('Operator error: ' + (e && e.message || e)); handled = true; }
+      if (handled) { viaVoice = false; return; }
+      // Not ours after all (e.g. "how is BTC doing" with no BTC held): hand it to the brain.
+      try { const m = document.querySelectorAll('#msgs .msg'); m[m.length - 1].remove(); } catch {}
+      input.value = text;
+    }
+    if (voiceOn() || wasVoice) armUntil = Date.now() + 180000;
+    viaVoice = false;
+    return _send.apply(this, arguments);
+  };
+
+  // ═══ UI: mic + speaker buttons, settings rows ══════════════════════════════════════════════
+  function mount(){
+    const sendBtn = document.getElementById('send-btn');
+    if (sendBtn && !document.getElementById('mic-btn')) {
+      const spk = document.createElement('button'); spk.className = 'attach-btn'; spk.id = 'spk-btn'; spk.type = 'button'; spk.innerHTML = ICON_SPK;
+      const paint = () => { spk.classList.toggle('on', voiceOn()); spk.title = voiceOn() ? 'Voice replies ON — tap to mute' : 'Voice replies OFF — tap to hear the brain'; };
+      spk.onclick = () => { unlockAudio(); if (voiceOn()) { LSS(K.on, '0'); stopSpeaking(); } else LSS(K.on, '1'); paint(); };
+      paint();
+      const mic = document.createElement('button'); mic.className = 'attach-btn'; mic.id = 'mic-btn'; mic.type = 'button'; mic.innerHTML = ICON_MIC;
+      mic.onclick = toggleMic; setMic('idle');
+      sendBtn.parentNode.insertBefore(spk, sendBtn);
+      sendBtn.parentNode.insertBefore(mic, sendBtn);
+      setMic('idle');
+    }
+    const box = document.querySelector('#settings-panel .settings-box');
+    if (box && !document.getElementById('p-eleven')) {
+      const row = document.createElement('div'); row.className = 's-row';
+      row.innerHTML = `<label>Voice — ElevenLabs key <span style="font-weight:400;text-transform:none;color:var(--dim);">(the brain speaks and hears you)</span></label>
+        <div class="input-wrap"><input type="password" id="p-eleven" placeholder="sk_…" autocorrect="off" autocapitalize="none" autocomplete="off" spellcheck="false"></div>
+        <label style="margin-top:8px;">Voice ID <span style="font-weight:400;text-transform:none;color:var(--dim);">(ElevenLabs, Voices; blank = George)</span></label>
+        <div class="input-wrap"><input type="text" id="p-eleven-voice" placeholder="${DEFAULT_VOICE}" autocorrect="off" autocapitalize="none" spellcheck="false"></div>
+        <div style="font-size:11px;color:var(--dim);margin-top:5px;line-height:1.5;">Without a key the browser's own voice is used. Commands that act on the account ("close APT", "move UNI's stop to 7.20", "set ETH target to 2650", "cancel SOL's target") are always repeated back and only sent on a yes. Saved as you type.</div>
+        <button type="button" id="p-voice-test" class="attach-btn" style="width:auto;padding:0 12px;margin-top:8px;">Test voice</button>`;
+      box.appendChild(row);
+      const k = row.querySelector('#p-eleven'), v = row.querySelector('#p-eleven-voice');
+      k.value = LSG(K.key, ''); v.value = LSG(K.voice, '');
+      k.oninput = () => LSS(K.key, k.value.trim().replace(/\s+/g, ''));
+      v.oninput = () => LSS(K.voice, v.value.trim());
+      row.querySelector('#p-voice-test').onclick = () => { unlockAudio(); speak('Cipher here. Voice is working.'); };
+    }
+  }
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', mount); else mount();
+
+  window.CipherVoice = { player, state: () => ({ speaking: VS.speaking, engine: VS.engine, micLevel: recState === 'rec' ? VS.micLevel : 0,
+      listening: recState === 'rec', transcribing: recState === 'busy', thinking: armUntil > Date.now(), pending: !!pending }),
+    unlockAudio, voiceOn, speak, stopSpeaking, toggleMic, parseOp, coinsIn, handleOperator, log: () => { try { return JSON.parse(LSG(K.log, '[]')); } catch { return []; } } };
+})();
+</script>
+
+<!-- ══ JARVIS VIEW (2026-10-27) ═══════════════════════════════════════════════════════════════
+     A full-screen HUD over the existing app. Centre: the reactor orb, whose wave ring moves with
+     the brain's voice (and with yours while the mic is listening). Around it, every feature as a
+     node on a slowly turning ring; tap one (or say "open accumulator") and it flies to the centre
+     and opens, enlarged. Nothing underneath was removed: every panel is the same panel, re-skinned,
+     and "Classic" (top right) puts the old layout back. -->
+<link href="https://fonts.googleapis.com/css2?family=Rajdhani:wght@500;600;700&display=swap" rel="stylesheet">
+<style>
+body.jarvis {
+  --bg:#0b0420; --surface:#160a36; --raised:#221048; --glass:rgba(139,92,246,.05); --glass-b:rgba(139,92,246,.22);
+  --text:#f3eeff; --muted:rgba(226,214,255,.72); --dim:rgba(196,180,240,.45);
+  --accent:#8b5cf6; --accent-soft:rgba(139,92,246,.14); --accent-border:rgba(139,92,246,.5); --amber:#8b5cf6; --dark-amber:#6d3fd8;
+  --jv:#8b5cf6; --jv2:#5ee7ff; --jvdim:rgba(139,92,246,.35); --jvm:#ff3ea5; --jva:#ffb547;
+  --jvg: linear-gradient(135deg, #5ee7ff 0%, #8b5cf6 50%, #ff3ea5 100%);
+}
+#jv { display:none; position:fixed; inset:0; z-index:46; overflow:hidden; color:#f3eeff;
+  background: radial-gradient(circle at 18% 85%, rgba(255,62,165,.16), transparent 40%), radial-gradient(circle at 85% 12%, rgba(94,231,255,.12), transparent 38%), radial-gradient(ellipse at 50% 45%, #2b0f63 0%, #140838 38%, #05021a 75%, #000 100%);
+  font-family: 'Rajdhani', system-ui, sans-serif; user-select:none; -webkit-user-select:none; }
+body.jarvis #jv { display:block; }
+body.jarvis #desk-dock { display:none !important; }
+body.jarvis #cipherExecPill { display:none !important; }
+#jv .grid { position:absolute; inset:0; opacity:.16; pointer-events:none;
+  background-image: linear-gradient(rgba(139,92,246,.35) 1px, transparent 1px), linear-gradient(90deg, rgba(139,92,246,.35) 1px, transparent 1px);
+  background-size: 46px 46px; mask-image: radial-gradient(circle at 50% 45%, #000 0%, transparent 70%); -webkit-mask-image: radial-gradient(circle at 50% 45%, #000 0%, transparent 70%); }
+#jv .corner { position:absolute; width:46px; height:46px; border:2px solid var(--jv2); opacity:.6; pointer-events:none; }
+#jv .c1 { top:14px; left:14px; border-right:0; border-bottom:0; } #jv .c2 { border-color:var(--jvm); top:14px; right:14px; border-left:0; border-bottom:0; }
+#jv .c3 { bottom:14px; left:14px; border-right:0; border-top:0; border-color:var(--jvm); } #jv .c4 { bottom:14px; right:14px; border-left:0; border-top:0; }
+#jv .hud-top { position:absolute; top:22px; left:70px; right:70px; display:flex; justify-content:space-between; align-items:flex-start; letter-spacing:2px; font-weight:600; font-size:13px; color:var(--jv2); text-transform:uppercase; pointer-events:none; }
+#jv .hud-top b { font-size:20px; letter-spacing:6px; background:var(--jvg); -webkit-background-clip:text; background-clip:text; color:transparent; filter:drop-shadow(0 0 10px rgba(139,92,246,.7)); }
+#jv .hud-top .r { text-align:right; } #jv .hud-top .sub { color:var(--dim); font-size:11px; letter-spacing:1.5px; margin-top:3px; }
+#jv .classic { position:absolute; top:58px; right:70px; pointer-events:auto; background:transparent; color:var(--jv2); border:1px solid var(--jvdim); border-radius:6px; padding:3px 10px; font:600 11px 'Rajdhani',sans-serif; letter-spacing:1.5px; cursor:pointer; }
+#jv .stage { position:absolute; left:50%; top:44%; width:0; height:0; }
+#jv canvas#jv-orb { position:absolute; transform:translate(-50%,-50%); left:0; top:0; cursor:pointer; }
+#jv .orb-label { position:absolute; left:0; top:0; transform:translate(-50%,-50%); text-align:center; pointer-events:none; letter-spacing:5px; font-weight:700; color:#fff; text-shadow:0 0 14px var(--jv); }
+#jv .orb-label small { display:block; letter-spacing:2px; font-size:11px; color:var(--jv2); font-weight:600; margin-top:2px; }
+#jv .node { position:absolute; left:0; top:0; width:116px; transform:translate(-50%,-50%); text-align:center; cursor:pointer; transition: opacity .35s; }
+#jv .node .disc { width:58px; height:58px; margin:0 auto; border-radius:50%; display:flex; align-items:center; justify-content:center;
+  border:1.5px solid transparent; background: radial-gradient(circle, rgba(139,92,246,.28), rgba(20,8,48,.92) 70%) padding-box, var(--jvg) border-box; box-shadow:0 0 16px rgba(139,92,246,.5), inset 0 0 12px rgba(94,231,255,.18); transition: transform .2s, box-shadow .2s; }
+#jv .node svg { width:24px; height:24px; stroke:var(--jv2); fill:none; stroke-width:1.6; stroke-linecap:round; stroke-linejoin:round; }
+#jv .node .nl { margin-top:6px; font-weight:700; font-size:13px; letter-spacing:1.6px; text-transform:uppercase; color:#f3eeff; text-shadow:0 0 8px rgba(139,92,246,.7); }
+#jv .node .ns { font-size:11px; color:var(--jv2); opacity:.8; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; max-width:116px; margin:1px auto 0; font-weight:600; }
+#jv .node:hover .disc { transform:scale(1.15); box-shadow:0 0 28px rgba(255,62,165,.75), inset 0 0 16px rgba(255,62,165,.35); }
+#jv .node:hover svg { stroke:#ffd1ec; }
+#jv .node.fly { transition: transform .45s cubic-bezier(.2,.8,.2,1), opacity .45s; opacity:0; }
+#jv .spoke { position:absolute; left:0; top:0; height:1px; transform-origin:0 0; background: linear-gradient(90deg, rgba(255,62,165,.0), rgba(255,62,165,.25) 40%, rgba(94,231,255,.4)); pointer-events:none; }
+#jv .talk { position:absolute; left:50%; bottom:22px; transform:translateX(-50%); width:min(760px, calc(100vw - 32px)); }
+#jv .caption { max-height:22vh; overflow-y:auto; margin-bottom:10px; padding:10px 14px; font:500 15px/1.45 system-ui, sans-serif; color:#ece4ff; text-align:center;
+  text-shadow:0 0 8px rgba(0,0,0,.8); user-select:text; -webkit-user-select:text; scrollbar-width:thin; }
+#jv .caption .you { color:var(--jva); font-size:13px; letter-spacing:.5px; margin-bottom:4px; opacity:.85; }
+#jv .caption strong { color:#fff; }
+#jv .caption button { font:700 13px 'Rajdhani',sans-serif; letter-spacing:1.5px; margin:8px 6px 0; padding:6px 18px; border-radius:8px; border:1px solid var(--jv); background:transparent; color:#fff; cursor:pointer; }
+#jv .caption button.go { background:var(--jvg); border-color:transparent; color:#fff; text-shadow:0 1px 2px rgba(0,0,0,.4); }
+#jv .bar { display:flex; gap:8px; align-items:center; padding:7px; border:1px solid var(--jvdim); border-radius:16px; background:rgba(14,6,36,.75); box-shadow:0 0 22px rgba(139,92,246,.18); backdrop-filter: blur(6px); }
+#jv .bar input { flex:1; min-width:0; background:transparent; border:0; outline:0; color:#f3eeff; font:500 16px system-ui, sans-serif; padding:8px 6px; }
+#jv .bar input::placeholder { color:rgba(196,180,240,.45); }
+#jv .bar button { width:42px; height:42px; flex:0 0 42px; border-radius:12px; border:1px solid var(--jvdim); background:rgba(139,92,246,.08); color:var(--jv2); display:flex; align-items:center; justify-content:center; cursor:pointer; }
+#jv .bar button svg { width:20px; height:20px; stroke:currentColor; fill:none; stroke-width:1.8; stroke-linecap:round; stroke-linejoin:round; }
+#jv .bar button.on { background:var(--jvg); color:#fff; border-color:transparent; }
+#jv .bar button.rec { background:var(--jvm); color:#fff; border-color:var(--jvm); box-shadow:0 0 18px rgba(255,62,165,.8); }
+#jv-back { display:none; position:fixed; left:16px; bottom:16px; z-index:45; width:46px; height:46px; border-radius:50%; border:1.5px solid #ff3ea5; cursor:pointer;
+  background: radial-gradient(circle, rgba(139,92,246,.45), #140838 70%); box-shadow:0 0 16px rgba(139,92,246,.6); }
+body:not(.jarvis) #jv-back { display:block; }
+/* Panels re-skinned as holo frames, zooming out of the centre. */
+body.jarvis #kb-panel .kb-box, body.jarvis #log-panel .kb-box, body.jarvis #scan-panel .kb-box, body.jarvis #trades-panel .kb-box,
+body.jarvis #macro-panel .kb-box, body.jarvis #lab-panel .kb-box, body.jarvis #bot-panel .kb-box, body.jarvis #help-panel .kb-box,
+body.jarvis #accum-panel-shell > *, body.jarvis .settings-box, body.jarvis #krown-panel .kb-box, body.jarvis #spend-panel .kb-box, body.jarvis #paper-panel .kb-box {
+  border:1px solid rgba(139,92,246,.6) !important; box-shadow:0 0 0 1px rgba(255,62,165,.15), 0 0 44px rgba(139,92,246,.35), 0 0 90px rgba(255,62,165,.10), inset 0 0 40px rgba(94,231,255,.05) !important;
+  background: linear-gradient(180deg, rgba(24,10,58,.96), rgba(10,4,28,.97)) !important; animation: jvZoom .38s cubic-bezier(.2,.8,.2,1); }
+body.jarvis .kb-title, body.jarvis .s-title { font-family:'Rajdhani',sans-serif; letter-spacing:2px; text-transform:uppercase; color:#fff; text-shadow:0 0 10px rgba(139,92,246,.8); }
+@keyframes jvZoom { from { transform: scale(.35); opacity:0; filter: blur(6px); } to { transform: scale(1); opacity:1; filter:none; } }
+@media (max-width: 640px) {
+  #jv .hud-top { left:22px; right:22px; top:18px; font-size:11px; } #jv .hud-top b { font-size:16px; letter-spacing:4px; }
+  #jv .classic { right:22px; top:50px; }
+  #jv .corner { width:28px; height:28px; }
+  #jv .node { width:84px; } #jv .node .disc { width:44px; height:44px; } #jv .node svg { width:19px; height:19px; }
+  #jv .node .nl { font-size:11px; letter-spacing:1px; } #jv .node .ns { display:none; }
+  #jv .caption { font-size:14px; max-height:18vh; }
+}
+</style>
+<div id="jv" aria-label="Cipher">
+  <div class="grid"></div>
+  <div class="corner c1"></div><div class="corner c2"></div><div class="corner c3"></div><div class="corner c4"></div>
+  <div class="hud-top"><div><b>CIPHER</b><div class="sub" id="jv-sys">systems online</div></div><div class="r"><div id="jv-clock">--:--</div><div class="sub" id="jv-date"></div></div></div>
+  <button class="classic" type="button" id="jv-classic">CLASSIC</button>
+  <div class="stage" id="jv-stage">
+    <canvas id="jv-orb"></canvas>
+    <div class="orb-label" id="jv-orb-label">CIPHER<small id="jv-state">ONLINE</small></div>
+  </div>
+  <div class="talk">
+    <div class="caption" id="jv-cap"></div>
+    <div class="bar">
+      <button type="button" id="jv-spk" title="Voice replies"><svg viewBox="0 0 24 24"><path d="M11 5L6 9H3v6h3l5 4z"/><path d="M15.5 8.5a5 5 0 0 1 0 7M18.5 5.5a9 9 0 0 1 0 13"/></svg></button>
+      <input id="jv-in" type="text" placeholder="Talk to Cipher, or type…" autocomplete="off" autocorrect="off" spellcheck="false">
+      <button type="button" id="jv-mic" title="Talk"><svg viewBox="0 0 24 24"><rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5 11a7 7 0 0 0 14 0M12 18v3"/></svg></button>
+      <button type="button" id="jv-send" title="Send"><svg viewBox="0 0 24 24"><path d="M5 12h14M13 6l6 6-6 6"/></svg></button>
+    </div>
+  </div>
+</div>
+<button id="jv-back" type="button" title="Back to the Cipher HUD"></button>
+<script>
+(function(){
+  const $ = (id) => document.getElementById(id);
+  const LSG = (k, d) => { try { const v = localStorage.getItem(k); return v == null ? d : v; } catch { return d; } };
+  const LSS = (k, v) => { try { localStorage.setItem(k, v); } catch {} };
+  const V = () => window.CipherVoice || null;
+  const call = (name) => { try { if (typeof window[name] === 'function') window[name](); } catch (e) { console.warn(name, e); } };
+  const I = {
+    bot:'<path d="M4 17l5-5 4 4 7-8"/><path d="M15 8h5v5"/>',
+    accum:'<circle cx="12" cy="12" r="8"/><path d="M12 7v10M9 9.5h4.5a2 2 0 0 1 0 4H9"/>',
+    scan:'<circle cx="11" cy="11" r="6"/><path d="M20 20l-4.5-4.5"/>',
+    alerts:'<path d="M18 8a6 6 0 0 0-12 0c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.7 21a2 2 0 0 1-3.4 0"/>',
+    pos:'<rect x="3" y="5" width="18" height="14" rx="2"/><path d="M3 10h18M8 15h3"/>',
+    log:'<path d="M4 4h16v16H4z"/><path d="M8 9h8M8 13h8M8 17h5"/>',
+    kb:'<path d="M4 5a2 2 0 0 1 2-2h12v18H6a2 2 0 0 1-2-2z"/><path d="M8 7h6"/>',
+    macro:'<rect x="3" y="4" width="18" height="17" rx="2"/><path d="M3 9h18M8 2v4M16 2v4"/>',
+    lab:'<path d="M9 3h6M10 3v6L5 19a1.5 1.5 0 0 0 1.3 2h11.4A1.5 1.5 0 0 0 19 19l-5-10V3"/>',
+    chat:'<path d="M4 5h16v11H9l-5 4z"/>',
+    settings:'<circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/>',
+  };
+  // Every feature, the panel it opens, and the words that call it by voice.
+  const NODES = [
+    { id:'bot', label:'Bot trades', icon:I.bot, open:()=>call('toggleBot'), panel:'bot-panel', words:/bot|trades? panel|trading/, sub:()=>dockLine('dock-bot') },
+    { id:'accum', label:'Accumulator', icon:I.accum, open:()=>call('toggleAccum'), panel:'accum-panel-shell', words:/accum/, sub:()=>dockLine('dock-accum') },
+    { id:'pos', label:'Positions', icon:I.pos, open:()=>ask('what am I in'), words:/position/ },
+    { id:'scan', label:'Scanner', icon:I.scan, open:()=>call('toggleScan'), panel:'scan-panel', words:/scan|setups?/ },
+    { id:'alerts', label:'Alerts', icon:I.alerts, open:()=>call('toggleTrades'), panel:'trades-panel', words:/alert|watch ?list|pending/ },
+    { id:'log', label:'Chart log', icon:I.log, open:()=>call('toggleLog'), panel:'log-panel', words:/chart log|log|history/ },
+    { id:'macro', label:'Macro', icon:I.macro, open:()=>call('toggleMacro'), panel:'macro-panel', words:/macro|calendar|economic/ },
+    { id:'lab', label:'Discovery lab', icon:I.lab, open:()=>call('toggleLab'), panel:'lab-panel', words:/lab|discover/ },
+    { id:'kb', label:'Knowledge', icon:I.kb, open:()=>call('toggleKB'), panel:'kb-panel', words:/knowledge|kb|brain/ },
+    { id:'chat', label:'Transcript', icon:I.chat, open:()=>setJarvis(false), words:/transcript|chat|conversation|classic/ },
+    { id:'settings', label:'Settings', icon:I.settings, open:()=>call('toggleSettings'), panel:'settings-panel', words:/settings?|setup/ },
+  ];
+  function dockLine(id){ const el = $(id); if (!el) return ''; const r = el.querySelector('.dock-row'); return r ? r.innerText.replace(/\s+/g, ' ').trim().slice(0, 40) : ''; }
+
+  // ── build nodes ──
+  const stage = $('jv-stage');
+  for (const n of NODES) {
+    const sp = document.createElement('div'); sp.className = 'spoke'; stage.appendChild(sp); n.spoke = sp;
+    const el = document.createElement('div'); el.className = 'node'; el.title = n.label;
+    el.innerHTML = `<div class="disc"><svg viewBox="0 0 24 24">${n.icon}</svg></div><div class="nl">${n.label}</div><div class="ns"></div>`;
+    el.onclick = (e) => { e.stopPropagation(); select(n); };
+    stage.appendChild(el); n.el = el;
+  }
+
+  // ── orbit ──
+  let angle = -Math.PI / 2, paused = false, last = performance.now(), R = 260, orbR = 120;
+  function layout(){
+    const w = innerWidth, h = innerHeight, small = w < 640;
+    // The orbit sits between the HUD title and the talk bar, and never off-screen.
+    const avail = Math.min(w / 2 - (small ? 46 : 80), h * (small ? 0.30 : 0.33));
+    R = Math.max(110, avail);
+    orbR = Math.max(62, Math.min(R * 0.46, 150));
+    const c = $('jv-orb'), size = orbR * 2 + 120, dpr = Math.min(2, devicePixelRatio || 1);
+    c.width = size * dpr; c.height = size * dpr; c.style.width = size + 'px'; c.style.height = size + 'px';
+    c.getContext('2d').setTransform(dpr, 0, 0, dpr, 0, 0);
+    $('jv-orb-label').style.fontSize = Math.max(14, orbR * 0.2) + 'px';
+  }
+  addEventListener('resize', layout);
+  stage.addEventListener('mouseover', (e) => { if (e.target.closest('.node')) paused = true; });
+  stage.addEventListener('mouseout', (e) => { if (e.target.closest('.node')) paused = false; });
+  function placeNodes(dt){
+    if (!paused && !flying) angle += dt * 0.00006;
+    const ry = R * (innerWidth < 640 ? 1.05 : 0.82);    // a flatter ellipse on wide screens
+    NODES.forEach((n, i) => {
+      if (n.flying) return;
+      const a = angle + i * (Math.PI * 2 / NODES.length);
+      const x = Math.cos(a) * R * (innerWidth < 640 ? 0.98 : 1.25), y = Math.sin(a) * ry;
+      n.el.style.transform = `translate(calc(-50% + ${x}px), calc(-50% + ${y}px))`;
+      const d = Math.hypot(x, y), r0 = orbR + 18, len = Math.max(0, d - r0 - 34);
+      n.spoke.style.width = len + 'px';
+      n.spoke.style.transform = `rotate(${Math.atan2(y, x)}rad) translateX(${r0}px)`;
+    });
+  }
+
+  // ── select: fly to the centre, then open ──
+  let flying = false, openNode = null;
+  function select(n){
+    if (flying) return;
+    try { V() && V().unlockAudio(); } catch {}
+    flying = true; n.flying = true;
+    n.el.classList.add('fly'); n.el.style.transform = 'translate(-50%,-50%) scale(2.4)';
+    setTimeout(() => {
+      n.open(); openNode = n.panel ? n : null;
+      n.el.classList.remove('fly'); n.flying = false; flying = false;
+    }, 420);
+  }
+  // Is any feature panel open? Then the HUD steps back (the panel sits above it).
+  function panelOpen(){ return NODES.some(n => n.panel && $(n.panel) && $(n.panel).classList.contains('show')); }
+  function closePanels(){ for (const n of NODES) if (n.panel && $(n.panel) && $(n.panel).classList.contains('show')) n.open(); }
+
+  // ── the orb ──
+  const ctx = $('jv-orb').getContext('2d');
+  let level = 0, ac = null, an = null, buf = null, wired = false;
+  function wireAnalyser(){
+    // Route the ElevenLabs <audio> through an analyser so the ring moves with the actual voice.
+    // Only once the AudioContext is RUNNING: a suspended context would silence the voice.
+    if (wired || !V() || !V().player) return;
+    try {
+      ac = ac || new (window.AudioContext || window.webkitAudioContext)();
+      if (ac.state !== 'running') { ac.resume().catch(()=>{}); return; }
+      const src = ac.createMediaElementSource(V().player);
+      an = ac.createAnalyser(); an.fftSize = 512; buf = new Uint8Array(an.fftSize);
+      src.connect(an); an.connect(ac.destination); wired = true;
+    } catch (e) { wired = true; an = null; }
+  }
+  document.addEventListener('pointerdown', wireAnalyser, { capture:true });
+  const wave = new Float32Array(96);
+  function draw(t){
+    const st = V() ? V().state() : {};
+    let target = 0;
+    if (st.speaking) {
+      if (an && st.engine === 'eleven') { an.getByteTimeDomainData(buf); let pk = 0; for (const v of buf) pk = Math.max(pk, Math.abs(v - 128)); target = Math.min(1, pk / 70); }
+      else target = 0.35 + 0.35 * Math.abs(Math.sin(t / 110)) * Math.abs(Math.sin(t / 47));   // browser voice: no samples to read
+    } else if (st.listening) target = st.micLevel || 0.05;
+    level += (target - level) * 0.25;
+    const size = orbR * 2 + 120, c = size / 2;
+    ctx.clearRect(0, 0, size, size);
+    const busy = st.thinking || st.transcribing;
+    const spin = t / (busy ? 900 : 4000);
+    // glow core
+    const g = ctx.createRadialGradient(c, c, 0, c, c, orbR * 0.75);
+    g.addColorStop(0, `rgba(255,190,240,${0.6 + level * 0.4})`); g.addColorStop(0.3, `rgba(255,62,165,${0.35 + level * 0.3})`); g.addColorStop(0.6, 'rgba(139,92,246,.30)'); g.addColorStop(1, 'rgba(139,92,246,0)');
+    ctx.fillStyle = g; ctx.beginPath(); ctx.arc(c, c, orbR * 0.75, 0, Math.PI * 2); ctx.fill();
+    const ring = (r, w, a, dash, rot, col) => { ctx.save(); ctx.translate(c, c); ctx.rotate(rot); ctx.strokeStyle = `rgba(${col || '139,92,246'},${a})`; ctx.lineWidth = w; ctx.setLineDash(dash || []); ctx.beginPath(); ctx.arc(0, 0, r, 0, Math.PI * 2); ctx.stroke(); ctx.restore(); };
+    ring(orbR * 0.42, 2, .9, [], 0);
+    ring(orbR * 0.55, 1, .6, [2, 6], spin * 1.6, '94,231,255');
+    ring(orbR * 0.98, 1.5, .5, [orbR * 0.5, orbR * 0.18], -spin);
+    ring(orbR * 1.12, 3, .35, [4, 14], spin * 0.6, '255,62,165');
+    ring(orbR * 1.28, 1, .3, [1, 5], -spin * 0.3);
+    // segmented arc ticks
+    ctx.save(); ctx.translate(c, c); ctx.rotate(spin * 0.8);
+    for (let i = 0; i < 60; i++) { const a = i / 60 * Math.PI * 2, r1 = orbR * 1.18, r2 = r1 + (i % 5 ? 4 : 9);
+      ctx.strokeStyle = i % 5 ? 'rgba(94,231,255,.4)' : 'rgba(255,181,71,.7)'; ctx.lineWidth = 1; ctx.beginPath(); ctx.moveTo(Math.cos(a) * r1, Math.sin(a) * r1); ctx.lineTo(Math.cos(a) * r2, Math.sin(a) * r2); ctx.stroke(); }
+    ctx.restore();
+    // the voice wave: a ring that ripples with the level
+    const base = orbR * 0.74, N = wave.length;
+    for (let i = 0; i < N; i++) { const n = Math.sin(i * 0.9 + t / 90) * Math.sin(i * 0.37 - t / 140) + (Math.random() - .5) * .6; wave[i] += ((n * level) - wave[i]) * 0.35; }
+    ctx.save(); ctx.translate(c, c);
+    ctx.shadowColor = '#ff3ea5'; ctx.shadowBlur = 10 + level * 24;
+    { const lg = ctx.createLinearGradient(-orbR, -orbR, orbR, orbR); lg.addColorStop(0, '#5ee7ff'); lg.addColorStop(0.5, '#a78bfa'); lg.addColorStop(1, '#ff3ea5'); ctx.strokeStyle = lg; ctx.globalAlpha = 0.65 + level * 0.35; }
+    ctx.lineWidth = 2 + level * 1.5;
+    ctx.beginPath();
+    for (let i = 0; i <= N; i++) { const k = i % N, a = k / N * Math.PI * 2, r = base + wave[k] * orbR * 0.32; const x = Math.cos(a) * r, y = Math.sin(a) * r; i ? ctx.lineTo(x, y) : ctx.moveTo(x, y); }
+    ctx.closePath(); ctx.stroke();
+    // radial bars outside the wave
+    ctx.shadowBlur = 0; ctx.globalAlpha = 1;
+    for (let i = 0; i < N; i += 2) { const a = i / N * Math.PI * 2, h = Math.abs(wave[i]) * orbR * 0.28;
+      if (h < 1) continue; ctx.strokeStyle = i % 4 ? 'rgba(94,231,255,.6)' : 'rgba(255,62,165,.7)'; ctx.lineWidth = 2; ctx.beginPath();
+      ctx.moveTo(Math.cos(a) * (orbR * 0.86), Math.sin(a) * (orbR * 0.86)); ctx.lineTo(Math.cos(a) * (orbR * 0.86 + h), Math.sin(a) * (orbR * 0.86 + h)); ctx.stroke(); }
+    ctx.restore();
+    $('jv-state').textContent = st.pending ? 'AWAITING YOUR GO' : st.speaking ? 'SPEAKING' : st.listening ? 'LISTENING' : st.transcribing ? 'HEARING' : st.thinking ? 'THINKING' : 'ONLINE';
+  }
+
+  // ── the talk section ──
+  let lastUser = '';
+  function caption(html, you){ const cap = $('jv-cap'); cap.innerHTML = (you ? `<div class="you">${esc2(you)}</div>` : '') + html; cap.scrollTop = 0; }
+  const esc2 = (s) => String(s).replace(/[&<>"]/g, (m) => ({ '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;' }[m]));
+  const fmt = (s) => esc2(s).replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>').replace(/\n/g, '<br>');
+  const _add = window.addAIMsg;
+  window.addAIMsg = function(text){
+    const r = _add.apply(this, arguments);
+    if (document.body.classList.contains('jarvis') && Date.now() - lastSendAt < 240000) {
+      caption(fmt(text), lastUser);
+      // Confirmation buttons follow the operator's question into the HUD.
+      if (/\bGo\?\s*$/.test(String(text))) {
+        const cap = $('jv-cap'), d = document.createElement('div');
+        d.innerHTML = '<button class="go" type="button">GO</button><button type="button">CANCEL</button>';
+        d.children[0].onclick = () => { d.remove(); ask('yes'); };
+        d.children[1].onclick = () => { d.remove(); ask('no'); };
+        cap.appendChild(d);
+      }
+    }
+    return r;
+  };
+  let lastSendAt = 0;
+  function ask(text){
+    const input = $('txt'); if (!input) return;
+    input.value = text; lastUser = text; lastSendAt = Date.now();
+    caption('<span style="opacity:.6">…</span>', text);
+    window.send();
+  }
+  // Watch the real input too, so speech from the mic shows as "you said".
+  const _send = window.send;
+  window.send = async function(){
+    const input = $('txt'); const text = input ? input.value.trim() : '';
+    if (text) { lastUser = text; lastSendAt = Date.now(); if (document.body.classList.contains('jarvis')) caption('<span style="opacity:.6">…</span>', text); }
+    // HUD navigation by voice or text: "open accumulator", "show bot trades", "close that", "home".
+    if (text && document.body.classList.contains('jarvis')) {
+      const t = text.toLowerCase().replace(/[.!?]$/, '').trim();
+      const nav = t.match(/^(?:open|show|show me|bring up|go to|display|pull up)\s+(?:the\s+|my\s+)?(.+)$/);
+      if (nav) { const n = NODES.find(x => x.words.test(nav[1])); if (n) { input.value = ''; caption(fmt(n.label + '.'), text); select(n); return; } }
+      if (/^(close (that|this|it|the panel|panel|window)|back|home|hide (that|it|panel))$/.test(t)) { input.value = ''; closePanels(); caption(fmt('Back to the HUD.'), text); return; }
+    }
+    return _send.apply(this, arguments);
+  };
+  $('jv-send').onclick = () => { const v = $('jv-in').value.trim(); if (!v) return; $('jv-in').value = ''; try { V() && V().unlockAudio(); } catch {} ask(v); };
+  $('jv-in').addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); $('jv-send').onclick(); } });
+  $('jv-mic').onclick = () => { if (V()) V().toggleMic(); };
+  $('jv-spk').onclick = () => { const b = $('spk-btn'); if (b) b.click(); };
+  $('jv-orb').onclick = () => { if (V()) V().toggleMic(); };
+
+  // ── mode switch ──
+  function setJarvis(on){ document.body.classList.toggle('jarvis', !!on); LSS('mc_jarvis', on ? '1' : '0'); if (on) layout(); }
+  $('jv-classic').onclick = () => setJarvis(false);
+  $('jv-back').onclick = () => setJarvis(true);
+  window.CipherJarvis = { setJarvis, select: (id) => { const n = NODES.find(x => x.id === id); if (n) select(n); }, nodes: NODES };
+
+  // ── frame loop + slow refreshers ──
+  function frame(t){
+    if (document.body.classList.contains('jarvis')) {
+      const dt = Math.min(64, t - last); last = t;
+      placeNodes(dt); draw(t);
+      const st = V() ? V().state() : {};
+      $('jv-mic').classList.toggle('rec', !!st.listening);
+      $('jv-spk').classList.toggle('on', !!(V() && V().voiceOn()));
+      // A feature panel is open: dim the ring behind it.
+      const po = panelOpen(); $('jv-stage').style.opacity = po ? '.25' : '1';
+    } else last = t;
+    requestAnimationFrame(frame);
+  }
+  function slow(){
+    const d = new Date();
+    $('jv-clock').textContent = d.toLocaleTimeString([], { hour:'2-digit', minute:'2-digit' });
+    $('jv-date').textContent = d.toLocaleDateString([], { weekday:'short', day:'numeric', month:'short' }).toUpperCase();
+    for (const n of NODES) { const s = n.sub ? n.sub() : ''; const el = n.el.querySelector('.ns'); if (el.textContent !== s) el.textContent = s; }
+    const bot = dockLine('dock-bot'); $('jv-sys').textContent = bot ? 'bot · ' + bot : 'systems online';
+  }
+  function start(){
+    layout(); slow(); setInterval(slow, 5000);
+    if (LSG('mc_jarvis', '1') === '1') setJarvis(true);
+    caption('<span style="opacity:.75">Tap the orb or the mic and talk. Tap a ring node, or say "open accumulator".</span>');
+    requestAnimationFrame(frame);
+  }
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', start); else start();
+})();
+</script>
+
 </body>
 </html>

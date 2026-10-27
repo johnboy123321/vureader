@@ -151,6 +151,35 @@ function validateConfig(patch) {
   return { out, errs };
 }
 
+// ── OPERATOR helpers (2026-10-27) ──
+const OP_LOG_KEY = "cipher_operator_log";
+async function opLog(entry) {
+  try {
+    const s = await blobStore();
+    const log = (await s.getJSON(OP_LOG_KEY)) || [];
+    log.push(entry);
+    await s.setJSON(OP_LOG_KEY, log.slice(-200));
+  } catch (e) { console.error("operator log failed:", e && e.message); }
+}
+// The live position for symbol+side; null = could not read, undefined = none open.
+async function opPosition(symbol, posSide) {
+  let r; try { r = await phemex("GET", "/g-accounts/accountPositions", "currency=USDT", null); } catch { return null; }
+  const rows = r && r.data && r.data.data && r.data.data.positions;
+  if (!Array.isArray(rows)) return null;
+  return rows.find((p) => p && String(p.symbol) === symbol && String(p.posSide || p.side) === posSide && Math.abs(Number(p.size) || 0) > 0);
+}
+async function opOrders(symbol) {
+  const seen = new Set(), out = [];
+  for (const q of [`symbol=${symbol}`, `symbol=${symbol}&untriggered=true`]) {
+    try {
+      const r = await phemex("GET", "/g-orders/activeList", q, null);
+      const rows = (r.data && r.data.data && (r.data.data.rows || r.data.data)) || [];
+      for (const o of (Array.isArray(rows) ? rows : [])) if (o && !seen.has(o.orderID)) { seen.add(o.orderID); out.push(o); }
+    } catch { }
+  }
+  return out;
+}
+
 async function handle(request) {
   if (request.method === "OPTIONS") return new Response(null, { headers: CORS });
 
@@ -368,6 +397,98 @@ async function handle(request) {
       return json({ error: `phemex ${code}: ${(r.data && r.data.msg) || "rejected"}`, sent: order, phemex: r }, 502);
     }
     return json({ sent: order, phemex: r });
+  }
+
+  // ═══════════ OPERATOR — John's voice/typed commands from the app (2026-10-27) ═══════════════
+  // One endpoint for "close APT", "move UNI's stop to 7.20", "cancel ATOM's target". Every order
+  // carries a clOrdID starting "gray" — the agent's operator rule (cipher-agent-valtown.js) treats
+  // those as the operator's decisions: never cancelled, stacked on or moved back to plan, and a
+  // close by one is recorded closedBy "operator", not counted. Everything here is REDUCE-ONLY, so
+  // it can shrink or protect a position and nothing else; that is why KILL does not block it.
+  // BASE (top of file) is still the testnet lock. The app confirms with John before calling this;
+  // this endpoint re-checks the position itself, acts, then re-reads the exchange and returns what
+  // it ACTUALLY shows, so the app never reports a close the venue did not make.
+  if (request.method === "GET" && seg === "/operator-log") {
+    let log = []; try { log = (await (await blobStore()).getJSON(OP_LOG_KEY)) || []; } catch {}
+    return json({ log: log.slice(-100) });
+  }
+  if (request.method === "POST" && seg === "/operator") {
+    let b; try { b = await request.json(); } catch { return json({ error: "bad json" }, 400); }
+    const action = String(b.action || "");
+    const symbol = String(b.symbol || "").toUpperCase();
+    const posSide = b.posSide === "Short" ? "Short" : b.posSide === "Long" ? "Long" : "";
+    if (!["close", "stop", "target", "cancel"].includes(action)) return json({ error: "action must be close, stop, target or cancel" }, 400);
+    if (!/^[A-Z0-9]{2,15}USDT$/.test(symbol) || !posSide) return json({ error: "symbol and posSide (Long/Short) required" }, 400);
+    const entry = { at: new Date().toISOString(), heard: String(b.heard || "").slice(0, 200), understood: String(b.understood || "").slice(0, 200),
+                    confirmed: !!b.confirmed, action, symbol, posSide };
+    const done = async (obj, status = 200) => { await opLog({ ...entry, ...obj, after: obj.after }); return json(obj, status); };
+    if (!b.confirmed) return done({ error: "not confirmed — the app must repeat the command back and get a yes first" }, 400);
+
+    const pos = await opPosition(symbol, posSide);
+    if (pos === null) return done({ error: "could not read positions from Phemex — nothing sent" }, 502);
+    if (!pos) return done({ error: `no open ${symbol} ${posSide} position — nothing sent` }, 404);
+    const closing = posSide === "Long" ? "Sell" : "Buy";
+    const mark = Number(pos.markPriceRp || pos.markPrice || 0);
+    const size = Math.abs(Number(pos.size) || 0);
+    const pxDp = (p) => Math.max((String(pos.markPriceRp || "").split(".")[1] || "").length, (String(p).split(".")[1] || "").length, 2);
+    const fmt = (v, dp) => String(Number(Number(v).toFixed(dp)));
+    const tag = (k) => ("gray" + k + symbol.replace(/USDT$/, "") + Date.now()).slice(0, 40);
+    const book = await opOrders(symbol);
+    const isStopRow = (o) => Number(o.stopPxRp || 0) > 0 || /^(cipherStop|cipherSL|grayStop)/i.test(String(o.clOrdID || ""));
+    const isTargetRow = (o) => !isStopRow(o) && /^(cipherTarget|grayTarget)/i.test(String(o.clOrdID || ""));
+    const closingRows = (book || []).filter((o) => o && (!o.side || String(o.side) === closing) && (!o.posSide || String(o.posSide) === posSide));
+    const cancelRows = async (rows) => { const out = [];
+      for (const o of rows) { const r = await phemex("DELETE", "/g-orders/cancel", `symbol=${symbol}&orderID=${encodeURIComponent(o.orderID)}&posSide=${posSide}`, null);
+        out.push({ clOrdID: o.clOrdID, orderID: o.orderID, ok: r.httpStatus === 200 && (!r.data || r.data.code === 0 || r.data.code === undefined), code: r.data && r.data.code }); }
+      return out; };
+    const send = async (order) => {
+      if (DRY) return { dryRun: true, wouldSend: order };
+      const r = await phemex("POST", "/g-orders", "", order);
+      const code = r.data && r.data.code;
+      return { ok: r.httpStatus === 200 && (code === 0 || code === undefined), code, msg: r.data && r.data.msg, orderID: r.data && r.data.data && r.data.data.orderID, sent: order };
+    };
+    const after = async () => { await new Promise((res) => setTimeout(res, 1500));
+      const p = await opPosition(symbol, posSide); const o = await opOrders(symbol);
+      return { position: p === null ? "unreadable" : p ? { size: Math.abs(Number(p.size)), mark: Number(p.markPriceRp || 0), pnl: Number(p.unRealisedPnlRv ?? p.unrealisedPnlRv ?? 0) } : "none",
+               orders: (o || []).filter((x) => x && (!x.side || String(x.side) === closing)).map((x) => ({ clOrdID: x.clOrdID, stopPx: Number(x.stopPxRp) || undefined, px: Number(x.priceRp) || undefined, qty: Number(x.orderQtyRq) || undefined })) }; };
+
+    if (action === "close") {
+      const want = b.qty === "all" || b.qty == null ? size : Number(b.qty);
+      if (!(want > 0) || want > size + 1e-9) return done({ error: `quantity ${b.qty} is not between 0 and the position size ${size}` }, 400);
+      const order = { clOrdID: tag("Close"), symbol, side: closing, posSide, ordType: "Market", orderQtyRq: String(want),
+        timeInForce: "ImmediateOrCancel", reduceOnly: true, text: "operator-close" };
+      const r = await send(order);
+      return done({ ...r, after: r.dryRun ? undefined : await after() }, r.ok || r.dryRun ? 200 : 502);
+    }
+    if (action === "stop" || action === "target") {
+      const px = Number(b.px);
+      if (!(px > 0)) return done({ error: "a price is required" }, 400);
+      if (mark > 0) {
+        const below = px < mark;
+        if (action === "stop" && posSide === "Long" && !below) return done({ error: `a LONG stop must be below the market (${mark})` }, 400);
+        if (action === "stop" && posSide === "Short" && below) return done({ error: `a SHORT stop must be above the market (${mark})` }, 400);
+        if (action === "target" && posSide === "Long" && below) return done({ error: `a LONG target must be above the market (${mark})` }, 400);
+        if (action === "target" && posSide === "Short" && !below) return done({ error: `a SHORT target must be below the market (${mark})` }, 400);
+      }
+      const dp = pxDp(b.px);
+      const order = action === "stop"
+        ? { clOrdID: tag("Stop"), symbol, side: closing, posSide, ordType: "Stop", stopPxRp: fmt(px, dp), triggerType: "ByMarkPrice",
+            orderQtyRq: String(size), timeInForce: "ImmediateOrCancel", closeOnTrigger: true, reduceOnly: true, text: "operator-stop" }
+        : { clOrdID: tag("Target"), symbol, side: closing, posSide, ordType: "Limit", priceRp: fmt(px, dp),
+            orderQtyRq: String(size), timeInForce: "GoodTillCancel", reduceOnly: true, text: "operator-target" };
+      // New one ON first, old ones OFF after — the position is never left without one.
+      const r = await send(order);
+      if (!(r.ok || r.dryRun)) return done(r, 502);
+      const old = closingRows.filter(action === "stop" ? isStopRow : isTargetRow);
+      const cancelled = r.dryRun ? old.map((o) => ({ clOrdID: o.clOrdID, wouldCancel: true })) : await cancelRows(old);
+      return done({ ...r, replaced: cancelled, after: r.dryRun ? undefined : await after() });
+    }
+    // cancel: what = stop | target | both
+    const what = String(b.what || "both");
+    const rows = closingRows.filter((o) => (what !== "target" && isStopRow(o)) || (what !== "stop" && isTargetRow(o)));
+    if (!rows.length) return done({ error: `no ${what === "both" ? "stop or target" : what} resting on ${symbol} ${posSide}` }, 404);
+    const cancelled = DRY ? rows.map((o) => ({ clOrdID: o.clOrdID, wouldCancel: true })) : await cancelRows(rows);
+    return done({ ok: cancelled.every((c) => c.ok || c.wouldCancel), cancelled, after: DRY ? undefined : await after() });
   }
 
   return json({ error: "not found" }, 404);

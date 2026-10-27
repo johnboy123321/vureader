@@ -153,6 +153,27 @@ const r5d = await run({ label:"apt-carry", state:{ cipher_open: { "APT|short": {
 ok("a stale closedBy from the last run is not carried onto a position still in the book", !(r5d.st.cipher_open["APT|short"] || {}).closedBy && r5d.st.cipher_health.status === "FAIL", JSON.stringify(r5d.st.cipher_health));
 ok("5b's filled close is marked confirmed", r5b.st.cipher_open["APT|short"] && r5b.st.cipher_open["APT|short"].closeConfirmed === true);
 
+console.log("\n5e. APT's plan was written for a DIFFERENT fill (plan 0.6124, venue average 0.925) — re-planned");
+const APT_REAL = [{ symbol:"APTUSDT", posSide:"Short", side:"Sell", size:507, avgEntryPriceRp:"0.925359566" }];
+const r5e = await run({ label:"apt-replan", state:{ cipher_open: APT_OPEN }, positions: APT_REAL, marks:{} });
+const ap = r5e.st.cipher_open["APT|short"] || {};
+ok("logged RE-PLANNED, naming the drift in R", r5e.log.some(e => e.coin === "APT" && e.result === "RE-PLANNED" && /R from the venue's average entry/.test(e.skipped)), JSON.stringify(r5e.log.filter(e=>e.coin==="APT").map(e=>e.result)));
+ok("the new plan's entry is today's price, not the stale 0.6124", ap.plan && ap.plan.entry !== 0.6124 && ap.adopted > 0, JSON.stringify(ap.plan));
+ok("a short's new stop sits ABOVE its entry", ap.plan && ap.plan.stop > ap.plan.entry);
+ok("and the stop sweep attaches it in the same run (no breach close)", stops(r5e).length === 1 && !r5e.sent.some(o => /^cipherBreach/.test(o.clOrdID || "")), JSON.stringify(r5e.sent.map(o=>o.clOrdID)));
+ok("the venue's real average entry is kept on the position", Math.abs(ap.avgEntry - 0.925359566) < 1e-9);
+const r5f = await run({ label:"trx-small-drift", state:{ cipher_open: { "TRX|long": { coin:"TRX", dir:"long", size:780, book:"swing",
+  plan:{ entry:0.3338, stop:0.3209795526432762, target:0.36264600655262846 }, since: SINCE, avgEntry:0.322 } } },
+  positions:[{ symbol:"TRXUSDT", posSide:"Long", side:"Buy", size:780, avgEntryPriceRp:"0.322" }], marks:{ TRXUSDT: 0.33 }, whitelist:"TRXUSDT" });
+ok("a fill under 1.5R from plan (TRX, 0.9R) keeps its plan", r5f.st.cipher_open["TRX|long"].plan.entry === 0.3338 && !r5f.log.some(e => e.result === "RE-PLANNED"));
+
+console.log("\n5g. Adopting a plan-less position: ONE price for entry, stop and target");
+const r5g = await run({ label:"adopt", positions:[{ symbol:"ADAUSDT", posSide:"Long", side:"Buy", size:100, avgEntryPriceRp:"50" }], marks:{ ADAUSDT: 129 } });
+const ad = (r5g.st.cipher_open["ADA|long"] || {}).plan;
+const adR = ad ? (ad.target - ad.entry) / (ad.entry - ad.stop) : NaN;
+ok("the plan's target is 2.25R from the plan's OWN entry (was 0.16–0.25R on ATOM/LTC)", Math.abs(adR - 2.25) < 1e-6, JSON.stringify(ad));
+ok("entry is today's price, not the 50 average entry", ad && ad.entry > 100, ad && ad.entry);
+
 console.log("\n6. De-hedge close: reduce-only, and no \"NaN\" anywhere in the body");
 const HEDGE = [{ symbol:"ADAUSDT", posSide:"Long", side:"Buy", size:2007, avgEntryPriceRp:"0.2049", markPriceRp:"0.205" },
                { symbol:"ADAUSDT", posSide:"Short", side:"Sell", size:321, avgEntryPriceRp:"0.21", markPriceRp:"0.205" }];
@@ -252,6 +273,30 @@ const gf = await run({ label:"dot-nofill", state: DOT_PREV, positions: [], fills
 delete process.env.FILL_RETRY_RUNS;
 const gresf = gf.ledger.find(e => e.kind === "resolved" && e.coin === "DOT");
 ok("not counted, no R", gresf && gresf.countsForStats === false && gresf.countsForStreak === false && gresf.R === undefined, JSON.stringify(gresf));
+
+console.log("\n10g. An ADOPTED position resolves — recorded, not counted");
+const prevAd = JSON.parse(JSON.stringify(prev)); prevAd.cipher_open["SOL|short"].adopted = Date.now() - 864e5;
+const gad = await run({ label:"adopted-res", state: prevAd, positions: [], fills: fillAt(100.89, "cipherTarget1", "Limit", "T1") });
+const gres = gad.ledger.find(e => e.kind === "resolved" && e.coin === "SOL");
+ok("graded from the fill but countsForStats false", gres && gres.gradedOn === "venue_fill" && gres.countsForStats === false && /adopted/.test(gres.why), JSON.stringify(gres));
+
+console.log("\n10h. One-time relabel of range-graded results");
+const oldLed = [
+  { kind:"resolved", coin:"UNI", R:-1, countsForStats:true, execution:"filled" },
+  { kind:"resolved", coin:"XRP", R:2.25, countsForStats:true, gradedOn:"venue" },
+  { kind:"resolved", coin:"SOL", R:2.25, countsForStats:true, gradedOn:"venue_fill", fill:{ px:1 } },
+  { kind:"placed", coin:"ADA", countsForStats:true } ];
+const grl = await run({ label:"relabel", keep:"relabel", state:{ cipher_ledger: oldLed, cipher_protect_rev: RESET_DONE }, positions: [] });
+const L = grl.ledger;
+ok("range-graded records stop counting", L.find(e=>e.coin==="UNI").countsForStats === false && L.find(e=>e.coin==="XRP").countsForStats === false);
+ok("their old flag is kept, so it can be undone", L.find(e=>e.coin==="UNI").countedBefore === true);
+ok("a fill-graded record is untouched", L.find(e=>e.coin==="SOL").countsForStats === true);
+ok("placed records are untouched", L.find(e=>e.kind==="placed").countsForStats === true);
+ok("announced once", grl.log.filter(e=>e.result==="LEDGER RELABELLED").length === 1 && /2 resolved/.test(grl.log.find(e=>e.result==="LEDGER RELABELLED").skipped));
+const st2 = JSON.parse(fs.readFileSync("/tmp/cipher-test/state-tp-relabel.json","utf8"));
+st2.cipher_ledger.push({ kind:"resolved", coin:"NEW", R:-1, countsForStats:true });
+const grl2 = await run({ label:"relabel2", keep:"relabel", state: st2, positions: [] });
+ok("and never runs twice (a later record is not touched by it)", grl2.ledger.find(e=>e.coin==="NEW").countsForStats === true && grl2.log.filter(e=>e.result==="LEDGER RELABELLED").length === 1);
 
 console.log("\n10b. AUDIT: same coin and side REOPENED between runs (entry moved)");
 const reopenPos = [{ symbol:"SOLUSDT", posSide:"Short", side:"Sell", size:3.0, avgEntryPriceRp:"104.00" }];

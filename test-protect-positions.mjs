@@ -14,7 +14,7 @@ const base = fs.readFileSync("cipher-agent-valtown.js", "utf8")
 const candles = n => { const out=[]; let p=100;
   for (let i=0;i<n;i++){ p=p*(1+0.0008); out.push([Date.now()-(n-i)*864e5,p*0.9995,p*1.008,p*0.992,p,1500]); } return out; };
 
-async function run({ label, whitelist, positions, activeRows, restingSeed, openSeed, kill }) {
+async function run({ label, whitelist, positions, activeRows, restingSeed, openSeed, kill, keepState, extraState, orderList }) {
   const file = `/tmp/cipher-test/agent-pp-${label}.mjs`;
   fs.writeFileSync(file, base);
   Object.assign(process.env, {
@@ -24,11 +24,12 @@ async function run({ label, whitelist, positions, activeRows, restingSeed, openS
     WHITELIST: whitelist,
     KILL: kill ? "1" : "0",
   });
-  try { fs.unlinkSync(process.env.STATE_FILE); } catch {}
-  if (openSeed || restingSeed) {
+  if (!keepState) try { fs.unlinkSync(process.env.STATE_FILE); } catch {}
+  if (!keepState && (openSeed || restingSeed || extraState)) {
     fs.writeFileSync(process.env.STATE_FILE, JSON.stringify({
       cipher_open: openSeed || {},
       cipher_resting: restingSeed || {},
+      ...(extraState || {}),
     }));
   }
 
@@ -40,6 +41,7 @@ async function run({ label, whitelist, positions, activeRows, restingSeed, openS
       text:async()=>typeof b==="string"?b:JSON.stringify(b), json:async()=>typeof b==="string"?JSON.parse(b):b });
     if (/phemex/.test(u)) {
       if (/accountPositions/.test(u)) return reply({ code:0, data:{ account:{}, positions: positions || [] } });
+      if (/orderList|g-futures\/orders\?/.test(u)) return reply({ code:0, data:{ rows: orderList || [] } });
       if (/activeList/.test(u)) {
         const qs = u.split("?")[1] || "";
         const sym = new URLSearchParams(qs).get("symbol");
@@ -60,7 +62,7 @@ async function run({ label, whitelist, positions, activeRows, restingSeed, openS
   const A = await import(file + "?t=" + label + Date.now());
   await A.default();
   const state = JSON.parse(fs.readFileSync(process.env.STATE_FILE, "utf8"));
-  return { sent, cancels, log: state.cipher_log || [] };
+  return { sent, cancels, log: state.cipher_log || [], state };
 }
 
 let pass=0, fail=0;
@@ -106,6 +108,85 @@ const r4 = await run({ label:"cancel", whitelist:"LTCUSDT", positions: [], activ
 ok("a cancel was actually attempted", r4.cancels.length > 0, JSON.stringify(r4.cancels));
 ok("and it carries posSide this time", r4.cancels.some(q => /(^|&)posSide=Long(&|$)/.test(q)), JSON.stringify(r4.cancels));
 ok("the expiry no longer fails with the old error", !r4.log.some(e => e.result==="EXPIRE FAILED"));
+
+
+// ═══════════ OPERATOR (GRAY) ORDERS — 2026-10-27 ═══════════
+// Book rows arrive with NO posSide (run #826), so the gray rows below carry side only.
+const SINCE = Date.now() - 864e5;
+const SOL_PLAN_FIXED = { "SOL|short": { ...SOL_PLAN["SOL|short"], since: SINCE } };
+const REV = { cipher_protect_rev: { rev: "2026-10-26-unstack", done: ["SOLUSDT"] } };
+const OUR_REG = { "SOL|short": { symbol:"SOLUSDT", posSide:"Short", since: SINCE,
+  stop:   { px:111.93208549409617, sentPx:111.93, qty:2.24, orderID:"c1", clOrdID:"cipherStop1", source:"placed" },
+  target: { px:83.1303076382836,   sentPx:83.13,  qty:2.24, orderID:"c2", clOrdID:"cipherTarget1", source:"placed" } } };
+const grayStopRow = (id, px) => ({ orderID:id, clOrdID:"grayStop"+id, side:"Buy", orderType:"Stop", stopPxRp:String(px), orderQtyRq:"2.24", ordStatus:"Untriggered" });
+const isGrayCancel = q => /grayStop|orderID=g/.test(q);
+
+console.log("\n5. A gray stop rests on SOL (operator moved it) — the bot's own stop is on record");
+const r5 = await run({ label:"gray-stop", whitelist:"SOLUSDT", positions: SOL_POS, openSeed: SOL_PLAN_FIXED,
+  extraState: { ...REV, cipher_protect: OUR_REG },
+  activeRows: { SOLUSDT: [ grayStopRow("g1", 118.5), { orderID:"c2", clOrdID:"cipherTarget1", side:"Buy", orderType:"Limit", priceRp:"83.13" } ] } });
+ok("no new bot stop is placed on top of the operator's", !r5.sent.some(o => /^cipherStop/.test(o.clOrdID||"")), JSON.stringify(r5.sent.map(o=>o.clOrdID)));
+ok("the gray stop is never cancelled", !r5.cancels.some(isGrayCancel), JSON.stringify(r5.cancels));
+ok("the bot's own stop comes off, so only the operator's can fire", r5.cancels.some(q => /orderID=c1/.test(q)), JSON.stringify(r5.cancels));
+ok("the bot's target is left alone (no gray target)", !r5.cancels.some(q => /orderID=c2/.test(q)));
+const reg5 = r5.state.cipher_protect && r5.state.cipher_protect["SOL|short"];
+ok("the registry records the gray stop as this position's stop (source operator, its own level)",
+  reg5 && reg5.stop && reg5.stop.source === "operator" && reg5.stop.clOrdID === "grayStopg1" && reg5.stop.px === 118.5, JSON.stringify(reg5 && reg5.stop));
+ok("logged OPERATOR: SOL stop seen", r5.log.some(e => e.result === "OPERATOR: SOL stop seen"));
+const h5 = r5.state.cipher_health;
+ok("HEALTH does not fail on 'no stop' — the gray stop counts", h5 && !h5.problems.some(p => /no stop/.test(p)) && h5.stops === 1 && h5.operatorLegs === 1, JSON.stringify(h5));
+
+console.log("\n5b. Gray stop present and nothing on record — still no bot stop");
+const r5b = await run({ label:"gray-stop-fresh", whitelist:"SOLUSDT", positions: SOL_POS, openSeed: SOL_PLAN_FIXED,
+  extraState: { ...REV }, activeRows: { SOLUSDT: [ grayStopRow("g1", 118.5) ] } });
+ok("no bot stop placed", !r5b.sent.some(o => /^cipherStop/.test(o.clOrdID||"")), JSON.stringify(r5b.sent.map(o=>o.clOrdID)));
+ok("no breach close either (the operator's stop is the protection)", !r5b.sent.some(o => /^cipherBreach/.test(o.clOrdID||"")));
+
+console.log("\n6. The operator MOVES its stop (g1 118.5 → g2 116.0) — the bot leaves it alone");
+const r6 = await run({ label:"gray-move", whitelist:"SOLUSDT", positions: SOL_POS, keepState: true,
+  activeRows: { SOLUSDT: [ grayStopRow("g2", 116.0), { orderID:"c2", clOrdID:"cipherTarget1", side:"Buy", orderType:"Limit", priceRp:"83.13" } ] } });
+const reg6 = r6.state.cipher_protect && r6.state.cipher_protect["SOL|short"];
+ok("no bot stop placed, no 'fix' back to the plan's 111.93", !r6.sent.some(o => /^cipherStop/.test(o.clOrdID||"")), JSON.stringify(r6.sent.map(o=>o.clOrdID)));
+ok("no gray order cancelled", !r6.cancels.some(isGrayCancel), JSON.stringify(r6.cancels));
+ok("the registry follows the operator's new level", reg6 && reg6.stop && reg6.stop.orderID === "g2" && reg6.stop.px === 116, JSON.stringify(reg6 && reg6.stop));
+ok("the move is logged", r6.log.filter(e => e.result === "OPERATOR: SOL stop seen").length >= 1);
+
+console.log("\n6b. Gray stop vanishes — kept one run, the plan's own stop goes back on the second");
+const tgtOnly = { SOLUSDT: [ { orderID:"c2", clOrdID:"cipherTarget1", side:"Buy", orderType:"Limit", priceRp:"83.13" } ] };
+const r6b = await run({ label:"gray-move", whitelist:"SOLUSDT", positions: SOL_POS, keepState: true, activeRows: tgtOnly });
+ok("first miss: nothing placed yet", !r6b.sent.some(o => /^cipherStop/.test(o.clOrdID||"")));
+const r6c = await run({ label:"gray-move", whitelist:"SOLUSDT", positions: SOL_POS, keepState: true, activeRows: tgtOnly });
+ok("second miss: logged OPERATOR: SOL stop gone", r6c.log.some(e => e.result === "OPERATOR: SOL stop gone"));
+ok("…and the plan's stop is back (position never left naked)", r6c.sent.some(o => /^cipherStop/.test(o.clOrdID||"")) || r6c.sent.some(o => /^cipherBreach/.test(o.clOrdID||"")), JSON.stringify(r6c.sent.map(o=>o.clOrdID)));
+
+console.log("\n7. Gray CLOSES SOL — position gone, order history names grayClose");
+const grayClose = [{ symbol:"SOLUSDT", orderID:"g9", clOrdID:"grayCloseSOL1", side:"Buy", posSide:"Short", ordType:"Market",
+  ordStatus:"Filled", cumQtyRq:"2.24", avgPriceRp:"90.10", transactTimeNs: String((Date.now()-6e5)*1e6) }];
+const r7 = await run({ label:"gray-close", whitelist:"SOLUSDT", positions: [], openSeed: SOL_PLAN_FIXED,
+  extraState: { ...REV, cipher_protect: OUR_REG }, orderList: grayClose, activeRows: {} });
+const res7g = (r7.state.cipher_ledger || []).find(e => e.kind === "resolved" && e.coin === "SOL");
+ok("resolved with closedBy operator", res7g && res7g.closedBy === "operator", JSON.stringify(res7g));
+ok("countsForStats false (and not in the streak)", res7g && res7g.countsForStats === false && res7g.countsForStreak === false);
+ok("never recorded as a stop or target hit", res7g && res7g.how === "operator" && !/stop|target/.test(res7g.how));
+ok("exit is the operator's fill", res7g && res7g.exit === 90.1, res7g && res7g.exit);
+ok("logged OPERATOR: SOL close seen", r7.log.some(e => e.result === "OPERATOR: SOL close seen"));
+const hold7 = r7.state.cipher_operator_hold || {};
+ok("SOL short is on hold for the next cycle", hold7["SOL|short"] > Date.now() + 10*6e4, JSON.stringify(hold7));
+ok("no new SOL order placed this run", !r7.sent.some(o => o.symbol === "SOLUSDT" && !/^cipher(Stop|Target)/.test(o.clOrdID||"")), JSON.stringify(r7.sent));
+
+console.log("\n7b. SOL short reappears plan-less while on hold — not re-adopted, HEALTH warns instead of failing");
+const r7b = await run({ label:"gray-close", whitelist:"SOLUSDT", positions: SOL_POS, keepState: true, orderList: [], activeRows: {} });
+const open7b = r7b.state.cipher_open && r7b.state.cipher_open["SOL|short"];
+ok("not adopted (no plan attached)", open7b && !open7b.plan, JSON.stringify(open7b));
+ok("no stop placed on it this cycle", !r7b.sent.some(o => /^cipherStop/.test(o.clOrdID||"")));
+const h7b = r7b.state.cipher_health;
+ok("HEALTH names the hold as a warning, not a 'no plan' failure", h7b && h7b.problems.some(p => /OPERATOR HOLD/.test(p)) && !h7b.problems.some(p => /no plan at all/.test(p)), JSON.stringify(h7b));
+
+console.log("\n7c. A non-gray close is still NOT labelled operator");
+const r7c = await run({ label:"hand-close", whitelist:"SOLUSDT", positions: [], openSeed: SOL_PLAN_FIXED,
+  extraState: { ...REV, cipher_protect: OUR_REG }, orderList: [{ ...grayClose[0], clOrdID:"manual123" }], activeRows: {} });
+ok("no OPERATOR log for a hand close", !r7c.log.some(e => /^OPERATOR/.test(e.result||"")));
+ok("no hold set", !((r7c.state.cipher_operator_hold || {})["SOL|short"]));
 
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);

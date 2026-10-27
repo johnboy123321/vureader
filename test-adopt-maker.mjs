@@ -78,12 +78,14 @@ console.log('\n7. Adoption is bookkeeping, never trading');
   ok('adoptOrphans exists', body.length > 100);
   ok('it places no orders', !/execOrder|directOrder|buildOrder|relay\(/.test(body));
   ok('the stop is anchored to today\'s price, not the stale entry', /buildTradePlan\(bars, pos\.dir, cur\)/.test(body));
-  ok('the recorded entry is the real average entry', /pos\.avgEntry.*>\s*0\s*\?\s*pos\.avgEntry\s*:\s*cur/.test(body));
+  // 2026-10-27: the PLAN's entry is today's price (the same price its stop and target were measured
+  // from); the real average entry stays on the position as avgEntry (checked by the snapshot tests).
+  ok('the plan\'s entry is the price its stop and target were measured from', /pos\.plan = \{ entry: cur,/.test(body));
   ok('adopted positions land in the swing book', /pos\.book = pos\.book \|\| "swing"/.test(body));
-  ok('the log entry says so', /result: "ADOPTED"/.test(body));
+  ok('the log entry says so', /"ADOPTED"/.test(body));
   ok('it runs in the resolution pass before resolvedSince',
-     src.indexOf('await adoptOrphans(nowOpen, bookMap)') > 0 &&
-     src.indexOf('await adoptOrphans(nowOpen, bookMap)') < src.indexOf('const resolved = resolvedSince'));
+     src.indexOf('await adoptOrphans(nowOpen, bookMap') > 0 &&
+     src.indexOf('await adoptOrphans(nowOpen, bookMap') < src.indexOf('const resolved = resolvedSince'));
 }
 console.log('\n8. The maker experiment measures and decides nothing');
 {
