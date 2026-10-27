@@ -11172,9 +11172,31 @@ document.addEventListener('click', function(e){
     return speakQ;
   }
   const VS = { speaking:false, engine:'', micLevel:0 };   // read by the Jarvis orb
+  // A voice that never reports "ended" (Chrome does this when it refuses to speak) must not
+  // block every reply after it: each one gets a deadline based on its length.
   async function speakNow(t){
     VS.speaking = true;
-    try { await speakNow2(t); } finally { VS.speaking = false; }
+    const limit = 6000 + t.length * 110;
+    try { await Promise.race([speakNow2(t), new Promise(res => setTimeout(res, limit))]); }
+    finally { VS.speaking = false; }
+  }
+  // Chrome stops long utterances after ~15 s and sometimes never starts one; speak sentence by
+  // sentence, with an English voice once the voice list has loaded.
+  function browserVoice(){
+    const vs = (window.speechSynthesis && speechSynthesis.getVoices()) || [];
+    return vs.find(v => /en-GB/i.test(v.lang) && /Daniel|Google UK English Male|Arthur/i.test(v.name)) || vs.find(v => /en-GB/i.test(v.lang)) || vs.find(v => /^en/i.test(v.lang)) || null;
+  }
+  async function browserSpeak(t){
+    if (!speechSynthesis.getVoices().length) await new Promise(res => { const tm = setTimeout(res, 1500); speechSynthesis.onvoiceschanged = () => { clearTimeout(tm); res(); }; });
+    try { speechSynthesis.cancel(); } catch {}
+    const parts = String(t).match(/[^.!?]+[.!?]*\s*/g) || [t];
+    const v = browserVoice();
+    for (const p of parts) {
+      if (!p.trim()) continue;
+      await new Promise((res) => { const u = new SpeechSynthesisUtterance(p.trim()); if (v) u.voice = v; u.lang = (v && v.lang) || 'en-GB';
+        u.onend = res; u.onerror = (e) => { console.warn('browser voice error:', e.error); res(); }; speechSynthesis.speak(u);
+        setTimeout(res, 4000 + p.length * 120); });
+    }
   }
   async function speakNow2(t){
     const key = LSG(K.key, '');
@@ -11189,11 +11211,14 @@ document.addEventListener('click', function(e){
         await new Promise((res) => { player.onended = res; player.onerror = res; player.src = url; player.play().catch(res); });
         URL.revokeObjectURL(url);
         return;
-      } catch (e) { console.warn('ElevenLabs voice failed, using the browser voice:', e && e.message); }
+      } catch (e) {
+        console.warn('ElevenLabs voice failed, using the browser voice:', e && e.message);
+        if (!window.__elevenWarned) { window.__elevenWarned = true; try { _addAIMsg('ElevenLabs did not answer (' + String(e && e.message || e).slice(0, 120) + '). Using the browser voice until it does — check the key and that Text to Speech is allowed on it.'); } catch {} }
+      }
     }
     if (!window.speechSynthesis) return;
     VS.engine = 'browser';
-    await new Promise((res) => { const u = new SpeechSynthesisUtterance(t); u.lang = 'en-GB'; u.onend = res; u.onerror = res; speechSynthesis.speak(u); });
+    await browserSpeak(t);
   }
   function stopSpeaking(){ try { player.pause(); } catch {} try { speechSynthesis.cancel(); } catch {} speakQ = Promise.resolve(); }
 
@@ -11504,7 +11529,7 @@ document.addEventListener('click', function(e){
       k.value = LSG(K.key, ''); v.value = LSG(K.voice, '');
       k.oninput = () => LSS(K.key, k.value.trim().replace(/\s+/g, ''));
       v.oninput = () => LSS(K.voice, v.value.trim());
-      row.querySelector('#p-voice-test').onclick = () => { unlockAudio(); speak('Cipher here. Voice is working.'); };
+      row.querySelector('#p-voice-test').onclick = () => { unlockAudio(); stopSpeaking(); speak(LSG(K.key, '') ? 'Cipher here. Voice is working.' : 'Cipher here. This is the browser voice — add your ElevenLabs key above for the real one.'); };
     }
   }
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', mount); else mount();
