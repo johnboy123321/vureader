@@ -21,11 +21,11 @@ const candles = n => { const out=[]; let p=100;
   for (let i=0;i<n;i++){ p=p*(1+0.0008); out.push([Date.now()-(n-i)*864e5,p*0.9995,p*1.008,p*0.992,p,1500]); } return out; };
 
 let seq = 0;
-async function run({ label, positions = [], activeRows = {}, marks = {}, fills = {}, state, keep, kill, postReply, whitelist = "SOLUSDT,DOTUSDT,ADAUSDT,APTUSDT" }) {
+async function run({ label, positions = [], activeRows = {}, marks = {}, fills = {}, state, keep, kill, postReply, breachNoFill = false, fillReply, whitelist = "SOLUSDT,DOTUSDT,ADAUSDT,APTUSDT" }) {
   const file = `/tmp/cipher-test/agent-tp-${label}-${++seq}.mjs`;
   fs.writeFileSync(file, base);
   const STATE = `/tmp/cipher-test/state-tp-${keep || label}.json`;
-  Object.assign(process.env, {
+  Object.assign(process.env, { BREACH_VERIFY_MS: "0",
     PHEMEX_KEY:"k", PHEMEX_SECRET:"s", EXEC_DIRECT:"1", MODE:"armed", DRY_RUN:"0",
     RISK_GBP:"10", BATCH:"3", UNIVERSE:"10", CORR_MAX:"6", STATE_FILE: STATE,
     WHITELIST: whitelist, KILL: kill ? "1" : "0", RELAY_URL: "",
@@ -34,6 +34,7 @@ async function run({ label, positions = [], activeRows = {}, marks = {}, fills =
   else if (!keep) { try { fs.unlinkSync(STATE); } catch {} }
 
   const sent = [], cancels = [], cancelAll = [], fillCalls = [];
+  let book = positions.slice();      // a breach close that FILLS takes its position off the book
   globalThis.fetch = async (url, opts = {}) => {
     const u = String(url);
     const reply = (b, s = 200) => ({ status:s, ok:s<400, headers:{get:()=>null},
@@ -41,13 +42,14 @@ async function run({ label, positions = [], activeRows = {}, marks = {}, fills =
     if (/phemex/.test(u)) {
       const qs = new URLSearchParams(u.split("?")[1] || "");
       const sym = qs.get("symbol");
-      if (/accountPositions/.test(u)) return reply({ code:0, data:{ account:{ accountBalanceRv: "1000" }, positions } });
+      if (/accountPositions/.test(u)) return reply({ code:0, data:{ account:{ accountBalanceRv: "1000" }, positions: book } });
       if (/activeList/.test(u)) return reply({ code:0, data:{ rows: (activeRows[sym]) || [] } });
       if (/\/md\/.*ticker/.test(u)) return marks[sym] ? reply({ result:{ symbol:sym, markPriceRp: String(marks[sym]) } }) : reply({}, 404);
-      if (/tradingList|g-futures\/trades/.test(u)) { fillCalls.push(sym); return reply({ code:0, data:{ rows: fills[sym] || [] } }); }
+      if (/tradingList|g-futures\/trades/.test(u)) { fillCalls.push(sym + (/api-data/.test(u) ? ":api-data" : "")); if (fillReply) { const fr = fillReply(u, sym); if (fr) return reply(fr.body, fr.status || 200); } return reply({ code:0, data:{ rows: fills[sym] || [] } }); }
       if (opts.method === "DELETE" && /\/g-orders\/all/.test(u)) { cancelAll.push(sym + (qs.get("untriggered") === "true" ? ":untriggered" : "")); return reply({ code:0 }); }
       if (opts.method === "DELETE" && /\/g-orders\/cancel/.test(u)) { cancels.push(u.split("?")[1] || ""); return reply({ code:0 }); }
       if (opts.method === "POST") { const b = JSON.parse(opts.body); sent.push({ ...b, _raw: opts.body });
+        if (/^cipherBreach/.test(b.clOrdID || "") && !breachNoFill) book = book.filter(x => !(x.symbol === b.symbol && x.posSide === b.posSide));
         const custom = postReply && postReply(b); if (custom) return reply(custom);
         return reply({ code:0, data:{ orderID:"m"+sent.length } }); }
       return reply({ code:0, data:{ rows: [] } });
@@ -137,6 +139,20 @@ const aptClose = r5b.sent.find(o => /^cipherBreach/.test(o.clOrdID || ""));
 ok("the venue's 'already past' answer leads to a close at market", !!aptClose && aptClose.side === "Buy" && aptClose.posSide === "Short" && aptClose.reduceOnly === true, JSON.stringify(r5b.sent.map(o=>o.clOrdID)));
 ok("logged as STOP BREACHED — CLOSED, not as a failure to retry forever", r5b.log.some(e => e.coin === "APT" && e.result === "STOP BREACHED — CLOSED") && !r5b.log.some(e => e.coin === "APT" && e.result === "STOP ATTACH FAILED"));
 
+console.log("\n5c. APT again, but the market IOC finds NO liquidity — the position is still there (Gray #1)");
+const r5c = await run({ label:"apt-nofill", state:{ cipher_open: APT_OPEN }, positions: APT_POS, marks:{}, breachNoFill: true,
+  postReply: b => /^cipherStop/.test(b.clOrdID || "") ? { code: 11043, msg: "TE_RISING_TRIGGER_DIRECTLY" } : null });
+ok("the close is still attempted", r5c.sent.some(o => /^cipherBreach/.test(o.clOrdID || "")));
+ok("NOT logged as closed", !r5c.log.some(e => e.coin === "APT" && e.result === "STOP BREACHED — CLOSED"));
+ok("logged as DID NOT FILL, with the size still open", r5c.log.some(e => e.coin === "APT" && e.result === "STOP BREACH CLOSE DID NOT FILL" && /STILL OPEN \(size 507\)/.test(e.skipped)), JSON.stringify(r5c.log.filter(e=>e.coin==="APT")));
+ok("no '0.00000' price in the message", !r5c.log.some(e => e.coin === "APT" && /0\.00000/.test(e.skipped || "")));
+ok("closedBy NOT stamped", !(r5c.st.cipher_open["APT|short"] || {}).closedBy, JSON.stringify(r5c.st.cipher_open["APT|short"]));
+ok("HEALTH says FAIL and names APT", r5c.st.cipher_health && r5c.st.cipher_health.status === "FAIL" && /APT short/.test(r5c.st.cipher_health.problems.join()), JSON.stringify(r5c.st.cipher_health));
+const r5d = await run({ label:"apt-carry", state:{ cipher_open: { "APT|short": { ...APT_OPEN["APT|short"], closedBy:"stop_breach_close" } } }, positions: APT_POS, marks:{}, breachNoFill: true,
+  postReply: b => /^cipherStop/.test(b.clOrdID || "") ? { code: 11043, msg: "TE_RISING_TRIGGER_DIRECTLY" } : null });
+ok("a stale closedBy from the last run is not carried onto a position still in the book", !(r5d.st.cipher_open["APT|short"] || {}).closedBy && r5d.st.cipher_health.status === "FAIL", JSON.stringify(r5d.st.cipher_health));
+ok("5b's filled close is marked confirmed", r5b.st.cipher_open["APT|short"] && r5b.st.cipher_open["APT|short"].closeConfirmed === true);
+
 console.log("\n6. De-hedge close: reduce-only, and no \"NaN\" anywhere in the body");
 const HEDGE = [{ symbol:"ADAUSDT", posSide:"Long", side:"Buy", size:2007, avgEntryPriceRp:"0.2049", markPriceRp:"0.205" },
                { symbol:"ADAUSDT", posSide:"Short", side:"Sell", size:321, avgEntryPriceRp:"0.21", markPriceRp:"0.205" }];
@@ -187,11 +203,55 @@ const r9 = await run({ label:"manual", state: prev, positions: [], fills: fillAt
 const res9 = r9.ledger.find(e => e.kind === "resolved" && e.coin === "SOL");
 ok("closedBy = outside_bot, not counted", res9 && res9.closedBy === "outside_bot" && res9.countsForStats === false, JSON.stringify(res9));
 
-console.log("\n10. No fill to be found — falls back to the range, and says what the venue returned");
-const r10 = await run({ label:"nofill", state: prev, positions: [], fills: {} });
-ok("still resolved (range fallback)", r10.ledger.some(e => e.kind === "resolved" && e.coin === "SOL"));
+console.log("\n10. No fill to be found — NOT graded from the range: it waits and is asked again (Gray #4)");
+const r10 = await run({ label:"nofill", keep:"nofill", state: prev, positions: [], fills: {} });
+ok("not written to the ledger yet", !r10.ledger.some(e => e.kind === "resolved" && e.coin === "SOL"), JSON.stringify(r10.ledger));
+ok("held in cipher_fill_pending with one try counted", (r10.st.cipher_fill_pending || []).length === 1 && r10.st.cipher_fill_pending[0].tries === 1, JSON.stringify(r10.st.cipher_fill_pending));
+ok("both endpoints were asked", r10.fillCalls.includes("SOLUSDT") && r10.fillCalls.includes("SOLUSDT:api-data"), JSON.stringify(r10.fillCalls));
 ok("the empty lookup is logged once per run, with the venue's answer", r10.log.filter(e => e.result === "FILL LOOKUP EMPTY").length === 1);
 ok("AUDIT 2: and that line names every coin it missed", r10.log.some(e => e.result === "FILL LOOKUP EMPTY" && /SOL short/.test(e.skipped || "")));
+
+console.log("\n10a. The fill turns up on the NEXT run — graded from the fill, then cleared from pending");
+const ga = await run({ label:"nofill-found", keep:"nofill", positions: [], fills: fillAt(100.89, "cipherTarget1", "Limit", "T1") });
+const gresa = ga.ledger.find(e => e.kind === "resolved" && e.coin === "SOL");
+ok("resolved from the venue fill", gresa && gresa.gradedOn === "venue_fill" && gresa.how === "target" && gresa.countsForStats === true, JSON.stringify(gresa));
+ok("pending list emptied", (ga.st.cipher_fill_pending || []).length === 0);
+
+console.log("\n10c. Never found — after FILL_RETRY_RUNS it is written, but NOT counted");
+process.env.FILL_RETRY_RUNS = "2";
+await run({ label:"nf2a", keep:"nf2", state: prev, positions: [], fills: {} });
+const gn = await run({ label:"nf2b", keep:"nf2", positions: [], fills: {} });
+delete process.env.FILL_RETRY_RUNS;
+const gresn = gn.ledger.find(e => e.kind === "resolved" && e.coin === "SOL");
+ok("written after the last try", !!gresn, JSON.stringify(gn.st.cipher_fill_pending));
+ok("countsForStats false, labelled no_fill_range_only", gresn && gresn.countsForStats === false && gresn.execution === "no_fill_range_only", JSON.stringify(gresn));
+
+console.log("\n10d. The venue answers 503 / 10500 — retried, and the answer is in the log");
+let hits10d = 0;
+const gd = await run({ label:"n503", state: prev, positions: [], fillReply: (u) => { hits10d++; return { status: 503, body: { code: 10500, msg: "service unavailable" } }; } });
+ok("each endpoint is tried twice", hits10d === 4, hits10d);
+ok("the log carries http 503 and code 10500", gd.log.some(e => e.result === "FILL LOOKUP EMPTY" && /http 503/.test(e.skipped) && /10500/.test(e.skipped)), JSON.stringify(gd.log.find(e => e.result === "FILL LOOKUP EMPTY")));
+
+console.log("\n10e. Phemex's REAL USDT tradingList shape: numeric side/posSide/ordType, no clOrdID, every symbol");
+const numericRows = { SOLUSDT: [
+  { symbol:"ADAUSDT", side:2, posSide:2, ordType:2, execPriceRp:"0.3", execQtyRq:"100", createdAt: Date.now()-10*6e4 },   // another coin, newer
+  { symbol:"SOLUSDT", side:1, posSide:"2", ordType:2, execPriceRp:"100.90", execQtyRq:"2.4", createdAt: Date.now()-36e5, closedPnlRv:"14.6" },
+  { symbol:"SOLUSDT", side:2, posSide:2, ordType:1, execPriceRp:"106.97", execQtyRq:"2.4", createdAt: SINCE + 1000 } ] };   // the opening fill
+const ge = await run({ label:"numeric", state: prev, positions: [], fills: numericRows });
+const grese = ge.ledger.find(e => e.kind === "resolved" && e.coin === "SOL");
+ok("found the SOL closing fill (side 1 = Buy, posSide 2 = Short), not ADA's", grese && grese.fill && Math.abs(grese.fill.px - 100.90) < 1e-9, JSON.stringify(grese));
+ok("a limit fill at the target with no order ID counts as the target", grese && grese.how === "target" && grese.countsForStats === true, JSON.stringify(grese));
+const { pickClosingFill: pcf } = ge.A;
+ok("pickClosingFill ignores another symbol's fill", pcf([{ symbol:"ADAUSDT", side:1, posSide:2, execPriceRp:"1", createdAt: Date.now() }], "Short", SINCE, "SOLUSDT") === null);
+
+console.log("\n10f. DOT: a breach close with NO fill is recorded but not counted (Gray #3)");
+const DOT_PREV = { cipher_protect_rev: RESET_DONE, cipher_open: { "DOT|long": { coin:"DOT", dir:"long", size:110, book:"swing", closedBy:"stop_breach_close",
+  plan:{ entry:1.101, stop:1.1087956917698574, target:1.2219096935178206 }, since: SINCE, avgEntry:1.101 } } };
+process.env.FILL_RETRY_RUNS = "1";
+const gf = await run({ label:"dot-nofill", state: DOT_PREV, positions: [], fills: {} });
+delete process.env.FILL_RETRY_RUNS;
+const gresf = gf.ledger.find(e => e.kind === "resolved" && e.coin === "DOT");
+ok("not counted, no R", gresf && gresf.countsForStats === false && gresf.countsForStreak === false && gresf.R === undefined, JSON.stringify(gresf));
 
 console.log("\n10b. AUDIT: same coin and side REOPENED between runs (entry moved)");
 const reopenPos = [{ symbol:"SOLUSDT", posSide:"Short", side:"Sell", size:3.0, avgEntryPriceRp:"104.00" }];
@@ -318,8 +378,10 @@ ok("a PULLED record does not count as covered", h3.status === "FAIL", JSON.strin
 const h4 = healthOf({ now, canSeeBook:true, mode:"armed", open: openOK, registry: regOK, runLog: [], prevBeatAt: new Date(now - 5*36e5).toISOString() });
 ok("a 5-hour gap since the last run → WARN with the minutes", h4.status === "WARN" && h4.gapMin === 300, JSON.stringify(h4));
 ok("unreadable positions → FAIL", healthOf({ now, canSeeBook:false, mode:"armed", open:{}, registry:{}, runLog:[] }).status === "FAIL");
-ok("a position closed this run by a breach is not counted as unprotected",
-   healthOf({ now, canSeeBook:true, mode:"armed", open: { "DOT|long": { coin:"DOT", dir:"long", size:110, plan:{ stop:1, target:2 }, closedBy:"stop_breach_close" } }, registry:{}, runLog:[] }).status === "OK");
+ok("a position whose breach close was CONFIRMED gone is not counted as unprotected",
+   healthOf({ now, canSeeBook:true, mode:"armed", open: { "DOT|long": { coin:"DOT", dir:"long", size:110, plan:{ stop:1, target:2 }, closedBy:"stop_breach_close", closeConfirmed:true } }, registry:{}, runLog:[] }).status === "OK");
+const hAPT = healthOf({ now, canSeeBook:true, mode:"armed", open: { "APT|short": { coin:"APT", dir:"short", size:507, plan:{ stop:1, target:2 }, closedBy:"stop_breach_close" } }, registry:{}, runLog:[] });
+ok("but a closedBy label with size > 0 and no confirmation IS counted — FAIL, named (Gray #2)", hAPT.status === "FAIL" && /APT short/.test(hAPT.problems.join()), JSON.stringify(hAPT));
 
 console.log("\n14. TRIGGER — every 15 minutes, never two runs at once");
 const trigSrc = fs.readFileSync("cipher-trigger-valtown.js", "utf8");

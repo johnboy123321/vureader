@@ -598,7 +598,9 @@ function detectMomentumRollover(c) {
   return null;
 }
 
-function detectGreenDotMFReversal(c) {
+// `daily` (2026-10-27): the 200 EMA is the DAILY one, as labelled. It used to be computed on whatever
+// timeframe the dot fired on, so a 1H dot's "daily 200 EMA" was the 200-hour line.
+function detectGreenDotMFReversal(c, daily) {
   if (!c || c.length < 80) return null;
   const { wt1, wt2 } = waveTrend(c); const mf = vmcMoneyFlow(c); const n = c.length, i = n-1;
   // green dot must have printed on the last 1–2 closed bars (fresh), in oversold
@@ -621,13 +623,22 @@ function detectGreenDotMFReversal(c) {
   if (mfAccel) { score++; ev.push('MF accelerating, not just rising'); }
   const vr = Math.max(volRatio(c, gI) || 0, volRatio(c, i) || 0);
   if (vr >= 1.5) { score++; ev.push(`volume ${vr.toFixed(1)}× the 20-bar avg`); } else ev.push(`volume ${vr.toFixed(1)}× avg (modest)`);
-  const ema200 = ema200At(c, i);
+  const d = daily && daily.length ? daily : null;
+  const ema200 = d ? ema200At(d, d.length - 1) : null;            // no daily bars → no trend read, not a guess
   const withTrend = ema200 == null ? null : c[i].c > ema200;
   if (withTrend === true)  { score++; ev.push('above daily 200 EMA — with trend'); }
   if (withTrend === false) { score--; ev.push('below daily 200 EMA — counter-trend, half size or skip'); }
   ev.push(`+${movePct.toFixed(0)}% off the low (early)`);
   const risk = c[i].c - lo*0.985;
-  return { match:true, dir:'long', label:'Green Dot MF Reversal', stage: withTrend === false ? 'counter-trend reversal' : 'reversal', score, base:lo,
+  // ── THE RANKING COULD NEVER SEE ANY OF THIS (2026-10-27) ──────────────────────────────────
+  // The ranker only reads `stage`, and only 'extreme'/'fresh' earn its +1. This returned 'reversal'
+  // every time, so a 4H dot topped out at 2.5+2 = 4.5 and a 1H at 4.0 against MIN_QUALITY 5 —
+  // the same arithmetic dead end the 4H rollover had on 2026-08-13, and why the ledger holds zero
+  // green-dot trades. Now a dot the detector itself rates strong (score ≥ 6: at least two
+  // confirmations net) and that is NOT under the daily 200 EMA is 'fresh'. A counter-trend dot
+  // never is, so the 200 EMA penalty finally bites too. GREENDOT_FRESH_SCORE moves the bar.
+  const fresh = withTrend !== false && score >= num('GREENDOT_FRESH_SCORE', 6);
+  return { match:true, dir:'long', label:'Green Dot MF Reversal', stage: withTrend === false ? 'counter-trend reversal' : fresh ? 'fresh' : 'reversal', score, base:lo,
     entry:c[i].c, stop:lo*0.985, target:c[i].c + (risk>0?risk:c[i].c*0.02)*2, ev };
 }
 
@@ -1395,9 +1406,12 @@ function snapshotOpen(positions, bookMap, prev) {
                setup: (prev && prev[k] && prev[k].setup) || undefined,
                setupTf: (prev && prev[k] && prev[k].setupTf) || undefined,
                quality: (prev && prev[k] && Number.isFinite(prev[k].quality)) ? prev[k].quality : undefined,
-               // what last closed it, when the bot itself did (e.g. a breached-stop close) —
-               // read by the resolution pass on the run after (2026-10-26)
-               closedBy: (prev && prev[k] && prev[k].closedBy) || undefined };
+               // what last closed it, when the bot itself did (e.g. a breached-stop close) — read
+               // by the resolution pass on the run after (2026-10-26). NOT carried forward
+               // (2026-10-27): this position is in the venue's book RIGHT NOW, so whatever "closed"
+               // it last run did not. Carrying the label let APT sit open with no stop for nine
+               // hours while HEALTH read OK, because healthOf skipped anything with closedBy set.
+               closedBy: undefined };
   }
   return out;
 }
@@ -1801,9 +1815,33 @@ function fillRowsFrom(body, depth = 0) {
   return null;
 }
 
+// ── PHEMEX'S USDT TRADE HISTORY SPEAKS IN NUMBERS (2026-10-27) ──────────────────────────────────
+// /exchange/order/v2/tradingList answers with side 1/2, posSide 1/2/3 and ordType 1..14 — not the
+// "Buy"/"Sell"/"Long" strings every matcher below compared against. So 50 fills came back and
+// "none closing Short" every time: 0 of 167 resolved records ever had a real fill. It also carries
+// no clOrdID, createdAt in ms, and (like ccxt's own call) may return EVERY symbol's fills, so the
+// symbol must be checked too. Enums per Phemex/ccxt: side 1 Buy 2 Sell; posSide 1 Long 2 Short
+// 3 Merged; ordType 1 Market 2 Limit 3 Stop 4 StopLimit 5 MarketIfTouched 6 LimitIfTouched …
+// The first raw row is logged on every miss so this mapping can be checked against the venue.
+const FILL_SIDE = { "1": "Buy", "2": "Sell" };
+const FILL_POS  = { "1": "Long", "2": "Short", "3": "Merged" };
+const FILL_ORD  = { "1": "Market", "2": "Limit", "3": "Stop", "4": "StopLimit", "5": "MarketIfTouched",
+  "6": "LimitIfTouched", "7": "ProtectedMarket", "8": "MarketAsLimit", "9": "StopAsLimit",
+  "10": "MarketIfTouchedAsLimit", "11": "Bracket", "12": "BoTpLimit", "13": "BoSlLimit", "14": "BoSlMarket" };
+function normFillRow(r) {
+  if (!r || typeof r !== "object") return r;
+  const o = { ...r };
+  const sd = String(r.side ?? ""); if (FILL_SIDE[sd]) o.side = FILL_SIDE[sd];
+  const ps = String(r.posSide ?? ""); if (FILL_POS[ps]) o.posSide = FILL_POS[ps];
+  const ot = String(r.ordType ?? ""); if (FILL_ORD[ot]) o.ordType = FILL_ORD[ot];
+  return o;
+}
+const fillSymOk = (r, symbol) => !symbol || !r.symbol || String(r.symbol) === symbol;
+
 // PURE. The most recent fill that CLOSED this side of the position, after it opened.
-function pickClosingFill(rows, posSide, sinceMs) {
+function pickClosingFill(rows, posSide, sinceMs, symbol) {
   const closing = posSide === "Long" ? "Sell" : "Buy";
+  rows = (rows || []).map(normFillRow).filter(r => r && fillSymOk(r, symbol) && !/funding/i.test(String(r.tradeType || "")));
   const at = r => {
     const ns = Number(r.transactTimeNs); if (ns > 0) return ns / 1e6;
     const ms = Number(r.createdAt ?? r.execTime ?? r.transactTime ?? r.timestamp); if (ms > 0) return ms > 1e14 ? ms / 1e6 : ms;
@@ -1884,18 +1922,32 @@ function attributeClose(was, fill, reg) {
   if (/iftouched|takeprofit|^bo/i.test(fill.ordType))
     return near(target) ? strat("target", "venue_target", `a target order filled at ${formatPrice(fill.px)}`)
                         : art("closed_by_hand", "venue_target_elsewhere", `a take-profit order filled at ${formatPrice(fill.px)}, not near this position's target ${formatPrice(target)}`);
+  // ── NO ORDER ID ON THE FILL (2026-10-27) ───────────────────────────────────────────────────
+  // USDT tradingList rows carry no clOrdID, so nothing above can name the order. Fall back to
+  // what the fill itself shows: our target is a plain reduce-only Limit at the plan's level, and
+  // a Market close on a position this bot just breach-closed is that close.
+  if (!fill.clOrdID && !fill.orderID) {
+    if (/^limit$/i.test(fill.ordType) && near(target))
+      return strat("target", "cipher_target", `a limit fill at the plan's target level ${formatPrice(fill.px)} (the venue's row carries no order ID)`);
+    if (/market/i.test(fill.ordType) && was.closedBy === "stop_breach_close")
+      return strat("stop", "stop_breach_close", `price was already past the stop; the bot closed it at market, filled at ${formatPrice(fill.px)}`);
+  }
   return art("closed_by_hand", "outside_bot", `closed by an order this bot did not send (${fill.ordType || "unknown type"}${fill.clOrdID ? ", " + fill.clOrdID.slice(0, 20) : ""}) at ${formatPrice(fill.px)} — by hand, the app, or another tool`);
 }
 
 // PURE. How much of this side was CLOSED by fills at or after sinceMs. Rows without a readable time
 // are not counted — they cannot be shown to come after the position opened.
-function closedQtySince(rows, posSide, sinceMs) {
+function closedQtySince(rows, posSide, sinceMs, symbol) {
   const closing = posSide === "Long" ? "Sell" : "Buy";
   let q = 0;
-  for (const r of rows || []) {
+  for (const r0 of rows || []) {
+    const r = normFillRow(r0);
     // The row must SAY it closed this side (audit, 3rd pass): a row with no side could be the
     // opening fill of the opposite leg, and counting it would record a reopen that never happened.
-    if (!r || String(r.side || "") !== closing || (r.posSide && String(r.posSide) !== posSide)) continue;
+    // Since 2026-10-27 it must also be THIS symbol and name its posSide: this decides whether a
+    // live position's stop gets pulled, so another coin's fill, or a Sell that might have OPENED a
+    // short rather than closed a long, must never count.
+    if (!r || !fillSymOk(r, symbol) || String(r.side || "") !== closing || String(r.posSide || "") !== posSide) continue;
     const ns = Number(r.transactTimeNs); const ms = ns > 0 ? ns / 1e6 : Number(r.createdAt ?? r.execTime ?? r.transactTime ?? 0);
     const t = ms > 1e14 ? ms / 1e6 : ms;
     if (!(t > 0) || t < sinceMs - 60e3) continue;
@@ -1905,29 +1957,60 @@ function closedQtySince(rows, posSide, sinceMs) {
 }
 
 let lastFillMiss = "";
-async function fetchFillRows(symbol, sinceMs) {
-  if (!CFG.direct()) return { rows: null, seen: ["relay mode"] };
+// One endpoint's answer in a line a human can diagnose from the log: status, venue code, how many
+// rows, how many for THIS symbol, and the first raw row's fields. "No fill" used to hide which of
+// "the venue is down (503 / 10500)", "the venue answered but our matcher said no" or "nothing
+// there" it was — and those need opposite fixes.
+function fillReplyLine(path, r, rows, symbol) {
+  const code = r && r.data && r.data.code;
+  const head = `${path} → http ${r ? r.status : "?"}${code !== undefined ? ` code ${code}` : ""}`;
+  if (!rows) return `${head} ${JSON.stringify((r && r.data) || {}).slice(0, 160)}`;
+  const mine = rows.filter(x => fillSymOk(x, symbol)).length;
+  const first = rows[0] ? JSON.stringify(rows[0]).slice(0, 260) : "";
+  return `${head}, ${rows.length} row(s), ${mine} for ${symbol}${first ? `; first row ${first}` : ""}`;
+}
+const fillRetryable = r => !r || r.status >= 500 || (r.data && Number(r.data.code) === 10500);
+
+// Every endpoint, in order, each retried once on a 5xx / 10500. Returns per-endpoint row sets so a
+// caller can move on to the next endpoint when the first answered but held nothing useful.
+async function fetchFillSets(symbol, sinceMs) {
+  if (!CFG.direct()) return { sets: [], seen: ["relay mode"] };
+  const start = sinceMs ? `&start=${Math.floor(sinceMs - 60e3)}` : "";
   const tries = [
-    ["/exchange/order/v2/tradingList", `symbol=${symbol}&currency=USDT&offset=0&limit=50&withCount=false`],
-    ["/api-data/g-futures/trades", `symbol=${symbol}&limit=50` + (sinceMs ? `&start=${Math.floor(sinceMs - 60e3)}` : "")],
+    ["/exchange/order/v2/tradingList", `symbol=${symbol}&currency=USDT&offset=0&limit=200&withCount=false` + start],
+    ["/api-data/g-futures/trades", `symbol=${symbol}&limit=200` + start],
   ];
-  const seen = [];
+  const sets = [], seen = [];
   for (const [path, q] of tries) {
-    try {
-      const r = await phemexCall("GET", path, q, null);
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      let r = null;
+      try { r = await phemexCall("GET", path, q, null); }
+      catch (e) { seen.push(`${path} (try ${attempt}) → ${String((e && e.message) || e).slice(0, 100)}`); if (attempt === 1) { await new Promise(res => setTimeout(res, 1000)); continue; } break; }
       const rows = r.status === 200 ? fillRowsFrom(r.data) : null;
-      if (rows && rows.length) return { rows, seen, via: path };
-      seen.push(`${path} → http ${r.status} ${JSON.stringify(r.data || {}).slice(0, 160)}`);
-    } catch (e) { seen.push(`${path} → ${String((e && e.message) || e).slice(0, 100)}`); }
+      seen.push((attempt > 1 ? "(retry) " : "") + fillReplyLine(path, r, rows, symbol));
+      if (rows && rows.length) { sets.push({ via: path, rows: rows.map(normFillRow) }); break; }
+      if (attempt === 1 && fillRetryable(r)) { await new Promise(res => setTimeout(res, 1000)); continue; }
+      break;
+    }
   }
-  return { rows: null, seen };
+  return { sets, seen };
+}
+
+// Kept for the reopen check: the first endpoint that returned rows, normalised.
+async function fetchFillRows(symbol, sinceMs) {
+  const { sets, seen } = await fetchFillSets(symbol, sinceMs);
+  return sets.length ? { rows: sets[0].rows, seen, via: sets[0].via } : { rows: null, seen };
 }
 
 async function fetchCloseFill(symbol, posSide, sinceMs) {
   // A position with no recorded start still gets a window, never an open-ended one.
   const since = Number(sinceMs) > 0 ? Number(sinceMs) : Date.now() - 7 * 864e5;
-  const { rows, seen, via } = await fetchFillRows(symbol, since);
-  if (rows) { const f = pickClosingFill(rows, posSide, since); if (f) return { ...f, via }; seen.push(`${via} → ${rows.length} fill(s), none closing ${posSide} since the position opened`); }
+  const { sets, seen } = await fetchFillSets(symbol, since);
+  for (const { rows, via } of sets) {
+    const f = pickClosingFill(rows, posSide, since, symbol);
+    if (f) return { ...f, via };
+    seen.push(`${via} → none closing ${symbol} ${posSide} since the position opened`);
+  }
   lastFillMiss = seen.join(" ;; ");
   return null;
 }
@@ -2663,7 +2746,25 @@ async function directBreachClose({ symbol, posSide, qty }) {
   const code = r.data && r.data.code;
   if (r.status !== 200) return { ok: false, why: `phemex http ${r.status}` };
   if (code !== 0 && code !== undefined) return { ok: false, why: `phemex ${code}: ${(r.data && r.data.msg) || "rejected"}` };
-  return { ok: true };
+  return { ok: true, accepted: true };
+}
+
+// ── DID THE BREACH CLOSE ACTUALLY CLOSE ANYTHING? (2026-10-27) ──────────────────────────────────
+// Phemex answers code 0 to a Market IOC the moment it ACCEPTS it. On a thin testnet book (APT: the
+// ticker itself returns 6001) the IOC then finds nothing to trade against and is cancelled, and
+// the position is exactly where it was. The old code read code 0 as "closed", logged STOP BREACHED
+// — CLOSED 31 times in nine hours and stamped closedBy, which HEALTH then skipped. Only the
+// position book can say the position is gone, so ask it.
+// true = gone, false = still open (with its size), null = could not read the book (NOT gone).
+async function breachCloseFilled(symbol, posSide, waitMs = 1500) {
+  if (waitMs > 0) await new Promise(res => setTimeout(res, waitMs));
+  let rows = null;
+  try { rows = await execPositions(); } catch { rows = null; }
+  if (!Array.isArray(rows)) return { gone: null };
+  const want = String(posSide).toLowerCase();
+  const hit = rows.find(p => String(p.symbol || "") === symbol &&
+    (String(p.posSide || p.side || "").toLowerCase() === want) && Math.abs(Number(p.size) || 0) > 0);
+  return hit ? { gone: false, size: Math.abs(Number(hit.size)) } : { gone: true };
 }
 
 // Cancel every UNTRIGGERED conditional order on a symbol (stops, if-touched). Leaves plain limit
@@ -2792,11 +2893,22 @@ async function protectOpenPositions(nowOpen, priceOf) {
         // impossible, and leaving the position open contradicts the plan. Close it — the exit the
         // plan asked for, a little late. (DOT 2026-10-26: refused every run for days instead.)
         const c = await directBreachClose({ symbol, posSide, qty: pos.size });
-        if (c.ok && !c.dry) {
+        const where = Number(ref) > 0 ? `the venue's mark ${formatPrice(ref)} is already past` : `the venue refused the stop as already behind price (no mark readable) — price is past`;
+        const chk = c.ok && !c.dry ? await breachCloseFilled(symbol, posSide, num("BREACH_VERIFY_MS", 1500)) : null;
+        if (chk && chk.gone === true) {
           out.breached++;
           pos.closedBy = "stop_breach_close";
+          pos.closeConfirmed = true;            // the book no longer shows it — HEALTH may stop counting it
           await pushLog({ coin: pos.coin, dir: pos.dir, result: "STOP BREACHED — CLOSED",
-            skipped: `the venue's price ${formatPrice(ref)} is already past the plan's stop ${formatPrice(pos.plan.stop)}, so a stop could not be placed. Closed at market, which is what the plan's stop would have done.` });
+            skipped: `${where} the plan's stop ${formatPrice(pos.plan.stop)}, so a stop could not be placed. Closed at market and CONFIRMED gone from the position book.` });
+        } else if (chk) {
+          // Accepted but not filled (or the book could not be read to prove it). The position is
+          // still open and still has no stop: say so as a failure, never as a close.
+          out.failed++;
+          await pushLog({ coin: pos.coin, dir: pos.dir, result: "STOP BREACH CLOSE DID NOT FILL",
+            skipped: `${where} the plan's stop ${formatPrice(pos.plan.stop)}. The market close was accepted (code 0) but ` +
+              (chk.gone === false ? `the position is STILL OPEN (size ${chk.size}) — the IOC found no liquidity.` : `the position book could not be read to confirm it closed.`) +
+              ` This position has NO STOP. Close it by hand at the venue if it matters; the bot retries every run.` });
         } else if (!c.ok) {
           out.failed++;
           await pushLog({ coin: pos.coin, dir: pos.dir, result: "STOP ATTACH FAILED",
@@ -5570,7 +5682,9 @@ const HEALTH_KEY = "cipher_health";
 function healthOf({ now, canSeeBook, mode, open, registry, runLog, prevBeatAt, maxGapMin = 45 }) {
   const fail = [], warn = [];
   if (!canSeeBook) fail.push("could not read open positions from Phemex — nothing was placed or protected this run");
-  const live = Object.entries(open || {}).filter(([, p]) => p && p.size > 0 && p.plan && !p.closedBy);
+  // Every position with size > 0 counts (2026-10-27). The one exception is a close this run that
+  // was CONFIRMED gone from the venue's book — a closedBy label on its own proves nothing (APT).
+  const live = Object.entries(open || {}).filter(([, p]) => p && p.size > 0 && p.plan && !(p.closedBy && p.closeConfirmed));
   let stops = 0, targets = 0;
   const noStop = [], noTarget = [];
   for (const [k, p] of live) {
@@ -5589,7 +5703,7 @@ function healthOf({ now, canSeeBook, mode, open, registry, runLog, prevBeatAt, m
   if (n1) warn.push(`${n1} stop attach failure(s)`);
   if (n2) warn.push(`${n2} de-hedge failure(s)`);
   if (n3) warn.push(`${n3} order error(s)`);
-  if (n4) warn.push("some closes graded from the price range (no fill found)");
+  if (n4) warn.push("some closes have no venue fill yet (retrying; not counted until found)");
   const gapMin = prevBeatAt ? Math.round((now - Date.parse(prevBeatAt)) / 6e4) : null;
   if (gapMin != null && gapMin > maxGapMin) warn.push(`${gapMin} min since the previous run (expected ≤ ${maxGapMin})`);
   return { at: new Date(now).toISOString(), status: fail.length ? "FAIL" : warn.length ? "WARN" : "OK", mode,
@@ -5782,7 +5896,7 @@ export default async function cipherAgent() {
         try {
           const { rows } = await fetchFillRows(`${was.coin}USDT`, was.since);
           if (!rows) continue;
-          const closed = closedQtySince(rows, was.dir === "short" ? "Short" : "Long", Number(was.since));
+          const closed = closedQtySince(rows, was.dir === "short" ? "Short" : "Long", Number(was.since), `${was.coin}USDT`);
           if (closed >= Number(was.size) * 0.999) reopenedKeys.add(k);
         } catch { }
       }
@@ -5929,7 +6043,7 @@ export default async function cipherAgent() {
       for (const tf of ["1D", "4H", "1H", "30m", "15m"]) {
         const c = bars[tf]; if (!c || c.length < 80) continue;
         for (const [nm, fn] of [["divergence", detectWTDivergence], ["rollover", detectMomentumRollover], ["greendot", detectGreenDotMFReversal]]) {
-          let r = null; try { r = fn(c); } catch {}
+          let r = null; try { r = fn(c, bars["1D"]); } catch {}   // 2nd arg: daily bars (only the green dot reads it)
           if (!r || !r.match) continue;
           const bonus = (r.stage === "extreme" || r.stage === "fresh") ? 1 : 0;
           hits.push({ m: r, label: nm, tf, c, q: (TF_WEIGHT[tf] || 1) + (DET_WEIGHT[nm] || 1) + bonus });
@@ -6093,7 +6207,7 @@ export default async function cipherAgent() {
     // The ledger gets the order attempt too, so a rejection rate can be measured over months
     // rather than over whatever happens to still be in the last 300 log lines.
     await pushLedger({ kind: ok ? "placed" : "rejected", coin: t.coin, dir: t.dir, book, setup: setupName, setupTf, quality,
-      entry: t.entry, stop: t.sl, target: t.tp1, qty: built.meta.qty, risk: built.meta.riskActual,
+      entry: t.entry, stop: t.sl, target: t.tp2 ?? t.tp1, qty: built.meta.qty,   // the 2.25R the order rests at, not 1R (2026-10-27) risk: built.meta.riskActual,
       mode, via: EXEC(), orderID: oid || undefined,
       dryRun: ok ? !!r.data.dryRun : undefined,
       rejection: ok ? undefined : { ...explainRejection(why), raw: String(why).slice(0, 120) },
@@ -6479,37 +6593,59 @@ export default async function cipherAgent() {
     // The range verdict above stays as the fallback. Where Phemex's trade history has the closing
     // fill, that fill decides: its price is the real exit and its clOrdID names the closer. Capped
     // per run so a mass close cannot turn one run into fifty API calls.
+    // ── NO FILL YET → ASK AGAIN NEXT RUN, DON'T GRADE FROM THE RANGE (2026-10-27) ───────────────
+    // 0 of 167 resolved records ever carried a real fill, and 62 range-graded guesses were counted
+    // as strategy results. A record with no fill now waits in cipher_fill_pending and is looked up
+    // again each run (FILL_RETRY_RUNS, default 8 ≈ 2 hours). Found → graded from the fill. Never
+    // found → written with the range verdict for information, but NOT counted in the stats. The
+    // streak still sees it, because the breaker failing safe matters more than a clean ledger.
+    const PENDING_KEY = "cipher_fill_pending";
+    const maxTries = num("FILL_RETRY_RUNS", 8), lookupCap = num("FILL_LOOKUPS_PER_RUN", 8);
     let fillLookups = 0, fillsFound = 0; const fillMisses = []; let firstMiss = "";
     const protectReg = (await getJSON(PROTECT_KEY, {})) || {};
     const regKeys = resolved.map(r => regKeyFor(posKey(r.coin, r.dir), r.since, protectReg));
-    for (let i = 0; i < resolved.length; i++) {
-      const r = resolved[i];
-      if (!r.plan || fillLookups >= num("FILL_LOOKUPS_PER_RUN", 8)) continue;
-      fillLookups++;
+    const pendingIn = (await getJSON(PENDING_KEY, [])) || [];
+    const work = [
+      ...pendingIn.filter(w => w && w.r).map(w => ({ ...w, fresh: false })),
+      ...resolved.map((r, i) => ({ r, reg: regKeys[i] ? protectReg[regKeys[i]] : null, tries: 0, firstAt: Date.now(), fresh: true })),
+    ];
+    const done = [], stillPending = [];
+    const finalNoFill = (r, tries) => r.closedBy === "stop_breach_close"
+      // We closed it ourselves because the stop was already behind price — but with no fill
+      // there is no exit price, and an R from "the last price" against a stop that may have
+      // trailed past entry is meaningless (DOT 2026-10-26: stop ABOVE entry, −2.437R).
+      ? { ...r, how: "stop", closedBy: "stop_breach_close", outcome: "unattributed", klass: "execution_artifact",
+          execution: "breach_close_no_fill", countsForStreak: false, countsForStats: false, R: undefined,
+          why: `the bot closed it at market because price was already past its stop — no closing fill found after ${tries} lookup(s), so no R and not counted` }
+      : { ...r, countsForStats: false, execution: "no_fill_range_only",
+          why: `${r.why || ""} — no closing fill at the venue after ${tries} lookup(s); this range verdict is information only and NOT counted`.trim() };
+    for (const w of work) {
+      const r = w.r;
+      if (!r.plan) { done.push(r); continue; }
+      if (fillLookups >= lookupCap) { stillPending.push(w); continue; }     // not tried, so not a try
+      fillLookups++; w.tries = (w.tries || 0) + 1;
       let fill = null;
       try { fill = await fetchCloseFill(`${r.coin}USDT`, r.dir === "short" ? "Short" : "Long", Number(r.since) || 0); } catch { }
-      if (fill) fillsFound++; else { fillMisses.push(`${r.coin} ${r.dir}`); if (!firstMiss) firstMiss = lastFillMiss; }
-      const a = attributeClose(r, fill, regKeys[i] ? protectReg[regKeys[i]] : null);
-      if (a) resolved[i] = { ...r, ...a };
-      else if (r.closedBy === "stop_breach_close" && Number.isFinite(r.exit)) {
-        // We closed it ourselves last run because the stop was already behind price.
-        const risk = Math.abs(r.plan.entry - r.plan.stop);
-        resolved[i] = { ...r, how: "stop", closedBy: "stop_breach_close", outcome: "loss", klass: "strategy",
-          execution: "filled_snapshot_only", countsForStreak: true, countsForStats: true,
-          R: risk > 0 ? +(((r.dir === "short" ? r.plan.entry - r.exit : r.exit - r.plan.entry)) / risk).toFixed(3) : -1,
-          why: "the bot closed it at market because price was already past its stop (no fill found, R from the last price)" };
-        if (resolved[i].R > 0) resolved[i].outcome = "win";
-      }
+      const a = fill ? attributeClose(r, fill, w.reg || null) : null;
+      if (a) { fillsFound++; done.push({ ...r, ...a }); continue; }
+      fillMisses.push(`${r.coin} ${r.dir} (try ${w.tries}/${maxTries})`); if (!firstMiss) firstMiss = lastFillMiss;
+      if (w.tries < maxTries) stillPending.push(w);
+      else done.push(finalNoFill(r, w.tries));
     }
+    // A pending record is a closed position: it must not hold a book slot while it waits.
+    for (const w of stillPending) if (w.fresh) delete bookMap[posKey(w.r.coin, w.r.dir)];
+    await setJSON(PENDING_KEY, stillPending.slice(-50).map(({ fresh, ...w }) => w));
+    const nNew = resolved.length;
+    resolved.length = 0; resolved.push(...done);
     // Take each ended position's recorded stop and target off the venue, so neither can fire on
     // the next position opened on the same coin and side.
     try {
-      if (fillLookups) console.log(`fill lookups: ${fillsFound} of ${fillLookups} closing fill(s) found at the venue — the rest were graded from the price range`);
-      // One line per run naming EVERY miss (audit: the old once-per-run line named only the first).
+      if (fillLookups) console.log(`fill lookups: ${fillsFound} of ${fillLookups} closing fill(s) found at the venue; ${stillPending.length} waiting to be asked again`);
+      // One line per run naming EVERY miss, and what each endpoint actually answered.
       if (fillMisses.length) await pushLog({ result: "FILL LOOKUP EMPTY",
-        skipped: `${fillMisses.length} of ${fillLookups} closed position(s) had no closing fill at the venue and were graded from the price range: ${fillMisses.join(", ")}. First venue answer: ${String(firstMiss).slice(0, 300)}` });
+        skipped: `${fillMisses.length} of ${fillLookups} closed position(s) had no closing fill at the venue yet — retried next run, NOT graded from the price range: ${fillMisses.join(", ")}. Venue answers: ${String(firstMiss).slice(0, 700)}` });
       const pulled = await cancelProtectionFor(regKeys.filter(Boolean));
-      if (pulled) console.log(`protection: cancelled ${pulled} leftover stop/target order(s) for ${resolved.length} closed position(s)`);
+      if (pulled) console.log(`protection: cancelled ${pulled} leftover stop/target order(s) for ${nNew} closed position(s)`);
     } catch (e) { console.error("leftover-order cleanup failed (harmless, retried by the next reset):", e && e.message); }
     const queue = [];
     for (const r of resolved) {
