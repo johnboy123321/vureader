@@ -2,6 +2,12 @@
   "cipher_cursor": 6,
   "cipher_log": [
     {
+      "at": "2026-11-06T04:09:16.739Z",
+      "coin": "BTC",
+      "result": "FLIP OFF",
+      "skipped": "1H dot flip switched off after 1 round trip — the pump ladder has the coins again: 0.00000000 BTC plus 555.95 USDT still in cash."
+    },
+    {
       "at": "2026-11-06T03:55:15.225Z",
       "coin": "APT",
       "dir": "short",
@@ -2447,12 +2453,6 @@
       "coin": "ARB",
       "dir": "short",
       "skipped": "signal too weak — rollover on 15m (quality 2.5 < 5)"
-    },
-    {
-      "at": "2026-11-05T22:38:03.749Z",
-      "coin": "LTC",
-      "dir": "short",
-      "skipped": "signal too weak — rollover on 4H (quality 4.5 < 5)"
     }
   ],
   "cipher_fired": {
@@ -31981,7 +31981,7 @@
       "baseBalance": 0.00463496,
       "quoteBalance": 4.94469533,
       "exec": "armed",
-      "checkedAt": 1793937323906
+      "checkedAt": 1793938154622
     },
     "seededReal": true,
     "seededAt": "2026-08-19T13:59:51.035Z",
@@ -31992,7 +31992,7 @@
         "cash": 0,
         "trips": 2223,
         "sells": 2223,
-        "lastT": 1793937300000,
+        "lastT": 1793937900000,
         "startUnits": 1,
         "unitsNow": 0.5743119,
         "gainPct": -42.57,
@@ -32003,10 +32003,10 @@
         "cash": 58634.285740674226,
         "trips": 790,
         "sells": 791,
-        "lastT": 1793935800000,
+        "lastT": 1793936700000,
         "startUnits": 1,
-        "unitsNow": 0.77251209,
-        "gainPct": -22.75,
+        "unitsNow": 0.7723971,
+        "gainPct": -22.76,
         "holding": false
       },
       "30m": {
@@ -32014,10 +32014,10 @@
         "cash": 60979.7783456242,
         "trips": 411,
         "sells": 412,
-        "lastT": 1793934000000,
+        "lastT": 1793935800000,
         "startUnits": 1,
-        "unitsNow": 0.80274153,
-        "gainPct": -19.73,
+        "unitsNow": 0.80329458,
+        "gainPct": -19.67,
         "holding": false
       },
       "1H": {
@@ -32025,7 +32025,7 @@
         "cash": 0,
         "trips": 211,
         "sells": 211,
-        "lastT": 1793930400000,
+        "lastT": 1793934000000,
         "startUnits": 1,
         "unitsNow": 0.98140331,
         "gainPct": -1.86,
@@ -32036,7 +32036,7 @@
         "cash": 0,
         "trips": 96,
         "sells": 96,
-        "lastT": 1793930400000,
+        "lastT": 1793937600000,
         "startUnits": 1,
         "unitsNow": 0.99875795,
         "gainPct": -0.12,
@@ -32047,10 +32047,10 @@
         "cash": 74196.59456258282,
         "trips": 69,
         "sells": 70,
-        "lastT": 1793916000000,
+        "lastT": 1793919600000,
         "startUnits": 1,
-        "unitsNow": 0.97195219,
-        "gainPct": -2.8,
+        "unitsNow": 0.97458725,
+        "gainPct": -2.54,
         "holding": false
       },
       "4H": {
@@ -32058,10 +32058,10 @@
         "cash": 61235.787322345466,
         "trips": 73,
         "sells": 74,
-        "lastT": 1793908800000,
+        "lastT": 1793923200000,
         "startUnits": 1,
-        "unitsNow": 0.80480851,
-        "gainPct": -19.52,
+        "unitsNow": 0.80666702,
+        "gainPct": -19.33,
         "holding": false
       },
       "1D": {
@@ -32078,10 +32078,8 @@
     },
     "liveFlip": {
       "tf": null,
-      "want": "1H",
-      "blocked": true,
-      "why": "the book holds 555.95 USDT but the SPOT wallet has 4.94 USDT and 0.00463496 BTC (~352.66 USDT). Nothing can be traded until the two agree — check whether the balance was moved off the spot wallet, then re-arm to reseed from what is actually there.",
-      "loggedAt": 1793923707628
+      "blocked": false,
+      "why": "off — the pump ladder holds the coins"
     },
     "ladders": {
       "L3x4": {
@@ -32129,7 +32127,7 @@
     }
   },
   "cipher_accum_liveflip": {
-    "tf": "1H",
+    "tf": null,
     "units": 0,
     "cash": 555.9549985099193,
     "trips": 1,
@@ -44435,15 +44433,12 @@
     ]
   },
   "cipher_health": {
-    "at": "2026-11-06T03:55:25.518Z",
-    "status": "OK",
-    "mode": "armed",
-    "positions": 10,
-    "stops": 10,
-    "targets": 10,
-    "operatorLegs": 0,
-    "gapMin": 15,
-    "problems": []
+    "at": "2026-11-06T04:09:16.765Z",
+    "status": "OFF",
+    "mode": "off",
+    "problems": [
+      "MODE is off — the futures scanner is idle"
+    ]
   },
   "cipher_fill_pending": [],
   "cipher_operator_hold": {},
