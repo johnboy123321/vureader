@@ -302,7 +302,7 @@ console.log('\n  GUARDS PRESENT IN THE DRIVER');
   // is a defect that already bit once, or would have.
   ok('the ladder is stood down when a flip owns the coins', /paused:\s*true,\s*pausedWhy/.test(src));
   ok('arming is refused while ladder rungs are still resting',
-     /flipBlocked\s*=\s*flipTf && state\.open && state\.open\.length > 0/.test(src));
+     /flipBlocked\s*=\s*\(!!flipTf \|\| isDotLadder\) && state\.open && state\.open\.length > 0/.test(src));
   ok("the whole-stack notional is checked against the cap BEFORE arming",
      /stackUsdt > capUsdt/.test(src));
   ok('an unplaced order rolls the book back', /if \(placeFailed\)/.test(src) && /lfBefore/.test(src));
@@ -322,12 +322,12 @@ console.log('\n  THE ACCUMULATOR IS NOT GOVERNED BY THE FUTURES BOT');
   // 2026-08-19: the relay /config read timed out, MODE fell back to "off", the agent returned at
   // the idle check, and the accumulator — a different strategy on a different product — never
   // ran. John watched dots print with nothing listening. These pin the fix.
-  ok('the accumulator lives in its own function', /async function runAccumulator\(\)/.test(src));
+  ok('the accumulator lives in its own function', /async function runAccumulator\(book = primaryAccumBook\(\)\)/.test(src));
   ok('MODE=off still runs it before returning',
-     /MODE=off[\s\S]{0,600}await runAccumulator\(\);\s*\n\s*return;/.test(src));
+     /MODE=off[\s\S]{0,700}await runAccumulators\(\);\s*\n[^\n]*HEALTH_KEY[^\n]*\n\s*return;/.test(src));
   ok('the idle log no longer claims the whole agent is idle', /futures scanner idle/.test(src));
-  ok('the scan path still runs it too', (src.match(/await runAccumulator\(\);/g) || []).length === 2,
-     (src.match(/await runAccumulator\(\);/g) || []).length);
+  ok('the scan path still runs it too', (src.match(/await runAccumulators\(\);/g) || []).length === 2,
+     (src.match(/await runAccumulators\(\);/g) || []).length);
   ok('KILL still stops spot orders on the order path', /if \(CFG\.kill\(\)\) return \{ dry: true, why: "KILL switch is on"/.test(src));
 
   // Declaration hoisting makes source order irrelevant, so assert the thing that actually

@@ -145,7 +145,7 @@ console.log('\n7. The DECISION core cannot trade (the spot rails are a separate,
   ok('no order function anywhere in the decision core',
      !/execOrder|directOrder|buildOrder|cancelOrder|closeOrderFor|rememberResting|phemexCall|sendSpotOrder/.test(block));
   ok('and no venue I/O at all in it', !/fetch\(|phemexPublic/.test(block));
-  const runBlock = src.slice(src.indexOf('async function runAccumulator()'), src.indexOf('// \u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550 THE LOOP'));
+  const runBlock = src.slice(src.indexOf('async function runAccumulator(book'), src.indexOf('// \u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550 THE LOOP'));
   if(runBlock.length < 5000) { fail++; console.log('  FAIL runBlock slice collapsed \u2014 markers moved, length ' + runBlock.length); }
   ok('the run loop never touches the FUTURES order path', !/execOrder|directOrder|buildOrder\(/.test(runBlock));
   ok('it reaches the venue only through the braked spot helper', /sendSpotOrder\(/.test(runBlock));
@@ -208,7 +208,12 @@ console.log('\n10. Spot execution has three independent brakes');
   // direction, so a drift back to arming-by-default turns this suite red.
   ok('the arm switch exists and is checked', /ACCUM_EXEC", "dry"\)\) === "armed"/.test(fn));
   ok('and it defaults to dry, so arming must be stated in the workflow', !/ACCUM_EXEC", "armed"/.test(fn));
-  ok('setting ACCUM_EXEC to anything else stands it down', /const armed = String\(env\("ACCUM_EXEC"[^)]*\)\) === "armed"/.test(fn));
+  // 2026-11-11: the accumulator now runs several books. Each book carries its own exec, and a book
+  // without one falls back to the global — so the global switch must still be in the comparison,
+  // and an extra book may only be armed when BOTH it and the global say so.
+  ok('setting ACCUM_EXEC to anything else stands it down', /const armed = String\(opts\.exec != null \? opts\.exec : env\("ACCUM_EXEC", "dry"\)\) === "armed"/.test(fn));
+  ok('an extra book cannot be armed unless the global switch is armed too', /const exec = wantsArm && globalArmed \? "armed" : "dry";/.test(src));
+  ok('the primary book takes its exec from the workflow and nowhere else', /exec: String\(env\("ACCUM_EXEC", "dry"\)\),/.test(src));
   ok('the cap was raised to clear a full-stack slice', /num\("ACCUM_MAX_USDT", 200\)/.test(src));
   ok('all three are checked BEFORE the wire call', fn.indexOf('phemexCall') > fn.indexOf('armed'));
   ok('the venue base URL is still hard-locked to testnet', /const PHEMEX_BASE = "https:\/\/testnet-api\.phemex\.com"/.test(src));
@@ -427,7 +432,7 @@ console.log('\nC. THE BUY-BACK IS A REAL ORDER, NOT A LOG LINE');
   ok('loudly', /result: "ACCUM UNPLACED"/.test(src));
   ok('and says the rung will be retried', /still resting and will be retried next run/.test(src));
   ok('the rollback snapshot is taken before anything is applied',
-     src.indexOf('const stateBefore = JSON.parse(JSON.stringify(state));') < src.indexOf('accumFillPass(state, fine)'));
+     src.indexOf('const stateBefore = JSON.parse(JSON.stringify(state));') < src.indexOf('accumFillPass(state, fine, book.cfg)'));
   ok('an expiry is logged as its own thing, not as a normal buy', /result: isExpiry \? "ACCUM RUNG EXPIRED" : "ACCUM BUY"/.test(src));
 }
 

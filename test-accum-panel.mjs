@@ -115,7 +115,8 @@ console.log('\n8. The toggles look like something you can press');
   const flips = { '1H':{gainPct:0.86,trips:28,holding:true} };
   fn({ cipher_accum: { units:0.0077, cash:0, open:[], sells:0, fills:0, pxNow:65000, startUnits:0.0077, flips } }, []);
   const chips = html.match(/<button class="flip-tf"[^>]*>/g) || [];
-  ok('nine chips render', chips.length === 9, chips.length);
+  // ten since 2026-08-30: OFF + eight timeframes + the dot-LADDER chip
+  ok('ten chips render', chips.length === 10, chips.length);
   ok('every chip has a visible fill', chips.every(c => /background:rgba/.test(c)));
   ok('every chip has a visible border', chips.every(c => /border:1px solid #(8bd|4a4a4a)/.test(c)));
   ok('every chip says it is clickable', chips.every(c => /cursor:pointer/.test(c)));

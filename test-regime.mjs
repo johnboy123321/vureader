@@ -39,7 +39,9 @@ console.log('\n1. It cannot place, block or resize anything');
   ok('and it is not referenced by any guard in the scan loop',
      !/(opposes|held\.has|sameDir|placedToday)[^\n]*REGIME/.test(src));
   const guardArea = src.slice(src.indexOf('const key = `${coin}|${sig.bias}|${day}`'), src.indexOf('const built = buildOrder(t)'));
-  ok('no regime term sits between the signal and the order', !/REGIME|regime/i.test(guardArea), guardArea.match(/regime/i));
+  { const hits = guardArea.split('\n').filter(l => /regime/i.test(l));
+    ok('the only regime term between the signal and the order is the 1D-short gate',
+       hits.length === 1 && /gate1dShort\(sig\.bias, sig\.planTf, REGIME\.label\)/.test(hits[0]), hits.join(' | ').slice(0,200)); }
   ok('the run tags records but never filters rankPool', !/rankPool[^\n]*REGIME/.test(src));
 }
 

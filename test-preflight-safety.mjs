@@ -12,7 +12,10 @@
 import fs from 'node:fs';
 const AGENT = 'cipher-agent-valtown.js';
 const RELAY = 'phemex-relay-valtown.js';
-const WF    = 'cipher-agent.yml';
+// The DEPLOYED workflow is the one in .github/workflows/. A loose cipher-agent.yml in the repo root
+// is a leftover upload copy — on 2026-11-11 it was three months stale and this suite was reading
+// it, i.e. testing a ghost. Read the deployed file whenever it exists.
+const WF    = fs.existsSync('.github/workflows/cipher-agent.yml') ? '.github/workflows/cipher-agent.yml' : 'cipher-agent.yml';
 const src = fs.readFileSync(AGENT, 'utf8');
 const relay = fs.readFileSync(RELAY, 'utf8');
 const wf = fs.readFileSync(WF, 'utf8');

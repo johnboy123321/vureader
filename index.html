@@ -10577,7 +10577,7 @@ document.addEventListener('click', function(e){
         const x=a.flips[t]; if(!x) continue;
         const g=Number(x.gainPct)||0;
         const c=g>0?'#9c9':g<0?'#e88':'var(--muted)';
-        const on=liveTf===t;
+        const on=flipTfLive===t;
         h += '<div style="display:flex;font-size:12px;border-bottom:1px solid var(--line);padding:5px 0;align-items:baseline;'+(on?'background:rgba(136,187,221,0.07);':'')+'">'
           + '<span style="width:52px;font-weight:700;'+(on?'color:#8bd;':(t===best?'color:#8bd;':''))+'">'+esc(t)+(on?' ●':(t===best?' ★':''))+'</span>'
           + '<span style="width:78px;text-align:right;color:'+c+';font-weight:700;">'+(g>=0?'+':'')+g.toFixed(2)+'%</span>'

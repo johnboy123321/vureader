@@ -91,9 +91,11 @@ console.log('\n5. Entry expiry — ENTRY_EXPIRY_H is finally read');
 
 console.log('\n6. The expiry pass can only ever cancel');
 {
-  const block = src.slice(src.indexOf('UNFILLED ORDERS MUST NOT LIVE FOREVER'), src.indexOf('MARKET REGIME (measurement only)'));
+  const block = src.slice(src.indexOf('async function expireStaleOrders()'), src.indexOf('async function relativeStrength('));
+  ok('the expiry slice is sane (guards against a reorder)', block.length > 800 && block.length < 9000, block.length);
   ok('it never places an order', !/buildOrder|POST[^\n]*orders|directOrder\(/.test(block));
-  ok('the only venue write is a cancel', (block.match(/phemexCall\(/g)||[]).length === 1 && /phemexCall\("DELETE", "\/g-orders\/cancel"/.test(block));
+  ok('the only venue write is a cancel', !/phemexCall\(|relay\(|directProtect\(|directBreachClose\(/.test(block) && /await cancelOrder\(/.test(block)
+     && /async function cancelOrder[\s\S]{0,1200}phemexCall\("DELETE", "\/g-orders\/cancel"/.test(src));
   ok('it refuses to act when it cannot read the book', /if \(!Array\.isArray\(live\)\) \{ out\.blind/.test(block));
   ok('and it only runs when armed', /if \(mode === "armed"\) \{[\s\S]{0,200}expireStaleOrders\(\)/.test(src));
 }

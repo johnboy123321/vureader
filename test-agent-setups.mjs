@@ -42,7 +42,7 @@ console.log('\n2. A rule it cannot evaluate is benched BY NAME, never run');
   ok('the engine publishes what it can compute', /CONDITION_NAMES/.test(src));
   ok('and the loader checks each rule against it', /const bad = \(r\.when \|\| \[\]\)\.map\(w => w\.fn\)\.filter/.test(src));
   ok('benched rules are named in the log', /setup lab: benched \$\{benched\.length\}/.test(src));
-  const eng = fs.readFileSync('setup-lab/engine.mjs','utf8');
+  const eng = fs.readFileSync('engine.mjs','utf8');
   ok('the export exists on the engine side too', /export const CONDITION_NAMES/.test(eng));
 }
 
@@ -83,7 +83,7 @@ ok('what fired is reported', /shadow decision\(s\) recorded from discovered setu
 
 console.log('\n5. The generator writes only to the store, never to the bot');
 {
-  const gen = fs.readFileSync('setup-lab/propose.mjs','utf8');
+  const gen = fs.readFileSync('propose.mjs','utf8');
   ok('it writes survivors and a journal', /writeFileSync\(STORE/.test(gen) && /writeFileSync\(JOURNAL/.test(gen));
   ok('and touches nothing else', !/cipher-agent|agent-state|writeFileSync\((?!STORE|JOURNAL)/.test(gen));
   ok('a proposal is never repaired into something that passes',

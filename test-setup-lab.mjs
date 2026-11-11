@@ -15,9 +15,9 @@
 //       200 attempts is that six coins never take part in selection. A single overlap between the
 //       two lists silently destroys that, and nothing else in the system would notice.
 // ═══════════════════════════════════════════════════════════════════════════════════════════════
-import { validateSetup, CONDITIONS, vocabularyForPrompt } from './setup-lab/schema.mjs';
-import { runRule, buildContext, _internals } from './setup-lab/engine.mjs';
-import { DISCOVER, VALIDATE, bars, scoreSetup } from './setup-lab/score.mjs';
+import { validateSetup, CONDITIONS, vocabularyForPrompt } from './schema.mjs';
+import { runRule, buildContext, _internals } from './engine.mjs';
+import { DISCOVER, VALIDATE, bars, scoreSetup } from './score.mjs';
 
 let pass = 0, fail = 0;
 const ok = (n, c, x) => { c ? (pass++, console.log('  ok   ' + n))
