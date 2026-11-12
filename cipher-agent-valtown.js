@@ -4794,6 +4794,179 @@ function shadowDiscovered(lab, SHADOW, coin, bars, meta) {
   return fired;
 }
 
+// ═══════════════ CROWD POSITIONING (measurement only, 2026-11-12) ═══════════════
+// The one thing in three years of replay that moved the coin flip. Every setup this bot takes
+// reaches +1R before its stop about 50% of the time — whichever detector, whichever timeframe —
+// so the win rate is just the geometry of a 1R stop and a 2.25R target. Positioning data is the
+// exception. On 2,951 replayed trades (2023-08 → 2026-07):
+//
+//     against the crowd AND big accounts on our side   417 trades  39.1% wins  +£2.43  every year
+//     against the crowd only                           155 trades  31.6% wins  +£0.30
+//     with the crowd, against big accounts             805 trades  27.2% wins  −£1.05  every year
+//
+// "The crowd" = long/short ratio by number of ACCOUNTS. "Big accounts" = top-trader long/short
+// ratio by POSITION size. Both z-scored on their own prior 30 days of hourly readings.
+//
+// Relative strength looked this good in a replay and then failed live, so this is a shadow arm:
+// it stamps each recorded decision with what the crowd was doing and reports the boxes every
+// run. IT FILTERS NOTHING. test-crowd.mjs asserts that no order function appears in this block.
+//
+// Freshness is the whole game. Replayed with stale readings the edge holds to 4 hours old
+// (+£1.80–2.40), halves by 6–8 hours and is gone at 24. So a reading older than CROWD_MAX_AGE_H
+// is recorded as no reading at all rather than as a weak one.
+//
+// The feed: Binance is what the replay used, but Binance geo-blocks GitHub's US runners, so OKX
+// (same two ratios, 30 days hourly, reachable) is the fallback. OKX's crowd is NOT what was
+// backtested — the source is stamped on every record and the boxes are reported per source, so
+// "the idea failed" can be told apart from "the substitute feed failed".
+const CROWD_Z_BARS = 720;       // 30 days of hourly readings — the replay's window
+const CROWD_MAX_AGE_H = 4;      // see above: measured, not chosen
+const CROWD_MIN_PER_BOX = 30;   // resolved decisions in a box before it is split in half
+const CROWD_BOXES = ["a. against crowd, big money with us", "b. against crowd only",
+                     "c. neither", "d. with crowd, against big money"];
+let _fapiUp = true;             // same pattern as _binanceUp: one failure, then stop paying for it
+const _crowdCache = new Map();  // coin → series | null, for this run only
+
+// z of the LAST value against the readings before it. Null rather than a guess when the history
+// is too thin to mean anything (under 80% of the window).
+function crowdZ(arr) {
+  const n = arr.length - 1;
+  if (n < CROWD_Z_BARS * 0.8 || !Number.isFinite(arr[n])) return null;
+  let s = 0, s2 = 0, k = 0;
+  for (let j = Math.max(0, n - CROWD_Z_BARS); j < n; j++) {
+    const v = arr[j]; if (!Number.isFinite(v)) continue; s += v; s2 += v * v; k++;
+  }
+  if (k < CROWD_Z_BARS * 0.8) return null;
+  const m = s / k, sd = Math.sqrt(Math.max(0, s2 / k - m * m));
+  return sd > 0 ? (arr[n] - m) / sd : null;
+}
+
+// rows → [[t, ratio], …] ascending, one per timestamp, finite and positive only.
+function crowdClean(rows) {
+  const m = new Map();
+  for (const r of rows || []) { const t = +r[0], v = +r[1]; if (Number.isFinite(t) && Number.isFinite(v) && v > 0) m.set(t, v); }
+  return [...m.entries()].sort((a, b) => a[0] - b[0]);
+}
+
+async function crowdFromBinance(coin) {
+  const one = async (ep) => {
+    const base = `https://fapi.binance.com/futures/data/${ep}?symbol=${coin}USDT&period=1h`;
+    const r = await fetch(base + "&limit=500");
+    if (!r.ok) throw new Error("binance " + r.status);
+    const a = await r.json();
+    if (!Array.isArray(a) || !a.length) return [];
+    let b = [];   // the API serves 500 a call and keeps 30 days: a second page reaches the rest
+    try { const r2 = await fetch(base + `&limit=260&endTime=${+a[0].timestamp - 1}`); if (r2.ok) { const j = await r2.json(); if (Array.isArray(j)) b = j; } } catch { }
+    return crowdClean([...b, ...a].map(x => [x.timestamp, x.longShortRatio]));
+  };
+  const [all, top] = await Promise.all([one("globalLongShortAccountRatio"), one("topLongShortPositionRatio")]);
+  return all.length ? { src: "binance", all, top } : null;
+}
+
+async function crowdFromOkx(coin) {
+  const one = async (url) => {
+    const r = await fetch(url);
+    if (!r.ok) return [];
+    const j = await r.json();
+    return j && j.code === "0" && Array.isArray(j.data) ? crowdClean(j.data) : [];
+  };
+  const [all, top] = await Promise.all([
+    one(`https://www.okx.com/api/v5/rubik/stat/contracts/long-short-account-ratio?ccy=${coin}&period=1H`),
+    one(`https://www.okx.com/api/v5/rubik/stat/contracts/long-short-position-ratio-contract-top-trader?instId=${coin}-USDT-SWAP&period=1H`)]);
+  return all.length ? { src: "okx", all, top } : null;
+}
+
+async function crowdSeries(sym) {
+  const coin = String(sym).toUpperCase().replace(/USDT$/, "");
+  if (_crowdCache.has(coin)) return _crowdCache.get(coin);
+  let s = null;
+  if (_fapiUp) { try { s = await crowdFromBinance(coin); } catch { _fapiUp = false; } }
+  if (!s) { try { s = await crowdFromOkx(coin); } catch { } }
+  _crowdCache.set(coin, s);
+  return s;
+}
+
+// PURE. What the crowd and the big accounts were doing, signed so that a NEGATIVE crowd means the
+// trade goes against the crowded side and a POSITIVE gap means big accounts lean the trade's way.
+function crowdFeatures(series, dir, now) {
+  if (!series || !series.all || !series.all.length) return null;
+  const last = series.all[series.all.length - 1];
+  const ageH = (now - last[0]) / 3.6e6;
+  if (!(ageH <= CROWD_MAX_AGE_H)) return { src: series.src, ageH: +ageH.toFixed(1), stale: true, crowd: null, gap: null, box: null };
+  const sg = dir === "short" ? -1 : 1;
+  const cz = crowdZ(series.all.map(x => x[1]));
+  const topAt = new Map(series.top || []);
+  const gaps = [];
+  for (const [t, v] of series.all) { const tv = topAt.get(t); gaps.push(tv > 0 ? Math.log(tv) - Math.log(v) : NaN); }
+  const gz = crowdZ(gaps);
+  const crowd = cz === null ? null : +(cz * sg).toFixed(2), gap = gz === null ? null : +(gz * sg).toFixed(2);
+  return { src: series.src, ageH: +ageH.toFixed(1), stale: false, crowd, gap, box: crowdBox(crowd, gap) };
+}
+
+// The four boxes, named before a single live decision was graded.
+function crowdBox(crowd, gap) {
+  if (crowd === null || gap === null || crowd === undefined || gap === undefined) return null;
+  if (crowd < -1 && gap > 0) return CROWD_BOXES[0];
+  if (crowd < -1) return CROWD_BOXES[1];
+  if (gap < -1) return CROWD_BOXES[3];
+  return CROWD_BOXES[2];
+}
+
+// The second exit measured on the same decisions: half off at +1R, the rest to break-even.
+// Replay: lifts the best box from 39% wins to 54% and costs about half the money per trade.
+// Same pessimism as walkDecision — the stop is checked first in every bar — and a bar that tags
+// +1R and then closes back through the entry takes the remainder out flat in that same bar.
+function walkHalfOff(rec, candles, capBars) {
+  const risk = Math.abs(rec.entry - rec.stop);
+  if (!(risk > 0) || !candles || !candles.length) return null;
+  const isLong = rec.dir !== "short", s = isLong ? 1 : -1;
+  const start = decisionBar(rec, candles);
+  if (start < 0) return null;
+  const cap = capBars || SHADOW_TIMEOUT_BARS * (rec.tfMult || 4);
+  const one = rec.entry + s * risk;
+  let stop = rec.stop, banked = 0, live = 1, armed = false;
+  for (let i = start; i < candles.length; i++) {
+    const c = candles[i];
+    if (isLong ? c.l <= stop : c.h >= stop) return banked + live * ((stop - rec.entry) * s / risk);
+    if (!armed && (isLong ? c.h >= one : c.l <= one)) {
+      armed = true; banked = 0.5; live = 0.5;
+      if (isLong ? c.c < rec.entry : c.c > rec.entry) return banked;
+      stop = rec.entry;
+    }
+    if (isLong ? c.h >= rec.target : c.l <= rec.target) return banked + live * (Math.abs(rec.target - rec.entry) / risk);
+    if (i - start >= cap) return banked + live * ((c.c - rec.entry) * s / risk);
+  }
+  return null;
+}
+
+function crowdBoxes(records, src) {
+  const out = {};
+  for (const key of CROWD_BOXES) {
+    const rs = records.filter(r => r.arm === "baseline" && r.R !== null && r.crowdBox === key && (!src || r.crowdSrc === src))
+                      .sort((a, b) => a.at - b.at);
+    const half = Math.floor(rs.length / 2);
+    const meanOf = (a, f) => a.length ? +(a.reduce((x, r) => x + r[f], 0) / a.length).toFixed(3) : null;
+    const hs = rs.filter(r => Number.isFinite(r.Rh));
+    out[key] = { n: rs.length, spanH: spanHoursOf(rs), meanR: meanOf(rs, "R"),
+                 winPct: rs.length ? Math.round(100 * rs.filter(r => r.R > 0).length / rs.length) : null,
+                 firstHalf: meanOf(rs.slice(0, half), "R"), secondHalf: meanOf(rs.slice(half), "R"),
+                 halfOffR: meanOf(hs, "Rh"),
+                 halfOffWinPct: hs.length ? Math.round(100 * hs.filter(r => r.Rh > 0).length / hs.length) : null };
+  }
+  return out;
+}
+
+// Same gate as the regime boxes: a real sample, more than a week of it, both halves agreeing.
+function crowdVerdict(records, src) {
+  const boxes = crowdBoxes(records, src), trustworthy = [];
+  for (const [k, b] of Object.entries(boxes)) {
+    if (b.n < CROWD_MIN_PER_BOX * 2 || !boxSpansEnough(b)) continue;
+    if (b.firstHalf === null || b.secondHalf === null) continue;
+    if ((b.firstHalf > 0) === (b.secondHalf > 0)) trustworthy.push({ box: k, ...b, sign: b.meanR > 0 ? "pays" : "costs" });
+  }
+  return { boxes, trustworthy, ready: trustworthy.length > 0 };
+}
+
 const SHADOW_KEY = "cipher_shadow";
 const SHADOW_MIN_RESOLVED = 30;    // per arm, before a comparison means anything
 const SHADOW_MARGIN_R     = 0.05;  // variant must beat baseline by this much in mean R
@@ -4862,6 +5035,10 @@ function shadowRecord(sh, id, arm, t, meta) {
     rs: (meta && meta.rs) != null ? meta.rs : null,  // 1 = trading the field's leader in your direction
     regDist: (meta && meta.regDist) ?? null,    // how far BTC was from its 200D line, in %
     breadth: (meta && meta.breadth) ?? null,    // share of scanned coins above their own 200D
+    crowd: (meta && meta.crowd) ?? null,        // crowd z, signed: negative = trading against the crowded side
+    gap: (meta && meta.gap) ?? null,            // big accounts vs crowd z, signed: positive = big money our way
+    crowdBox: (meta && meta.crowdBox) || null,  // which of the four pre-registered boxes — see CROWD POSITIONING
+    crowdSrc: (meta && meta.crowdSrc) || null,  // "binance" (what the replay used) | "okx" (the fallback)
     R: null,                                    // filled in by grading, later
   });
   if (slot.records.length > SHADOW_MAX_RECORDS) slot.records = slot.records.slice(-SHADOW_MAX_RECORDS);
@@ -4961,7 +5138,8 @@ async function gradeShadow(sh) {
     if (!candles) continue;
     for (const rec of recs) {
       const R = gradeOne(rec, candles);
-      if (R !== null) { rec.R = +R.toFixed(3); rec.gtf = gtf; graded++; }
+      if (R !== null) { rec.R = +R.toFixed(3); rec.gtf = gtf; graded++;
+        if (rec.crowdBox) { const h = walkHalfOff(rec, candles); if (h !== null) rec.Rh = +h.toFixed(3); } }
     }
   }
   await secondOpinion(sh);
@@ -6485,13 +6663,18 @@ export default async function cipherAgent() {
     const MINQ = num("MIN_QUALITY", 5);
     const baselineSet = rankPool.filter(x => x.quality >= MINQ);
     const variantSet  = [...rankPool].sort((a, b) => b.quality - a.quality).slice(0, RANK_TOP_N);
+    const crowdFeed = {};
     for (const [arm, set] of [["baseline", baselineSet], ["variant", variantSet]]) {
       for (const x of set) {
         const t = await planFor(x);
+        let cw = null;   // measurement only: a failed or stale feed records "no reading", never blocks
+        if (t) { try { cw = crowdFeatures(await crowdSeries(x.coin), x.dir, Date.now()); } catch { }
+          const k = !cw ? "none" : cw.stale ? "stale" : cw.box ? cw.src : "thin"; crowdFeed[k] = (crowdFeed[k] || 0) + 1; }
         if (t) shadowRecord(SHADOW, "rank_vs_threshold", arm, t,
           { quality: +x.quality.toFixed(1), note: x.label,
             reg: REGIME.label, regDist: REGIME.distPct, breadth: REGIME.breadth,
-            rs: RS.ok ? RS.rank(x.coin, x.dir) : null });
+            rs: RS.ok ? RS.rank(x.coin, x.dir) : null,
+            crowd: cw && cw.crowd, gap: cw && cw.gap, crowdBox: cw && cw.box, crowdSrc: cw && cw.box ? cw.src : null });
       }
     }
     const gradedN = await gradeShadow(SHADOW);
@@ -6625,6 +6808,28 @@ export default async function cipherAgent() {
         slot.history.push({ at: Date.now(), changed: "evidence", boxes: sv.boxes, trustworthy: sv.trustworthy });
         await pushLog({ shadow: "relative_strength", result: "EVIDENCE",
           skipped: `rank boxes now stable: ${sv.trustworthy.map(t => `${t.box} ${t.sign} ${t.meanR}R over ${t.n}`).join("; ")}. Still advisory — nothing is filtered.` });
+      }
+    }
+    // ── CROWD POSITIONING EXPERIMENT ─────────────────────────────────────────────────────────
+    // Same decisions, a fourth question: was the trade against the crowd with big accounts on its
+    // side? Reported per feed, because OKX is a stand-in for the Binance data the replay used.
+    {
+      const fr = (v) => v === null ? "—" : (v >= 0 ? "+" : "") + v + "R";
+      console.log(`crowd feed this run: ${Object.entries(crowdFeed).map(([k, n]) => `${k} ${n}`).join(" · ") || "no decisions to stamp"}`);
+      const slot = shadowSlot(SHADOW, "crowd_positioning");
+      for (const feed of ["binance", "okx"]) {
+        const cv = crowdVerdict(src, feed);
+        if (!Object.values(cv.boxes).some(b => b.n)) continue;
+        console.log(`shadow crowd_positioning [${feed}]: ` + Object.entries(cv.boxes)
+          .map(([k, b]) => `${k.slice(3)} ${fr(b.meanR)}${b.winPct === null ? "" : " " + b.winPct + "%"} | half-off ${fr(b.halfOffR)}${b.halfOffWinPct === null ? "" : " " + b.halfOffWinPct + "%"} (${b.n})`).join(" · "));
+        for (const t of cv.trustworthy) console.log(`  → ${t.box} ${t.sign} consistently: ${t.meanR}R over ${t.n}, and holds in both halves (${t.firstHalf} then ${t.secondHalf})`);
+        const sig = cv.trustworthy.map(t => t.box + ":" + t.sign).sort().join(",");
+        if (cv.ready && (slot.lastVerdict || {})[feed] !== sig) {
+          slot.lastVerdict = { ...(slot.lastVerdict || {}), [feed]: sig };
+          slot.history.push({ at: Date.now(), changed: "evidence", feed, boxes: cv.boxes, trustworthy: cv.trustworthy });
+          await pushLog({ shadow: "crowd_positioning", result: "EVIDENCE",
+            skipped: `crowd boxes now stable on ${feed}: ${cv.trustworthy.map(t => `${t.box} ${t.sign} ${t.meanR}R over ${t.n}`).join("; ")}. Still advisory — nothing is filtered.` });
+        }
       }
     }
     // ── INSIGHT SCAN ─────────────────────────────────────────────────────────────────────────
