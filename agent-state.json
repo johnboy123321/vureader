@@ -1,6 +1,109 @@
 {
-  "cipher_cursor": 0,
+  "cipher_cursor": 20,
   "cipher_log": [
+    {
+      "at": "2026-11-14T00:27:14.999Z",
+      "result": "HEALTH WARN",
+      "skipped": "some closes have no venue fill yet (retrying; not counted until found)"
+    },
+    {
+      "at": "2026-11-14T00:27:12.285Z",
+      "result": "FILL LOOKUP EMPTY",
+      "skipped": "1 of 1 closed position(s) had no closing fill at the venue yet — retried next run, NOT graded from the price range: LTC long (try 1/8). Venue answers: /exchange/order/v2/tradingList → http 200 code 0, 0 row(s), 0 for LTCUSDT ;; /api-data/g-futures/trades → http 503 code 10500 {\"msg\":\"please try again later! Unable to find instance for phemex-api-data-app\",\"code\":10500} ;; (retry) /api-data/g-futures/trades → http 503 code 10500 {\"msg\":\"please try again later! Unable to find instance for phemex-api-data-app\",\"code\":10500}"
+    },
+    {
+      "at": "2026-11-14T00:27:01.798Z",
+      "coin": "APT",
+      "dir": "short",
+      "book": "fast",
+      "result": "RE-PLANNED",
+      "skipped": "its plan (entry 0.536300, stop 0.672944) was 2.8R from the venue's average entry 0.925360 — written for a different fill. Replaced a swing10 stop 0.672944 and target 0.228850 from today's daily structure at 0.536300 (venue average entry 0.925360), fast book. Not counted in the strategy's stats. The stop sweep below attaches it."
+    },
+    {
+      "at": "2026-11-14T00:26:33.781Z",
+      "coin": "BCH",
+      "dir": "short",
+      "skipped": "signal too weak — rollover on 1H (quality 4.0 < 5)"
+    },
+    {
+      "at": "2026-11-14T00:26:33.536Z",
+      "coin": "AAVE",
+      "dir": "long",
+      "skipped": "signal too weak — rollover on 15m (quality 2.5 < 5)"
+    },
+    {
+      "at": "2026-11-14T00:26:33.251Z",
+      "coin": "AVAX",
+      "dir": "long",
+      "skipped": "signal too weak — rollover on 15m (quality 3.5 < 5)"
+    },
+    {
+      "at": "2026-11-14T00:26:33.047Z",
+      "coin": "INJ",
+      "dir": "short",
+      "skipped": "signal too weak — divergence on 30m (quality 4.0 < 5)"
+    },
+    {
+      "at": "2026-11-14T00:26:32.624Z",
+      "coin": "FIL",
+      "dir": "long",
+      "skipped": "signal too weak — rollover on 30m (quality 4.0 < 5)"
+    },
+    {
+      "at": "2026-11-14T00:26:32.421Z",
+      "coin": "ADA",
+      "dir": "long",
+      "skipped": "signal too weak — rollover on 30m (quality 4.0 < 5)"
+    },
+    {
+      "at": "2026-11-14T00:26:32.201Z",
+      "coin": "LINK",
+      "dir": "long",
+      "skipped": "signal too weak — rollover on 15m (quality 3.5 < 5)"
+    },
+    {
+      "at": "2026-11-14T00:26:31.544Z",
+      "coin": "SUI",
+      "dir": "long",
+      "skipped": "signal too weak — rollover on 15m (quality 3.5 < 5)"
+    },
+    {
+      "at": "2026-11-14T00:26:31.117Z",
+      "coin": "NEAR",
+      "dir": "long",
+      "skipped": "signal too weak — rollover on 15m (quality 3.5 < 5)"
+    },
+    {
+      "at": "2026-11-14T00:26:30.906Z",
+      "coin": "DOGE",
+      "dir": "long",
+      "skipped": "signal too weak — rollover on 15m (quality 3.5 < 5)"
+    },
+    {
+      "at": "2026-11-14T00:26:30.694Z",
+      "coin": "XRP",
+      "dir": "long",
+      "skipped": "signal too weak — rollover on 15m (quality 3.5 < 5)"
+    },
+    {
+      "at": "2026-11-14T00:26:30.474Z",
+      "coin": "SOL",
+      "dir": "long",
+      "book": "fast",
+      "score": 6,
+      "skipped": "already holding SOL in the fast book"
+    },
+    {
+      "at": "2026-11-14T00:26:29.855Z",
+      "coin": "BTC",
+      "dir": "long",
+      "skipped": "signal too weak — rollover on 15m (quality 3.5 < 5)"
+    },
+    {
+      "at": "2026-11-14T00:26:24.803Z",
+      "result": "EXPIRE FAILED",
+      "skipped": "2 order(s) past the 8h expiry did not cancel: AVAX long (102h), LTC long (31h). Reason: phemex http 400 code 10500 Missing required parameter,Required query parameter 'posSide' is not present.. Left resting; will retry next run."
+    },
     {
       "at": "2026-11-14T00:12:16.358Z",
       "coin": "BTC",
@@ -2998,153 +3101,19 @@
       "coin": "SOL",
       "dir": "long",
       "skipped": "signal too weak — rollover on 15m (quality 2.5 < 5)"
-    },
-    {
-      "at": "2026-11-13T17:47:20.565Z",
-      "coin": "APT",
-      "dir": "long",
-      "book": "fast",
-      "score": 6,
-      "skipped": "REFUSED — would open a long against an existing short on APT in the fast book. This bot does not hedge within a book."
-    },
-    {
-      "at": "2026-11-13T17:47:20.124Z",
-      "coin": "DOT",
-      "dir": "long",
-      "book": "swing",
-      "score": 6,
-      "skipped": "correlation guard — already 3 long positions in the swing book (max 3)"
-    },
-    {
-      "at": "2026-11-13T17:47:15.689Z",
-      "result": "EXPIRE FAILED",
-      "skipped": "2 order(s) past the 8h expiry did not cancel: AVAX long (95h), LTC long (25h). Reason: phemex http 400 code 10500 Missing required parameter,Required query parameter 'posSide' is not present.. Left resting; will retry next run."
-    },
-    {
-      "at": "2026-11-13T17:32:58.594Z",
-      "result": "HEALTH WARN",
-      "skipped": "some closes have no venue fill yet (retrying; not counted until found)"
-    },
-    {
-      "at": "2026-11-13T17:32:56.432Z",
-      "result": "FILL LOOKUP EMPTY",
-      "skipped": "1 of 1 closed position(s) had no closing fill at the venue yet — retried next run, NOT graded from the price range: LTC long (try 3/8). Venue answers: /exchange/order/v2/tradingList → http 200 code 0, 0 row(s), 0 for LTCUSDT ;; /api-data/g-futures/trades → http 503 code 10500 {\"msg\":\"please try again later! Unable to find instance for phemex-api-data-app\",\"code\":10500} ;; (retry) /api-data/g-futures/trades → http 503 code 10500 {\"msg\":\"please try again later! Unable to find instance for phemex-api-data-app\",\"code\":10500}"
-    },
-    {
-      "at": "2026-11-13T17:32:46.653Z",
-      "coin": "APT",
-      "dir": "short",
-      "book": "fast",
-      "result": "RE-PLANNED",
-      "skipped": "its plan (entry 0.555400, stop 0.673138) was 3.1R from the venue's average entry 0.925360 — written for a different fill. Replaced a swing10 stop 0.673138 and target 0.290489 from today's daily structure at 0.555400 (venue average entry 0.925360), fast book. Not counted in the strategy's stats. The stop sweep below attaches it."
-    },
-    {
-      "at": "2026-11-13T17:32:22.501Z",
-      "coin": "OP",
-      "dir": "short",
-      "skipped": "signal too weak — rollover on 30m (quality 3.0 < 5)"
-    },
-    {
-      "at": "2026-11-13T17:32:22.129Z",
-      "coin": "BCH",
-      "dir": "short",
-      "skipped": "signal too weak — rollover on 30m (quality 4.0 < 5)"
-    },
-    {
-      "at": "2026-11-13T17:32:21.588Z",
-      "coin": "AVAX",
-      "dir": "short",
-      "skipped": "signal too weak — rollover on 1H (quality 4.0 < 5)"
-    },
-    {
-      "at": "2026-11-13T17:32:21.236Z",
-      "coin": "ARB",
-      "dir": "short",
-      "skipped": "signal too weak — rollover on 30m (quality 3.0 < 5)"
-    },
-    {
-      "at": "2026-11-13T17:32:20.877Z",
-      "coin": "ADA",
-      "dir": "short",
-      "skipped": "signal too weak — rollover on 1H (quality 4.0 < 5)"
-    },
-    {
-      "at": "2026-11-13T17:32:20.696Z",
-      "coin": "LINK",
-      "dir": "long",
-      "entry": 9.932,
-      "sl": 9.557410220810238,
-      "tp1": 10.306589779189762,
-      "tp2": 10.774827003176965,
-      "score": 6,
-      "stopKind": "swing10",
-      "trend": "down",
-      "zone": null,
-      "result": "SKIPPED (aged out)",
-      "skipped": "LONG stop 9.557410220810238 vs mark 8.976 (6.48% away, wrong side). Phemex validates the stop against the MARK price, not our planned entry, and would refuse this. Declined here instead so the coin is not burned on an order that was never going to be accepted.",
-      "rejection": {
-        "label": "aged out — the stop is on the wrong side of the live mark",
-        "detail": "LONG stop 9.557410220810238 vs mark 8.976 (6.48% away, wrong side). Phemex validates the stop against the MARK price, not our planned entry, and would refuse this. Declined here instead so the coin is not burned on an order that was never going to be accepted.",
-        "klass": "execution_artifact",
-        "cause": "cadence",
-        "mark": 8.976,
-        "stop": 9.557410220810238
-      },
-      "countsForStats": false
-    },
-    {
-      "at": "2026-11-13T17:32:20.050Z",
-      "coin": "TRX",
-      "dir": "long",
-      "entry": 0.31325,
-      "sl": 0.3116932504794369,
-      "tp1": 0.31480674952056303,
-      "tp2": 0.31675268642126686,
-      "score": 6,
-      "stopKind": "FVG",
-      "trend": "down",
-      "zone": {
-        "src": "FVG",
-        "top": 0.3125,
-        "bottom": 0.31191,
-        "awayPct": 0.24
-      },
-      "skipped": "REFUSED — stop only 0.50% from entry — below the 2.2% floor, costs would eat 44% of the risk"
-    },
-    {
-      "at": "2026-11-13T17:32:19.683Z",
-      "coin": "SUI",
-      "dir": "short",
-      "skipped": "signal too weak — rollover on 1H (quality 4.0 < 5)"
-    },
-    {
-      "at": "2026-11-13T17:32:19.314Z",
-      "coin": "NEAR",
-      "dir": "short",
-      "skipped": "signal too weak — rollover on 1H (quality 4.0 < 5)"
-    },
-    {
-      "at": "2026-11-13T17:32:13.621Z",
-      "result": "EXPIRE FAILED",
-      "skipped": "2 order(s) past the 8h expiry did not cancel: AVAX long (95h), LTC long (25h). Reason: phemex http 400 code 10500 Missing required parameter,Required query parameter 'posSide' is not present.. Left resting; will retry next run."
-    },
-    {
-      "at": "2026-11-13T17:18:03.565Z",
-      "result": "HEALTH WARN",
-      "skipped": "some closes have no venue fill yet (retrying; not counted until found)"
     }
   ],
   "cipher_fired": {
     "LTC|long|2026-11-14": 1794615096008
   },
   "cipher_heartbeat": {
-    "at": "2026-11-14T00:12:16.439Z",
+    "at": "2026-11-14T00:27:15.008Z",
     "scanned": 20,
-    "candidates": 3,
-    "placed": 1,
+    "candidates": 2,
+    "placed": 0,
     "mode": "armed",
     "via": "direct",
-    "ms": 92743
+    "ms": 90739
   },
   "cipher_attempts": {
     "LTC|long|2026-11-14": 1
@@ -36864,7 +36833,7 @@
       "setupTf": "4H",
       "quality": 5.5,
       "bookShape": {
-        "at": 1794615125790,
+        "at": 1794616022729,
         "symbol": "SOLUSDT",
         "rows": 1,
         "shape": [
@@ -36872,7 +36841,7 @@
         ],
         "keys": "actionTimeNs,bizError,clOrdID,closedPnlRv,closedSizeRq,cumQtyRq,cumValueRv,displayQtyRq,execInst,execStatus,leavesQtyRq,leavesValueRv,ordStatus,orderID,orderQtyRq,orderType,pegOffsetProportionRr,pegOffsetValueRp,pegPriceType,priceRp,side,slPxRp,stopDirection,stopLossRp,stopPxRp,symbol,takeProfitRp,timeInForce,tpPxRp,transactTimeNs,trigger"
       },
-      "lastSeen": 1794615133932
+      "lastSeen": 1794616032293
     },
     "ADA|short": {
       "coin": "ADA",
@@ -36889,7 +36858,7 @@
       "setup": "rollover",
       "setupTf": "1H",
       "quality": 5,
-      "lastSeen": 1794615133932
+      "lastSeen": 1794616032293
     },
     "AVAX|long": {
       "coin": "AVAX",
@@ -36906,7 +36875,7 @@
       "setup": "divergence",
       "setupTf": "1D",
       "quality": 6,
-      "lastSeen": 1794615133932
+      "lastSeen": 1794616032293
     },
     "APT|short": {
       "coin": "APT",
@@ -36920,8 +36889,8 @@
       },
       "since": 1788435411143,
       "avgEntry": 0.925359566,
-      "adopted": 1794615124732,
-      "lastSeen": 1794615133932
+      "adopted": 1794616021798,
+      "lastSeen": 1794616032293
     },
     "LTC|short": {
       "coin": "LTC",
@@ -36936,7 +36905,7 @@
       "since": 1790018246556,
       "avgEntry": 53.07,
       "adopted": 1790018246686,
-      "lastSeen": 1794615133932
+      "lastSeen": 1794616032293
     },
     "ETH|short": {
       "coin": "ETH",
@@ -36951,7 +36920,7 @@
       "since": 1793354248037,
       "avgEntry": 2425.8,
       "adopted": 1793354248318,
-      "lastSeen": 1794615133932
+      "lastSeen": 1794616032293
     },
     "DOT|long": {
       "coin": "DOT",
@@ -36968,7 +36937,7 @@
       "setup": "rollover",
       "setupTf": "1D",
       "quality": 6,
-      "lastSeen": 1794615133932
+      "lastSeen": 1794616032293
     },
     "BNB|long": {
       "coin": "BNB",
@@ -36985,7 +36954,7 @@
       "setup": "rollover",
       "setupTf": "4H",
       "quality": 5.5,
-      "lastSeen": 1794615133932
+      "lastSeen": 1794616032293
     },
     "ATOM|long": {
       "coin": "ATOM",
@@ -37000,23 +36969,7 @@
       "since": 1794175768001,
       "avgEntry": 1.533495613,
       "adopted": 1794175768648,
-      "lastSeen": 1794615133932
-    },
-    "LTC|long": {
-      "coin": "LTC",
-      "dir": "long",
-      "size": 0,
-      "book": "fast",
-      "since": 1794615124534,
-      "plan": {
-        "entry": 49.39,
-        "stop": 47.3671653511942,
-        "target": 53.941377959813046
-      },
-      "setup": "rollover",
-      "setupTf": "4H",
-      "quality": 5.5,
-      "lastSeen": 1794615133932
+      "lastSeen": 1794616032293
     }
   },
   "cipher_books": {
@@ -37026,8 +36979,7 @@
     "AVAX|long": "swing",
     "ADA|short": "fast",
     "BNB|long": "fast",
-    "DOT|long": "swing",
-    "LTC|long": "fast"
+    "DOT|long": "swing"
   },
   "cipher_resting": {
     "agentAVAX1794250460554": {
@@ -37120,29 +37072,29 @@
       "baseBalance": 0.00463496,
       "quoteBalance": 4.94469533,
       "exec": "armed",
-      "checkedAt": 1794615134448
+      "checkedAt": 1794616033220
     },
     "seededReal": true,
     "seededAt": "2026-08-19T13:59:51.035Z",
     "exec": "armed",
     "flips": {
       "5m": {
-        "units": 0.5756504595817721,
-        "cash": 0,
+        "units": 0,
+        "cash": 39322.8948945821,
         "trips": 2427,
-        "sells": 2427,
-        "lastT": 1794615000000,
+        "sells": 2428,
+        "lastT": 1794615900000,
         "startUnits": 1,
-        "unitsNow": 0.57565046,
-        "gainPct": -42.43,
-        "holding": true
+        "unitsNow": 0.57551623,
+        "gainPct": -42.45,
+        "holding": false
       },
       "15m": {
         "units": 0.779559852385479,
         "cash": 0,
         "trips": 871,
         "sells": 871,
-        "lastT": 1794613500000,
+        "lastT": 1794614400000,
         "startUnits": 1,
         "unitsNow": 0.77955985,
         "gainPct": -22.04,
@@ -50761,7 +50713,7 @@
         "clOrdID": "cipherTarget1794243286464",
         "at": 1794243286641,
         "source": "placed",
-        "checkedAt": 1794611525288
+        "checkedAt": 1794616028461
       }
     },
     "SOL|long": {
@@ -50776,7 +50728,7 @@
         "clOrdID": "cipherStop1793137989808",
         "at": 1793137990265,
         "source": "placed",
-        "checkedAt": 1794612426253
+        "checkedAt": 1794616029188
       },
       "history": [
         {
@@ -50851,7 +50803,7 @@
         "clOrdID": "cipherStop1794272846194",
         "at": 1794272846655,
         "source": "placed",
-        "checkedAt": 1794611525525
+        "checkedAt": 1794616028693
       },
       "history": [
         {
@@ -50873,7 +50825,7 @@
         "clOrdID": "cipherTarget1794272846666",
         "at": 1794272846895,
         "source": "placed",
-        "checkedAt": 1794612426014
+        "checkedAt": 1794616028942
       }
     },
     "ADA|short": {
@@ -51027,26 +50979,59 @@
     }
   },
   "cipher_protect_check": {
-    "at": "2026-11-14T00:12:13.843Z",
+    "at": "2026-11-14T00:27:09.188Z",
     "checks": [
-      "APT|short stop: unreadable (http 503 {\"msg\":\"please try again later! Unable to find instance for phemex-api-data-app\",\"code\":10500})",
-      "ATOM|long stop: unreadable (http 503 {\"msg\":\"please try again later! Unable to find instance for phemex-api-data-app\",\"code\":10500})",
-      "BNB|long stop: unreadable (http 503 {\"msg\":\"please try again later! Unable to find instance for phemex-api-data-app\",\"code\":10500})",
-      "BNB|long target: unreadable (http 503 {\"msg\":\"please try again later! Unable to find instance for phemex-api-data-app\",\"code\":10500})"
+      "ATOM|long target: unreadable (http 503 {\"msg\":\"please try again later! Unable to find instance for phemex-api-data-app\",\"code\":10500})",
+      "AVAX|long stop: unreadable (http 503 {\"msg\":\"please try again later! Unable to find instance for phemex-api-data-app\",\"code\":10500})",
+      "AVAX|long target: unreadable (http 503 {\"msg\":\"please try again later! Unable to find instance for phemex-api-data-app\",\"code\":10500})",
+      "SOL|long stop: unreadable (http 503 {\"msg\":\"please try again later! Unable to find instance for phemex-api-data-app\",\"code\":10500})"
     ]
   },
   "cipher_health": {
-    "at": "2026-11-14T00:12:16.431Z",
-    "status": "OK",
+    "at": "2026-11-14T00:27:14.991Z",
+    "status": "WARN",
     "mode": "armed",
     "positions": 9,
     "stops": 9,
     "targets": 9,
     "operatorLegs": 0,
     "gapMin": 15,
-    "problems": []
+    "problems": [
+      "some closes have no venue fill yet (retrying; not counted until found)"
+    ]
   },
-  "cipher_fill_pending": [],
+  "cipher_fill_pending": [
+    {
+      "r": {
+        "coin": "LTC",
+        "dir": "long",
+        "size": 0,
+        "book": "fast",
+        "since": 1794615124534,
+        "plan": {
+          "entry": 49.39,
+          "stop": 47.3671653511942,
+          "target": 53.941377959813046
+        },
+        "setup": "rollover",
+        "setupTf": "4H",
+        "quality": 5.5,
+        "lastSeen": 1794615133932,
+        "how": "closed_by_hand",
+        "outcome": "unattributed",
+        "klass": "execution_artifact",
+        "execution": "closed_off_plan",
+        "why": "closed at neither the stop nor the target — was in profit when we looked. Not the bot's exit, so it grades nothing.",
+        "countsForStreak": false,
+        "countsForStats": false,
+        "exit": 49.52,
+        "gradedOn": "reference"
+      },
+      "reg": null,
+      "tries": 1,
+      "firstAt": 1794616029709
+    }
+  ],
   "cipher_operator_hold": {},
   "cipher_ledger_relabel": {
     "rev": "2026-10-27-no-fill",
