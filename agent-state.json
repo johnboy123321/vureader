@@ -1,6 +1,135 @@
 {
-  "cipher_cursor": 9,
+  "cipher_cursor": 8,
   "cipher_log": [
+    {
+      "at": "2026-11-20T04:06:18.324Z",
+      "coin": "ETH",
+      "dir": "short",
+      "book": "swing",
+      "result": "RE-PLANNED",
+      "skipped": "its plan (entry 1757.5, stop 1910.5) was 4.4R from the venue's average entry 2425.8 — written for a different fill. Replaced a FVG stop 1910.5 and target 1413.4 from today's daily structure at 1757.5 (venue average entry 2425.8), swing book. Not counted in the strategy's stats. The stop sweep below attaches it."
+    },
+    {
+      "at": "2026-11-20T04:06:18.128Z",
+      "coin": "APT",
+      "dir": "short",
+      "result": "PLAN DOES NOT MATCH POSITION",
+      "skipped": "the plan's entry 0.432400 is 5.1R from the venue's average entry 0.925360, so it was written for a different fill — and no replacement could be built from today's structure (stop > 3 ATR). Kept as is; check this position by hand."
+    },
+    {
+      "at": "2026-11-20T04:05:54.728Z",
+      "coin": "NEAR",
+      "dir": "long",
+      "entry": 3.208,
+      "sl": 2.7793012393238787,
+      "tp1": 3.6366987606761216,
+      "tp2": 4.172572211521273,
+      "score": 6,
+      "stopKind": "swing10",
+      "trend": "down",
+      "zone": null,
+      "result": "SKIPPED (venue)",
+      "skipped": "NEARUSDT is benched — the venue has this symbol switched off (TE_SEQ_TURN_OFF). Refused 24×; trying again in 6h.",
+      "rejection": {
+        "label": "the venue has this symbol switched off (TE_SEQ_TURN_OFF)",
+        "klass": "execution_artifact",
+        "cause": "venue",
+        "code": "20005"
+      },
+      "countsForStats": false
+    },
+    {
+      "at": "2026-11-20T04:05:54.506Z",
+      "coin": "DOGE",
+      "dir": "long",
+      "skipped": "signal too weak — rollover on 30m (quality 4.0 < 5)"
+    },
+    {
+      "at": "2026-11-20T04:05:54.078Z",
+      "coin": "SOL",
+      "dir": "long",
+      "skipped": "signal too weak — rollover on 30m (quality 4.0 < 5)"
+    },
+    {
+      "at": "2026-11-20T04:05:53.852Z",
+      "coin": "ETH",
+      "dir": "long",
+      "book": "fast",
+      "score": 6,
+      "skipped": "correlation guard — already 4 long positions in the fast book (max 4)"
+    },
+    {
+      "at": "2026-11-20T04:05:53.579Z",
+      "coin": "BTC",
+      "dir": "long",
+      "book": "fast",
+      "score": 6,
+      "skipped": "correlation guard — already 4 long positions in the fast book (max 4)"
+    },
+    {
+      "at": "2026-11-20T04:05:52.939Z",
+      "coin": "APT",
+      "dir": "long",
+      "book": "fast",
+      "score": 6,
+      "skipped": "REFUSED — would open a long against an existing short on APT in the fast book. This bot does not hedge within a book."
+    },
+    {
+      "at": "2026-11-20T04:05:52.718Z",
+      "coin": "AAVE",
+      "dir": "long",
+      "skipped": "signal too weak — rollover on 30m (quality 4.0 < 5)"
+    },
+    {
+      "at": "2026-11-20T04:05:52.488Z",
+      "coin": "ARB",
+      "dir": "long",
+      "skipped": "signal too weak — rollover on 30m (quality 4.0 < 5)"
+    },
+    {
+      "at": "2026-11-20T04:05:52.045Z",
+      "coin": "INJ",
+      "dir": "long",
+      "skipped": "signal too weak — rollover on 30m (quality 4.0 < 5)"
+    },
+    {
+      "at": "2026-11-20T04:05:51.798Z",
+      "coin": "LTC",
+      "dir": "long",
+      "book": "fast",
+      "score": 6,
+      "skipped": "correlation guard — already 4 long positions in the fast book (max 4)"
+    },
+    {
+      "at": "2026-11-20T04:05:51.326Z",
+      "coin": "FIL",
+      "dir": "long",
+      "skipped": "signal too weak — greendot on 4H (quality 4.5 < 5)"
+    },
+    {
+      "at": "2026-11-20T04:05:51.110Z",
+      "coin": "TRX",
+      "dir": "long",
+      "entry": 0.31046,
+      "sl": 0.3078434516850596,
+      "tp1": 0.3130765483149404,
+      "tp2": 0.31634723370861595,
+      "score": 6,
+      "stopKind": "FVG",
+      "trend": "down",
+      "zone": {
+        "src": "FVG",
+        "top": 0.30957,
+        "bottom": 0.30875,
+        "awayPct": 0.29
+      },
+      "skipped": "REFUSED — stop only 0.84% from entry — below the 2.2% floor, costs would eat 26% of the risk"
+    },
+    {
+      "at": "2026-11-20T04:05:46.441Z",
+      "result": "EXPIRE FAILED",
+      "skipped": "5 order(s) past the 8h expiry did not cancel: LTC long (155h), LTC long (148h), LTC long (33h), DOT long (109h), AVAX long (33h). Reason: phemex http 400 code 10500 Missing required parameter,Required query parameter 'posSide' is not present.. Left resting; will retry next run."
+    },
     {
       "at": "2026-11-20T03:51:20.792Z",
       "coin": "ETH",
@@ -2427,161 +2556,22 @@
       "coin": "DOT",
       "dir": "long",
       "skipped": "signal too weak — rollover on 15m (quality 3.5 < 5)"
-    },
-    {
-      "at": "2026-11-19T22:34:30.639Z",
-      "coin": "BCH",
-      "dir": "long",
-      "skipped": "signal too weak — rollover on 15m (quality 3.5 < 5)"
-    },
-    {
-      "at": "2026-11-19T22:34:30.438Z",
-      "coin": "APT",
-      "dir": "long",
-      "book": "fast",
-      "score": 6,
-      "skipped": "REFUSED — would open a long against an existing short on APT in the fast book. This bot does not hedge within a book."
-    },
-    {
-      "at": "2026-11-19T22:34:30.214Z",
-      "coin": "ARB",
-      "dir": "long",
-      "skipped": "signal too weak — rollover on 15m (quality 3.5 < 5)"
-    },
-    {
-      "at": "2026-11-19T22:34:29.985Z",
-      "coin": "AAVE",
-      "dir": "long",
-      "skipped": "signal too weak — rollover on 30m (quality 4.0 < 5)"
-    },
-    {
-      "at": "2026-11-19T22:34:29.683Z",
-      "coin": "AVAX",
-      "dir": "long",
-      "skipped": "signal too weak — rollover on 30m (quality 4.0 < 5)"
-    },
-    {
-      "at": "2026-11-19T22:34:29.492Z",
-      "coin": "INJ",
-      "dir": "long",
-      "skipped": "signal too weak — rollover on 30m (quality 4.0 < 5)"
-    },
-    {
-      "at": "2026-11-19T22:34:29.293Z",
-      "coin": "LTC",
-      "dir": "long",
-      "skipped": "signal too weak — divergence on 15m (quality 4.5 < 5)"
-    },
-    {
-      "at": "2026-11-19T22:34:29.064Z",
-      "coin": "ADA",
-      "dir": "long",
-      "skipped": "signal too weak — rollover on 30m (quality 4.0 < 5)"
-    },
-    {
-      "at": "2026-11-19T22:34:28.632Z",
-      "coin": "LINK",
-      "dir": "long",
-      "skipped": "signal too weak — rollover on 30m (quality 4.0 < 5)"
-    },
-    {
-      "at": "2026-11-19T22:34:28.442Z",
-      "coin": "TRX",
-      "dir": "long",
-      "entry": 0.30976,
-      "sl": 0.3064613710458995,
-      "tp1": 0.31305862895410047,
-      "tp2": 0.3171819151467261,
-      "score": 6,
-      "stopKind": "FVG",
-      "trend": "down",
-      "zone": {
-        "src": "FVG",
-        "top": 0.30743,
-        "bottom": 0.30739,
-        "awayPct": 0.75
-      },
-      "skipped": "REFUSED — stop only 1.06% from entry — below the 2.2% floor, costs would eat 21% of the risk"
-    },
-    {
-      "at": "2026-11-19T22:34:23.975Z",
-      "result": "EXPIRE FAILED",
-      "skipped": "5 order(s) past the 8h expiry did not cancel: LTC long (150h), LTC long (142h), LTC long (27h), DOT long (104h), AVAX long (27h). Reason: phemex http 400 code 10500 Missing required parameter,Required query parameter 'posSide' is not present.. Left resting; will retry next run."
-    },
-    {
-      "at": "2026-11-19T22:20:09.657Z",
-      "result": "HEALTH OK",
-      "skipped": "all checks passed"
-    },
-    {
-      "at": "2026-11-19T22:20:07.276Z",
-      "coin": "UNI",
-      "dir": "short",
-      "book": "fast",
-      "gradedOn": "venue_fill",
-      "closedBy": "cipher_target",
-      "quality": 6,
-      "how": "target",
-      "outcome": "win",
-      "klass": "strategy",
-      "execution": "filled",
-      "R": 2.251,
-      "entry": 5.235,
-      "exit": 4.903,
-      "countsForStats": true,
-      "countsForStreak": true,
-      "result": "RESOLVED",
-      "skipped": "UNI short target at 4.9030 — a limit fill at the plan's target level 4.9030 (the venue's row carries no order ID) Target hit, queued for a reverse look."
-    },
-    {
-      "at": "2026-11-19T22:19:54.213Z",
-      "coin": "ETH",
-      "dir": "short",
-      "book": "swing",
-      "result": "RE-PLANNED",
-      "skipped": "its plan (entry 1777.1, stop 1910.7) was 4.9R from the venue's average entry 2425.8 — written for a different fill. Replaced a FVG stop 1910.7 and target 1476.5 from today's daily structure at 1777.1 (venue average entry 2425.8), swing book. Not counted in the strategy's stats. The stop sweep below attaches it."
-    },
-    {
-      "at": "2026-11-19T22:19:54.038Z",
-      "coin": "APT",
-      "dir": "short",
-      "book": "fast",
-      "result": "RE-PLANNED",
-      "skipped": "its plan (entry 0.432400, stop 0.528195) was 5.1R from the venue's average entry 0.925360 — written for a different fill. Replaced a FVG stop 0.528195 and target 0.216860 from today's daily structure at 0.432400 (venue average entry 0.925360), fast book. Not counted in the strategy's stats. The stop sweep below attaches it."
     }
   ],
   "cipher_fired": {},
   "cipher_heartbeat": {
-    "at": "2026-11-20T03:51:30.702Z",
+    "at": "2026-11-20T04:06:27.839Z",
     "scanned": 20,
-    "candidates": 4,
+    "candidates": 6,
     "placed": 0,
     "mode": "armed",
     "via": "direct",
-    "ms": 73770
+    "ms": 71439
   },
   "cipher_attempts": {},
   "cipher_shadow": {
     "rank_vs_threshold": {
       "records": [
-        {
-          "at": 1794395056348,
-          "arm": "baseline",
-          "coin": "UNI",
-          "dir": "long",
-          "tf": "1H",
-          "entry": 6.466,
-          "stop": 6.310777743759405,
-          "target": 6.815250076541339,
-          "quality": 5,
-          "note": "rollover",
-          "reg": "bull",
-          "rs": 0.478,
-          "regDist": 0.8,
-          "breadth": 0.47,
-          "R": -1,
-          "gtf": "30m"
-        },
         {
           "at": 1794398650295,
           "arm": "baseline",
@@ -12084,7 +12074,8 @@
           "gap": null,
           "crowdBox": null,
           "crowdSrc": null,
-          "R": null
+          "R": -0.517,
+          "gtf": "30m"
         },
         {
           "at": 1794860027081,
@@ -15368,7 +15359,8 @@
           "gap": null,
           "crowdBox": null,
           "crowdSrc": null,
-          "R": null
+          "R": -1,
+          "gtf": "30m"
         },
         {
           "at": 1795133072002,
@@ -15386,6 +15378,27 @@
           "regDist": -14.7,
           "breadth": 0.1,
           "crowd": -0.04,
+          "gap": null,
+          "crowdBox": null,
+          "crowdSrc": null,
+          "R": null
+        },
+        {
+          "at": 1795147555970,
+          "arm": "baseline",
+          "coin": "APT",
+          "dir": "long",
+          "tf": "4H",
+          "entry": 0.3999,
+          "stop": 0.37939915282383785,
+          "target": 0.44602690614636475,
+          "quality": 5.5,
+          "note": "divergence",
+          "reg": "bear",
+          "rs": 0,
+          "regDist": -14.7,
+          "breadth": 0.1,
+          "crowd": 0.47,
           "gap": null,
           "crowdBox": null,
           "crowdSrc": null,
@@ -15645,14 +15658,9 @@
       "history": [],
       "arms": {
         "bars20": {
-          "sum": -268.53189915788084,
-          "n": 1997,
+          "sum": -273.53189915788084,
+          "n": 2002,
           "seen": [
-            "POL1793751093879",
-            "POL1793755712091",
-            "XRP1793765603628",
-            "FIL1793740288246",
-            "SUI1793707998186",
             "NEAR1793774624405",
             "NEAR1793776425229",
             "AAVE1793773726702",
@@ -16247,18 +16255,18 @@
             "ETH1795053735330",
             "AVAX1795053733668",
             "INJ1795073589973",
-            "AAVE1795133071675"
+            "AAVE1795133071675",
+            "OP1794962908750",
+            "OP1794974613765",
+            "OP1795060933783",
+            "APT1795104721578",
+            "APT1795125873564"
           ]
         },
         "bars40": {
-          "sum": -375.15354332063157,
-          "n": 1902,
+          "sum": -380.15354332063157,
+          "n": 1907,
           "seen": [
-            "TRX1793405680516",
-            "NEAR1793344259334",
-            "AAVE1793481146188",
-            "BCH1793383982759",
-            "BCH1793391185682",
             "INJ1793394884775",
             "INJ1793398477605",
             "INJ1793402082866",
@@ -16853,18 +16861,18 @@
             "ETH1795029248159",
             "ETH1795046531561",
             "ETH1795053735330",
-            "AVAX1795053733668"
+            "AVAX1795053733668",
+            "OP1794962908750",
+            "OP1794974613765",
+            "OP1795060933783",
+            "APT1795104721578",
+            "APT1795125873564"
           ]
         },
         "bars60": {
-          "sum": -365.5699478195862,
-          "n": 1896,
+          "sum": -370.5699478195862,
+          "n": 1901,
           "seen": [
-            "OP1793414765013",
-            "DOGE1792653679673",
-            "UNI1792653679854",
-            "POL1793333377545",
-            "XRP1793333378229",
             "ADA1793333376129",
             "XRP1793337063134",
             "INJ1793463203634",
@@ -17459,7 +17467,12 @@
             "ETH1795029248159",
             "ETH1795046531561",
             "ETH1795053735330",
-            "AVAX1795053733668"
+            "AVAX1795053733668",
+            "OP1794962908750",
+            "OP1794974613765",
+            "OP1795060933783",
+            "APT1795104721578",
+            "APT1795125873564"
           ]
         }
       },
@@ -17471,18 +17484,17 @@
       "history": [],
       "arms": {
         "taker": {
-          "sum": -424.5239999999991,
-          "n": 1881
+          "sum": -425.0809999999991,
+          "n": 1882
         },
         "maker": {
-          "sum": -501.73499999999757,
-          "n": 1881,
-          "filled": 1661,
+          "sum": -502.2749999999976,
+          "n": 1882,
+          "filled": 1662,
           "missed": 220
         }
       },
       "seen": [
-        "NEAR1793344259334",
         "ADA1793333376129",
         "POL1793333377545",
         "XRP1793337063134",
@@ -18081,7 +18093,8 @@
         "INJ1795073589973",
         "APT1795104721578",
         "APT1795125873564",
-        "AVAX1795053733668"
+        "AVAX1795053733668",
+        "BCH1794856429894"
       ],
       "graderRev": "2026-09-12-window-guard"
     },
@@ -40772,7 +40785,7 @@
       "setupTf": "4H",
       "quality": 5.5,
       "bookShape": {
-        "at": 1795146681963,
+        "at": 1795147579393,
         "symbol": "SOLUSDT",
         "rows": 1,
         "shape": [
@@ -40780,7 +40793,7 @@
         ],
         "keys": "actionTimeNs,bizError,clOrdID,closedPnlRv,closedSizeRq,cumQtyRq,cumValueRv,displayQtyRq,execInst,execStatus,leavesQtyRq,leavesValueRv,ordStatus,orderID,orderQtyRq,orderType,pegOffsetProportionRr,pegOffsetValueRp,pegPriceType,priceRp,side,slPxRp,stopDirection,stopLossRp,stopPxRp,symbol,takeProfitRp,timeInForce,tpPxRp,transactTimeNs,trigger"
       },
-      "lastSeen": 1795146688172
+      "lastSeen": 1795147585590
     },
     "AVAX|long": {
       "coin": "AVAX",
@@ -40795,7 +40808,7 @@
       "since": 1795048363670,
       "avgEntry": 7.634519947,
       "adopted": 1795048363883,
-      "lastSeen": 1795146688172
+      "lastSeen": 1795147585590
     },
     "XRP|short": {
       "coin": "XRP",
@@ -40812,7 +40825,7 @@
       "setup": "rollover",
       "setupTf": "1H",
       "quality": 5,
-      "lastSeen": 1795146688172
+      "lastSeen": 1795147585590
     },
     "APT|short": {
       "coin": "APT",
@@ -40827,7 +40840,7 @@
       "since": 1788435411143,
       "avgEntry": 0.925359566,
       "adopted": 1795132191685,
-      "lastSeen": 1795146688172
+      "lastSeen": 1795147585590
     },
     "LTC|short": {
       "coin": "LTC",
@@ -40842,7 +40855,7 @@
       "since": 1790018246556,
       "avgEntry": 53.07,
       "adopted": 1790018246686,
-      "lastSeen": 1795146688172
+      "lastSeen": 1795147585590
     },
     "ETH|short": {
       "coin": "ETH",
@@ -40856,8 +40869,8 @@
       },
       "since": 1794911876453,
       "avgEntry": 2425.8,
-      "adopted": 1795146680792,
-      "lastSeen": 1795146688172
+      "adopted": 1795147578324,
+      "lastSeen": 1795147585590
     },
     "DOT|long": {
       "coin": "DOT",
@@ -40874,7 +40887,7 @@
       "setup": "rollover",
       "setupTf": "4H",
       "quality": 5.5,
-      "lastSeen": 1795146688172
+      "lastSeen": 1795147585590
     },
     "BNB|long": {
       "coin": "BNB",
@@ -40891,7 +40904,7 @@
       "setup": "rollover",
       "setupTf": "4H",
       "quality": 5.5,
-      "lastSeen": 1795146688172
+      "lastSeen": 1795147585590
     }
   },
   "cipher_books": {
@@ -40986,29 +40999,29 @@
       "baseBalance": 0.00463496,
       "quoteBalance": 4.94469533,
       "exec": "armed",
-      "checkedAt": 1795146688938
+      "checkedAt": 1795147586121
     },
     "seededReal": true,
     "seededAt": "2026-08-19T13:59:51.035Z",
     "exec": "armed",
     "flips": {
       "5m": {
-        "units": 0.5781402352604228,
-        "cash": 0,
+        "units": 0,
+        "cash": 35929.61453537897,
         "trips": 2602,
-        "sells": 2602,
-        "lastT": 1795146600000,
+        "sells": 2603,
+        "lastT": 1795147500000,
         "startUnits": 1,
-        "unitsNow": 0.57814024,
-        "gainPct": -42.19,
-        "holding": true
+        "unitsNow": 0.5805521,
+        "gainPct": -41.94,
+        "holding": false
       },
       "15m": {
         "units": 0.8173127350548041,
         "cash": 0,
         "trips": 929,
         "sells": 929,
-        "lastT": 1795145400000,
+        "lastT": 1795146300000,
         "startUnits": 1,
         "unitsNow": 0.81731274,
         "gainPct": -18.27,
@@ -41019,7 +41032,7 @@
         "cash": 0,
         "trips": 480,
         "sells": 480,
-        "lastT": 1795143600000,
+        "lastT": 1795145400000,
         "startUnits": 1,
         "unitsNow": 0.85430379,
         "gainPct": -14.57,
@@ -41030,7 +41043,7 @@
         "cash": 0,
         "trips": 244,
         "sells": 244,
-        "lastT": 1795140000000,
+        "lastT": 1795143600000,
         "startUnits": 1,
         "unitsNow": 1.05067693,
         "gainPct": 5.07,
@@ -41041,7 +41054,7 @@
         "cash": 0,
         "trips": 105,
         "sells": 105,
-        "lastT": 1795140000000,
+        "lastT": 1795147200000,
         "startUnits": 1,
         "unitsNow": 1.03897126,
         "gainPct": 3.9,
@@ -41052,10 +41065,10 @@
         "cash": 66278.76573641736,
         "trips": 80,
         "sells": 81,
-        "lastT": 1795125600000,
+        "lastT": 1795129200000,
         "startUnits": 1,
-        "unitsNow": 1.06642541,
-        "gainPct": 6.64,
+        "unitsNow": 1.07628771,
+        "gainPct": 7.63,
         "holding": false
       },
       "4H": {
@@ -41063,10 +41076,10 @@
         "cash": 53066.355159190396,
         "trips": 81,
         "sells": 82,
-        "lastT": 1795118400000,
+        "lastT": 1795132800000,
         "startUnits": 1,
-        "unitsNow": 0.85611884,
-        "gainPct": -14.39,
+        "unitsNow": 0.85380062,
+        "gainPct": -14.62,
         "holding": false
       },
       "1D": {
@@ -55216,7 +55229,7 @@
         "clOrdID": "cipherTarget1793048578269",
         "at": 1793048578497,
         "source": "placed",
-        "checkedAt": 1795142996427
+        "checkedAt": 1795147585059
       },
       "history": [
         {
@@ -55465,7 +55478,7 @@
         "clOrdID": "cipherTarget1793137990273",
         "at": 1793137990718,
         "source": "placed",
-        "checkedAt": 1795142996167
+        "checkedAt": 1795147584828
       }
     },
     "AVAX|long#1793579334842": {
@@ -55687,7 +55700,7 @@
         "clOrdID": "cipherStop1795004511817",
         "at": 1795004512232,
         "source": "placed",
-        "checkedAt": 1795142996681
+        "checkedAt": 1795147585299
       },
       "history": [
         {
@@ -55709,21 +55722,21 @@
         "clOrdID": "cipherTarget1795004512241",
         "at": 1795004512618,
         "source": "placed",
-        "checkedAt": 1795142996945
+        "checkedAt": 1795147585541
       }
     }
   },
   "cipher_protect_check": {
-    "at": "2026-11-20T03:51:28.121Z",
+    "at": "2026-11-20T04:06:25.541Z",
     "checks": [
-      "BNB|long target: unreadable (http 503 {\"msg\":\"please try again later! Unable to find instance for phemex-api-data-app\",\"code\":10500})",
-      "SOL|long stop: unreadable (http 503 {\"msg\":\"please try again later! Unable to find instance for phemex-api-data-app\",\"code\":10500})",
-      "AVAX|long stop: unreadable (http 503 {\"msg\":\"please try again later! Unable to find instance for phemex-api-data-app\",\"code\":10500})",
-      "AVAX|long target: unreadable (http 503 {\"msg\":\"please try again later! Unable to find instance for phemex-api-data-app\",\"code\":10500})"
+      "SOL|long target: unreadable (http 503 {\"msg\":\"please try again later! Unable to find instance for phemex-api-data-app\",\"code\":10500})",
+      "APT|short target: unreadable (http 503 {\"msg\":\"please try again later! Unable to find instance for phemex-api-data-app\",\"code\":10500})",
+      "XRP|short stop: unreadable (http 503 {\"msg\":\"please try again later! Unable to find instance for phemex-api-data-app\",\"code\":10500})",
+      "XRP|short target: unreadable (http 503 {\"msg\":\"please try again later! Unable to find instance for phemex-api-data-app\",\"code\":10500})"
     ]
   },
   "cipher_health": {
-    "at": "2026-11-20T03:51:30.691Z",
+    "at": "2026-11-20T04:06:27.827Z",
     "status": "OK",
     "mode": "armed",
     "positions": 8,
