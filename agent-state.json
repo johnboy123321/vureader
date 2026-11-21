@@ -1,6 +1,58 @@
 {
-  "cipher_cursor": 21,
+  "cipher_cursor": 19,
   "cipher_log": [
+    {
+      "at": "2026-11-21T03:25:49.659Z",
+      "coin": "ETH",
+      "dir": "short",
+      "result": "PLAN DOES NOT MATCH POSITION",
+      "skipped": "the plan's entry 1757.5 is 4.4R from the venue's average entry 2425.8, so it was written for a different fill — and no replacement could be built from today's structure (stop > 3 ATR). Kept as is; check this position by hand."
+    },
+    {
+      "at": "2026-11-21T03:25:49.534Z",
+      "coin": "APT",
+      "dir": "short",
+      "result": "PLAN DOES NOT MATCH POSITION",
+      "skipped": "the plan's entry 0.432400 is 5.1R from the venue's average entry 0.925360, so it was written for a different fill — and no replacement could be built from today's structure (stop > 3 ATR). Kept as is; check this position by hand."
+    },
+    {
+      "at": "2026-11-21T03:25:36.072Z",
+      "coin": "ARB",
+      "dir": "long",
+      "entry": 0.11215,
+      "sl": 0.11042548577348221,
+      "tp1": 0.11387451422651779,
+      "tp2": 0.11603015700966501,
+      "score": 6,
+      "stopKind": "OB",
+      "trend": "down",
+      "zone": {
+        "src": "OB",
+        "top": 0.11169,
+        "bottom": 0.11071,
+        "awayPct": 0.41
+      },
+      "skipped": "REFUSED — stop only 1.54% from entry — below the 2.2% floor, costs would eat 14% of the risk"
+    },
+    {
+      "at": "2026-11-21T03:25:34.609Z",
+      "coin": "NEAR",
+      "dir": "long",
+      "entry": 2.85,
+      "sl": 2.306106904749938,
+      "tp1": 3.3938930952500623,
+      "tp2": 4.073759464312641,
+      "score": 6,
+      "stopKind": "swing10",
+      "trend": "down",
+      "zone": null,
+      "skipped": "CIRCUIT BREAKER — 3 consecutive losing trades — pausing new entries 12h to stop re-asking a market that keeps saying no"
+    },
+    {
+      "at": "2026-11-21T03:25:30.588Z",
+      "result": "EXPIRE FAILED",
+      "skipped": "2 order(s) past the 8h expiry did not cancel: DOT long (133h), LTC long (56h). Reason: phemex http 400 code 10500 Missing required parameter,Required query parameter 'posSide' is not present.. Left resting; will retry next run."
+    },
     {
       "at": "2026-11-21T03:10:55.313Z",
       "coin": "DOT",
@@ -3621,65 +3673,17 @@
       "book": "fast",
       "score": 6,
       "skipped": "already holding SOL in the fast book"
-    },
-    {
-      "at": "2026-11-20T22:10:09.775Z",
-      "coin": "ETH",
-      "dir": "long",
-      "skipped": "signal too weak — rollover on 30m (quality 4.0 < 5)"
-    },
-    {
-      "at": "2026-11-20T22:10:09.648Z",
-      "coin": "BTC",
-      "dir": "long",
-      "entry": 59019.3,
-      "sl": 57546.768048653736,
-      "tp1": 60491.83195134627,
-      "tp2": 62332.4968905291,
-      "score": 6,
-      "stopKind": "swing10",
-      "trend": "down",
-      "zone": null,
-      "skipped": "CIRCUIT BREAKER — 3 consecutive losing trades — pausing new entries 12h to stop re-asking a market that keeps saying no"
-    },
-    {
-      "at": "2026-11-20T22:10:09.519Z",
-      "coin": "OP",
-      "dir": "long",
-      "skipped": "signal too weak — rollover on 30m (quality 4.0 < 5)"
-    },
-    {
-      "at": "2026-11-20T22:10:09.198Z",
-      "coin": "DOT",
-      "dir": "long",
-      "entry": 0.6719,
-      "sl": 0.6470528423932463,
-      "tp1": 0.6967471576067538,
-      "tp2": 0.7278061046151959,
-      "score": 6,
-      "stopKind": "swing10",
-      "trend": "down",
-      "zone": null,
-      "skipped": "CIRCUIT BREAKER — 3 consecutive losing trades — pausing new entries 12h to stop re-asking a market that keeps saying no"
-    },
-    {
-      "at": "2026-11-20T22:10:09.067Z",
-      "coin": "APT",
-      "dir": "long",
-      "book": "fast",
-      "score": 6,
-      "skipped": "REFUSED — would open a long against an existing short on APT in the fast book. This bot does not hedge within a book."
     }
   ],
   "cipher_fired": {},
   "cipher_heartbeat": {
-    "at": "2026-11-21T03:10:59.208Z",
+    "at": "2026-11-21T03:25:55.635Z",
     "scanned": 20,
     "candidates": 2,
     "placed": 0,
     "mode": "armed",
     "via": "direct",
-    "ms": 47012
+    "ms": 44187
   },
   "cipher_attempts": {},
   "cipher_shadow": {
@@ -42999,7 +43003,7 @@
       "setupTf": "4H",
       "quality": 5.5,
       "bookShape": {
-        "at": 1795230651696,
+        "at": 1795231550432,
         "symbol": "SOLUSDT",
         "rows": 1,
         "shape": [
@@ -43007,7 +43011,7 @@
         ],
         "keys": "actionTimeNs,bizError,clOrdID,closedPnlRv,closedSizeRq,cumQtyRq,cumValueRv,displayQtyRq,execInst,execStatus,leavesQtyRq,leavesValueRv,ordStatus,orderID,orderQtyRq,orderType,pegOffsetProportionRr,pegOffsetValueRp,pegPriceType,priceRp,side,slPxRp,stopDirection,stopLossRp,stopPxRp,symbol,takeProfitRp,timeInForce,tpPxRp,transactTimeNs,trigger"
       },
-      "lastSeen": 1795230656482
+      "lastSeen": 1795231553855
     },
     "APT|short": {
       "coin": "APT",
@@ -43022,7 +43026,7 @@
       "since": 1788435411143,
       "avgEntry": 0.925359566,
       "adopted": 1795132191685,
-      "lastSeen": 1795230656482
+      "lastSeen": 1795231553855
     },
     "LTC|short": {
       "coin": "LTC",
@@ -43037,7 +43041,7 @@
       "since": 1790018246556,
       "avgEntry": 53.07,
       "adopted": 1790018246686,
-      "lastSeen": 1795230656482
+      "lastSeen": 1795231553855
     },
     "ETH|short": {
       "coin": "ETH",
@@ -43052,7 +43056,7 @@
       "since": 1794911876453,
       "avgEntry": 2425.8,
       "adopted": 1795218935319,
-      "lastSeen": 1795230656482
+      "lastSeen": 1795231553855
     },
     "DOT|long": {
       "coin": "DOT",
@@ -43067,7 +43071,7 @@
       "since": 1795187872768,
       "avgEntry": 0.77927879,
       "adopted": 1795219839025,
-      "lastSeen": 1795230656482
+      "lastSeen": 1795231553855
     }
   },
   "cipher_books": {
@@ -43136,7 +43140,7 @@
       "baseBalance": 0.00463496,
       "quoteBalance": 4.94469533,
       "exec": "armed",
-      "checkedAt": 1795230658082
+      "checkedAt": 1795231554468
     },
     "seededReal": true,
     "seededAt": "2026-08-19T13:59:51.035Z",
@@ -43147,10 +43151,10 @@
         "cash": 33840.69218503738,
         "trips": 2623,
         "sells": 2624,
-        "lastT": 1795230600000,
+        "lastT": 1795231500000,
         "startUnits": 1,
-        "unitsNow": 0.58034536,
-        "gainPct": -41.97,
+        "unitsNow": 0.57926751,
+        "gainPct": -42.07,
         "holding": false
       },
       "15m": {
@@ -43158,10 +43162,10 @@
         "cash": 49225.24168864051,
         "trips": 937,
         "sells": 938,
-        "lastT": 1795229100000,
+        "lastT": 1795230000000,
         "startUnits": 1,
-        "unitsNow": 0.84002119,
-        "gainPct": -16,
+        "unitsNow": 0.84158228,
+        "gainPct": -15.84,
         "holding": false
       },
       "30m": {
@@ -57679,7 +57683,7 @@
         "clOrdID": "cipherStop1795046568117",
         "at": 1795046568569,
         "source": "placed",
-        "checkedAt": 1795228855526
+        "checkedAt": 1795231553618
       }
     },
     "LTC|short": {
@@ -57693,7 +57697,7 @@
         "clOrdID": "cipherStop1793048579453",
         "at": 1793048579673,
         "source": "placed",
-        "checkedAt": 1795228855141
+        "checkedAt": 1795231553225
       },
       "target": {
         "px": 50.768064037334334,
@@ -57702,7 +57706,7 @@
         "clOrdID": "cipherTarget1793048579680",
         "at": 1793048580109,
         "source": "placed",
-        "checkedAt": 1795228855328
+        "checkedAt": 1795231553423
       }
     },
     "ETH|short": {
@@ -57784,7 +57788,7 @@
         "clOrdID": "cipherStop1793137989808",
         "at": 1793137990265,
         "source": "placed",
-        "checkedAt": 1795228855721
+        "checkedAt": 1795231553818
       },
       "history": [
         {
@@ -57944,16 +57948,16 @@
     }
   },
   "cipher_protect_check": {
-    "at": "2026-11-21T03:10:56.449Z",
+    "at": "2026-11-21T03:25:53.818Z",
     "checks": [
-      "DOT|long stop: unreadable (http 503 {\"msg\":\"please try again later! Unable to find instance for phemex-api-data-app\",\"code\":10500})",
-      "DOT|long target: unreadable (http 503 {\"msg\":\"please try again later! Unable to find instance for phemex-api-data-app\",\"code\":10500})",
-      "ETH|short stop: unreadable (http 503 {\"msg\":\"please try again later! Unable to find instance for phemex-api-data-app\",\"code\":10500})",
-      "ETH|short target: unreadable (http 503 {\"msg\":\"please try again later! Unable to find instance for phemex-api-data-app\",\"code\":10500})"
+      "LTC|short stop: unreadable (http 503 {\"msg\":\"please try again later! Unable to find instance for phemex-api-data-app\",\"code\":10500})",
+      "LTC|short target: unreadable (http 503 {\"msg\":\"please try again later! Unable to find instance for phemex-api-data-app\",\"code\":10500})",
+      "APT|short stop: unreadable (http 503 {\"msg\":\"please try again later! Unable to find instance for phemex-api-data-app\",\"code\":10500})",
+      "SOL|long stop: unreadable (http 503 {\"msg\":\"please try again later! Unable to find instance for phemex-api-data-app\",\"code\":10500})"
     ]
   },
   "cipher_health": {
-    "at": "2026-11-21T03:10:59.200Z",
+    "at": "2026-11-21T03:25:55.626Z",
     "status": "OK",
     "mode": "armed",
     "positions": 5,
